@@ -1,286 +1,71 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+const path = require('path');
 
 const app = express();
 app.use(cors());
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 256 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256 });
-
-function getAgent(url) {
-    return url.startsWith('https') ? httpsAgent : httpAgent;
-}
+app.use(express.static('public'));
 
 // ============================================
-// 🎯 هيدرات خاصة بيوتيوب (وكيل تصفح)
-// ============================================
-function getYouTubeHeaders(url) {
-    return {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-User': '?1',
-        'Sec-Fetch-Dest': 'document',
-        'Upgrade-Insecure-Requests': '1',
-        'Cookie': 'PREF=f1=50000000&hl=en; VISITOR_INFO1_LIVE=...; CONSENT=YES+cb',
-        'Referer': 'https://www.youtube.com/'
-    };
-}
-
-// ============================================
-// 🔍 نظام ذكي لاستخراج الـ Headers حسب الموقع
-// ============================================
-function getHeaders(url) {
-    try {
-        const urlObj = new URL(url);
-        const hostname = urlObj.hostname;
-
-        if (hostname.includes('youtube.com') || hostname.includes('youtu.be')) {
-            return getYouTubeHeaders(url);
-        }
-
-        if (hostname.includes('facebook.com')) {
-            return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-Mode': 'navigate'
-            };
-        }
-
-        if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
-            return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9'
-            };
-        }
-
-        if (hostname.includes('instagram.com')) {
-            return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-Mode': 'navigate'
-            };
-        }
-
-        if (hostname.includes('tiktok.com')) {
-            return {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9'
-            };
-        }
-
-        return {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Origin': `https://${hostname}`,
-            'Referer': `https://${hostname}/`,
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-        };
-
-    } catch (e) {
-        console.warn('⚠️ خطأ في تحليل URL:', e.message);
-        return {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        };
-    }
-}
-
-// ============================================
-// 🔄 دالة لتعديل الروابط داخل الصفحة (عشان التصفح الكامل)
-// ============================================
-function rewriteLinks(html, baseUrl, proxyBase) {
-    // تعديل روابط <a href="...">
-    html = html.replace(/<a\s+(?:[^>]*?\s+)?href\s*=\s*["']([^"']*)["']/gi, (match, href) => {
-        try {
-            const absoluteUrl = new URL(href, baseUrl).href;
-            // نتأكد إن الرابط مش خارجي (نفس النطاق) عشان نمرره
-            if (absoluteUrl.startsWith('https://www.youtube.com') || 
-                absoluteUrl.startsWith('https://youtube.com') ||
-                absoluteUrl.startsWith('https://youtu.be')) {
-                return match.replace(href, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-            }
-            // لو الرابط لموقع تاني، نمرره برضه عشان التصفح الكامل
-            return match.replace(href, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-        } catch (e) {
-            return match;
-        }
-    });
-
-    // تعديل روابط <form action="...">
-    html = html.replace(/<form\s+(?:[^>]*?\s+)?action\s*=\s*["']([^"']*)["']/gi, (match, action) => {
-        try {
-            const absoluteUrl = new URL(action, baseUrl).href;
-            return match.replace(action, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-        } catch (e) {
-            return match;
-        }
-    });
-
-    // تعديل روابط <img src="..."> (الصور)
-    html = html.replace(/<img\s+(?:[^>]*?\s+)?src\s*=\s*["']([^"']*)["']/gi, (match, src) => {
-        try {
-            const absoluteUrl = new URL(src, baseUrl).href;
-            return match.replace(src, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-        } catch (e) {
-            return match;
-        }
-    });
-
-    // تعديل روابط <link href="..."> (CSS, icons)
-    html = html.replace(/<link\s+(?:[^>]*?\s+)?href\s*=\s*["']([^"']*)["']/gi, (match, href) => {
-        try {
-            const absoluteUrl = new URL(href, baseUrl).href;
-            return match.replace(href, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-        } catch (e) {
-            return match;
-        }
-    });
-
-    // تعديل روابط <script src="...">
-    html = html.replace(/<script\s+(?:[^>]*?\s+)?src\s*=\s*["']([^"']*)["']/gi, (match, src) => {
-        try {
-            const absoluteUrl = new URL(src, baseUrl).href;
-            return match.replace(src, `${proxyBase}?url=${encodeURIComponent(absoluteUrl)}`);
-        } catch (e) {
-            return match;
-        }
-    });
-
-    return html;
-}
-
-// ============================================
-// 📡 نقطة نهاية الوكيل الرئيسية (للتصفح الكامل)
+// 🎯 الوكيل الرئيسي (بيجيب الفيديو فقط)
 // ============================================
 app.get('/api/stream', async (req, res) => {
-    const urlMatch = req.query.url;
-
-    if (!urlMatch) {
-        return res.status(400).json({
-            error: '❌ مطلوب رابط',
-            example: '/api/stream?url=https://www.youtube.com'
-        });
+    const url = req.query.url;
+    if (!url) {
+        return res.status(400).send('❌ مطلوب رابط الفيديو');
     }
 
-    let url = decodeURIComponent(urlMatch);
-
-    const abortController = new AbortController();
-    req.on('close', () => abortController.abort());
-
     try {
-        const headers = getHeaders(url);
+        const decodedUrl = decodeURIComponent(url);
+        console.log('📥 جلب الفيديو:', decodedUrl);
 
-        if (req.headers.range) {
-            headers.Range = req.headers.range;
-        }
-
-        const response = await fetch(url, {
-            headers,
-            redirect: 'follow',
-            agent: getAgent(url),
-            signal: abortController.signal,
-            timeout: 30000
+        const response = await fetch(decodedUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://www.youtube.com/',
+                'Origin': 'https://www.youtube.com'
+            }
         });
 
         if (!response.ok) {
-            return res.status(response.status).json({
-                error: `HTTP ${response.status}`,
-                details: response.statusText
-            });
+            return res.status(response.status).send(`❌ خطأ: ${response.status}`);
         }
 
-        const contentType = response.headers.get('content-type') || 'text/html';
+        // ننقل الـ headers المهمة
+        res.setHeader('Content-Type', response.headers.get('content-type') || 'video/mp4');
+        res.setHeader('Content-Length', response.headers.get('content-length'));
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Type');
 
-        // ============================================
-        // 🎯 لو الـ response HTML، نعدل الروابط عشان التصفح الكامل
-        // ============================================
-        if (contentType.includes('text/html')) {
-            let html = await response.text();
-            const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-            const proxyBase = '/api/stream';
-            html = rewriteLinks(html, baseUrl, proxyBase);
-            
-            res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            return res.send(html);
-        }
-
-        // ============================================
-        // 🎯 لو مش HTML (صور، فيديوهات، CSS، JS) نمررها زي ما هي
-        // ============================================
-        res.setHeader('Content-Type', contentType);
-        const contentLength = response.headers.get('content-length');
-        if (contentLength) res.setHeader('Content-Length', contentLength);
-
-        const setCookie = response.headers.get('set-cookie');
-        if (setCookie) {
-            res.setHeader('Set-Cookie', setCookie);
-        }
-
-        const headersToForward = ['cache-control', 'etag', 'last-modified', 'accept-ranges'];
-        for (const header of headersToForward) {
-            const value = response.headers.get(header);
-            if (value) res.setHeader(header, value);
-        }
-
+        // نرسل الفيديو مباشرة
         response.body.pipe(res);
 
-        response.body.on('error', (err) => {
-            console.error('❌ خطأ في الـ streaming:', err.message);
-            if (!res.headersSent) res.status(502).end();
-            else res.end();
-        });
-
     } catch (error) {
-        if (error.name === 'AbortError' || abortController.signal.aborted) {
-            console.warn('⚠️ تم إلغاء الطلب من قبل المستخدم');
-            return;
-        }
-        console.error('❌ خطأ في الوكيل:', error.message);
-        if (!res.headersSent) {
-            res.status(500).json({
-                error: 'Proxy Error',
-                message: error.message
-            });
-        }
+        console.error('❌ خطأ:', error.message);
+        res.status(500).send(`❌ خطأ في الوكيل: ${error.message}`);
     }
 });
 
 // ============================================
-// 🏠 الصفحة الرئيسية
+// 🏠 الصفحة الرئيسية (الواجهة)
 // ============================================
 app.get('/', (req, res) => {
-    res.type('text/html').send(`
+    res.send(`
 <!DOCTYPE html>
 <html dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🚀 الوكيل الشامل - تصفح كامل</title>
+    <title>🎥 مشغل يوتيوب - الوكيل الشامل</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -288,116 +73,231 @@ app.get('/', (req, res) => {
             padding: 20px;
         }
         .container {
-            background: white;
-            border-radius: 15px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
             max-width: 800px;
             width: 100%;
             padding: 40px;
         }
-        h1 { color: #667eea; margin-bottom: 10px; }
-        .status {
-            background: #d4edda;
-            border: 1px solid #c3e6cb;
-            color: #155724;
-            padding: 12px 15px;
-            border-radius: 5px;
-            margin: 20px 0;
-        }
-        .section {
-            margin: 25px 0;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 10px;
-            border-right: 4px solid #667eea;
-        }
-        .section h2 { color: #333; font-size: 18px; margin-bottom: 15px; }
-        code {
-            background: #2d2d2d;
-            color: #f8f8f2;
-            padding: 12px;
-            border-radius: 5px;
-            display: block;
-            margin: 10px 0;
-            overflow-x: auto;
-            font-size: 13px;
-        }
-        .feature-list { list-style: none; margin: 15px 0; }
-        .feature-list li {
-            padding: 8px 0;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: #555;
-        }
-        .feature-list li:before {
-            content: "✅";
-            font-weight: bold;
-            font-size: 18px;
-        }
-        .footer {
-            margin-top: 40px;
-            padding-top: 20px;
-            border-top: 1px solid #ddd;
+        h1 {
+            color: #fff;
             text-align: center;
-            color: #999;
-            font-size: 13px;
+            margin-bottom: 10px;
+            font-size: 28px;
         }
-        .badge {
-            display: inline-block;
-            background: #667eea;
+        .subtitle {
+            color: #aaa;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .input-group input {
+            flex: 1;
+            padding: 14px 20px;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 16px;
+            min-width: 200px;
+        }
+        .input-group input::placeholder {
+            color: #888;
+        }
+        .input-group input:focus {
+            outline: none;
+            border-color: #e74c3c;
+        }
+        .btn {
+            padding: 14px 25px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .btn-primary {
+            background: #e74c3c;
             color: white;
-            padding: 3px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            margin: 0 5px;
         }
-        .big-link {
+        .btn-primary:hover {
+            background: #c0392b;
+            transform: scale(1.02);
+        }
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+        }
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        .btn-paste {
+            background: #3498db;
+            color: white;
+        }
+        .btn-paste:hover {
+            background: #2980b9;
+        }
+        .player-container {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 12px;
+            overflow: hidden;
+            margin-top: 20px;
+            display: none;
+        }
+        .player-container.active {
             display: block;
-            background: #667eea;
-            color: white;
+        }
+        #videoPlayer {
+            width: 100%;
+            max-height: 450px;
+            display: block;
+        }
+        .error-message {
+            color: #e74c3c;
+            background: rgba(231, 76, 60, 0.1);
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 10px;
+            display: none;
+            border: 1px solid rgba(231, 76, 60, 0.3);
+        }
+        .info-box {
+            background: rgba(255, 255, 255, 0.05);
             padding: 15px;
             border-radius: 10px;
-            text-align: center;
-            text-decoration: none;
-            font-size: 18px;
-            margin: 20px 0;
+            margin: 15px 0;
+            color: #aaa;
+            font-size: 13px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
-        .big-link:hover {
-            background: #5a6fd6;
+        .info-box strong {
+            color: #fff;
+        }
+        @media (max-width: 600px) {
+            .input-group {
+                flex-direction: column;
+            }
+            .btn {
+                width: 100%;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🌍 الوكيل الشامل v4.0</h1>
-        <div class="status">
-            ✅ تصفح كامل | يدعم <span class="badge">يوتيوب</span> <span class="badge">فيسبوك</span> <span class="badge">تويتر</span> <span class="badge">إنستجرام</span> <span class="badge">تيك توك</span>
+        <h1>🎥 مشغل يوتيوب</h1>
+        <p class="subtitle">شغل أي فيديو من يوتيوب بسهولة</p>
+
+        <div class="input-group">
+            <input type="text" id="videoUrl" placeholder="https://www.youtube.com/watch?v=VIDEO_ID" />
+            <button class="btn btn-paste" id="pasteBtn">📋 لصق</button>
+            <button class="btn btn-primary" id="playBtn">▶️ تشغيل</button>
         </div>
 
-        <a class="big-link" href="/api/stream?url=https://www.youtube.com">
-            🎥 افتح يوتيوب الآن
-        </a>
-
-        <div class="section">
-            <h2>📖 طريقة الاستخدام</h2>
-            <code>/api/stream?url=https://www.youtube.com</code>
-            <p style="margin-top: 10px; color: #666;">👆 افتح الرابط واتصفح يوتيوب كامل</p>
+        <div class="info-box">
+            <strong>📌 طريقة الاستخدام:</strong><br>
+            1- انسخ رابط الفيديو من يوتيوب<br>
+            2- اضغط زر "لصق" أو اكتب الرابط يدوياً<br>
+            3- اضغط "تشغيل" واستمتع 🎬
         </div>
 
-        <div class="section">
-            <h2>⚡ المواقع المدعومة</h2>
-            <ul class="feature-list">
-                <li>YouTube, YouTube Shorts (تصفح كامل)</li>
-                <li>Facebook, Instagram, Twitter/X, TikTok</li>
-                <li>أي موقع تاني تلقائي ✅</li>
-            </ul>
-        </div>
+        <div id="errorMessage" class="error-message"></div>
 
-        <div class="footer">
-            <p>🚀 تم البناء بـ ❤️ | v4.0 - وكيل تصفح كامل</p>
+        <div id="playerContainer" class="player-container">
+            <video id="videoPlayer" controls autoplay></video>
         </div>
     </div>
+
+    <script>
+        const videoUrlInput = document.getElementById('videoUrl');
+        const playBtn = document.getElementById('playBtn');
+        const pasteBtn = document.getElementById('pasteBtn');
+        const playerContainer = document.getElementById('playerContainer');
+        const videoPlayer = document.getElementById('videoPlayer');
+        const errorMessage = document.getElementById('errorMessage');
+
+        // 🎯 زرار اللصق
+        pasteBtn.addEventListener('click', async () => {
+            try {
+                const text = await navigator.clipboard.readText();
+                if (text && text.includes('youtube.com')) {
+                    videoUrlInput.value = text;
+                    hideError();
+                } else {
+                    showError('❌ الحافظة لا تحتوي على رابط يوتيوب صحيح');
+                }
+            } catch (err) {
+                showError('❌ لا يمكن الوصول إلى الحافظة. الصق الرابط يدوياً');
+            }
+        });
+
+        // 🎯 زرار التشغيل
+        playBtn.addEventListener('click', playVideo);
+
+        // 🎯 تشغيل بالضغط على Enter
+        videoUrlInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') playVideo();
+        });
+
+        function playVideo() {
+            const url = videoUrlInput.value.trim();
+            if (!url) {
+                showError('❌ من فضلك أدخل رابط الفيديو');
+                return;
+            }
+
+            // نستخرج رابط الفيديو المباشر
+            const proxyUrl = \`/api/stream?url=\${encodeURIComponent(url)}\`;
+            console.log('🎬 تشغيل:', proxyUrl);
+
+            // نختبر الرابط الأول
+            fetch(proxyUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(\`HTTP \${response.status}\`);
+                    }
+                    // لو نجح، نشغل الفيديو
+                    videoPlayer.src = proxyUrl;
+                    playerContainer.classList.add('active');
+                    hideError();
+                    videoPlayer.play().catch(e => console.warn('Autoplay prevented'));
+                })
+                .catch(error => {
+                    showError(\`❌ فشل تشغيل الفيديو: \${error.message}\`);
+                    playerContainer.classList.remove('active');
+                });
+        }
+
+        function showError(msg) {
+            errorMessage.textContent = msg;
+            errorMessage.style.display = 'block';
+        }
+
+        function hideError() {
+            errorMessage.style.display = 'none';
+        }
+
+        // 🎯 لو فيه رابط في الـ URL، يشتغل تلقائي
+        const params = new URLSearchParams(window.location.search);
+        const autoUrl = params.get('url');
+        if (autoUrl) {
+            videoUrlInput.value = autoUrl;
+            playVideo();
+        }
+
+        console.log('🚀 الوكيل الشامل v5.0 - شغال');
+    </script>
 </body>
 </html>
     `);
@@ -409,11 +309,10 @@ app.get('/', (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
     console.log(`
-╔══════════════════════════════════════════════╗
-║   🚀 الوكيل الشامل v4.0 شغال بنجاح        ║
-║   📡 http://localhost:${port}                 ║
-║   🌐 http://localhost:${port}/api/stream     ║
-║   ✅ تصفح كامل لـ YouTube وجميع المواقع   ║
-╚══════════════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║   🎥 مشغل يوتيوب - الوكيل الشامل   ║
+║   📡 http://localhost:${port}        ║
+║   ✅ شغال وجاهز للاستخدام           ║
+╚══════════════════════════════════════╝
     `);
 });
