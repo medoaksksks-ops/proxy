@@ -1,14 +1,33 @@
 {
-  "name": "proxy",
-  "version": "1.0.0",
-  "description": "وكيل شامل لفتح المواقع المحظورة",
-  "main": "server.js",
+  "name": "video-streaming-proxy",
+  "version": "7.0.0",
+  "description": "🎥 مشغل فيديو متقدم مع وكيل آمن وسريع",
+  "main": "youtube-proxy-v2.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node youtube-proxy-v2.js",
+    "dev": "nodemon youtube-proxy-v2.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "video",
+    "streaming",
+    "proxy",
+    "youtube",
+    "express"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "node-fetch": "^2.6.7"
+    "node-fetch": "^2.7.0",
+    "node-cache": "^5.1.2",
+    "express-rate-limit": "^6.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
