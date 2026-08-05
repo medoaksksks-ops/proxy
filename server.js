@@ -32,12 +32,10 @@ app.get('/api/stream', async (req, res) => {
             return res.status(response.status).send(`❌ خطأ: ${response.status}`);
         }
 
-        // ننقل الـ headers المهمة
         res.setHeader('Content-Type', response.headers.get('content-type') || 'video/mp4');
         res.setHeader('Content-Length', response.headers.get('content-length'));
         res.setHeader('Access-Control-Allow-Origin', '*');
 
-        // نرسل الفيديو مباشرة
         response.body.pipe(res);
 
     } catch (error) {
@@ -47,9 +45,12 @@ app.get('/api/stream', async (req, res) => {
 });
 
 // ============================================
-// 🏠 الصفحة الرئيسية (الواجهة)
+// 🏠 الصفحة الرئيسية (مع الفيديو الافتراضي)
 // ============================================
 app.get('/', (req, res) => {
+    // الرابط الافتراضي للفيديو (بتاعك)
+    const defaultVideo = 'https://youtu.be/KnuIqBn6UTM?si=qVmGiU_xWJlpQYc1';
+
     res.send(`
 <!DOCTYPE html>
 <html dir="rtl">
@@ -153,10 +154,6 @@ app.get('/', (req, res) => {
             border-radius: 12px;
             overflow: hidden;
             margin-top: 20px;
-            display: none;
-        }
-        .player-container.active {
-            display: block;
         }
         #videoPlayer {
             width: 100%;
@@ -184,6 +181,15 @@ app.get('/', (req, res) => {
         .info-box strong {
             color: #fff;
         }
+        .default-badge {
+            display: inline-block;
+            background: #e74c3c;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-right: 10px;
+        }
         @media (max-width: 600px) {
             .input-group {
                 flex-direction: column;
@@ -200,16 +206,16 @@ app.get('/', (req, res) => {
         <p class="subtitle">شغل أي فيديو من يوتيوب بسهولة</p>
 
         <div class="input-group">
-            <input type="text" id="videoUrl" placeholder="https://www.youtube.com/watch?v=VIDEO_ID" />
+            <input type="text" id="videoUrl" placeholder="https://www.youtube.com/watch?v=VIDEO_ID" value="${defaultVideo}" />
             <button class="btn btn-paste" id="pasteBtn">📋 لصق</button>
             <button class="btn btn-primary" id="playBtn">▶️ تشغيل</button>
         </div>
 
         <div class="info-box">
-            <strong>📌 طريقة الاستخدام:</strong><br>
-            1- انسخ رابط الفيديو من يوتيوب<br>
-            2- اضغط زر "لصق" أو اكتب الرابط يدوياً<br>
-            3- اضغط "تشغيل" واستمتع 🎬
+            <strong>📌 الفيديو الافتراضي:</strong>
+            <span style="color: #fff;">لعبت بتشكيله كامله من شو تايم الديفيجن المجاني🤯</span>
+            <br>
+            <small style="color: #888;">(محمّل تلقائياً عند فتح الصفحة)</small>
         </div>
 
         <div id="errorMessage" class="error-message"></div>
@@ -257,25 +263,22 @@ app.get('/', (req, res) => {
                 return;
             }
 
-            // نستخرج رابط الفيديو المباشر
             const proxyUrl = \`/api/stream?url=\${encodeURIComponent(url)}\`;
             console.log('🎬 تشغيل:', proxyUrl);
 
-            // نختبر الرابط الأول
             fetch(proxyUrl)
                 .then(response => {
                     if (!response.ok) {
                         throw new Error(\`HTTP \${response.status}\`);
                     }
-                    // لو نجح، نشغل الفيديو
                     videoPlayer.src = proxyUrl;
-                    playerContainer.classList.add('active');
+                    playerContainer.style.display = 'block';
                     hideError();
                     videoPlayer.play().catch(e => console.warn('Autoplay prevented'));
                 })
                 .catch(error => {
                     showError(\`❌ فشل تشغيل الفيديو: \${error.message}\`);
-                    playerContainer.classList.remove('active');
+                    playerContainer.style.display = 'none';
                 });
         }
 
@@ -288,15 +291,12 @@ app.get('/', (req, res) => {
             errorMessage.style.display = 'none';
         }
 
-        // 🎯 لو فيه رابط في الـ URL، يشتغل تلقائي
-        const params = new URLSearchParams(window.location.search);
-        const autoUrl = params.get('url');
-        if (autoUrl) {
-            videoUrlInput.value = autoUrl;
-            playVideo();
-        }
+        // 🎯 تشغيل الفيديو الافتراضي تلقائياً عند تحميل الصفحة
+        window.addEventListener('load', () => {
+            setTimeout(playVideo, 500); // ننتظر نص ثانية عشان التحميل
+        });
 
-        console.log('🚀 الوكيل الشامل v5.0 - شغال');
+        console.log('🚀 الوكيل الشامل v6.0 - مع فيديو افتراضي');
     </script>
 </body>
 </html>
@@ -312,7 +312,8 @@ app.listen(port, '0.0.0.0', () => {
 ╔══════════════════════════════════════╗
 ║   🎥 مشغل يوتيوب - الوكيل الشامل   ║
 ║   📡 http://localhost:${port}        ║
-║   ✅ شغال وجاهز للاستخدام           ║
+║   ✅ الفيديو الافتراضي جاهز         ║
+║   📹 ${defaultVideo} ║
 ╚══════════════════════════════════════╝
     `);
 });
