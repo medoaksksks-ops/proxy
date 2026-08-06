@@ -1,19 +1,17 @@
 {
-  "name": "advanced-web-proxy-pro",
-  "version": "4.0.0",
-  "description": "وكيل ويب متقدم Pro يدعم YouTube و Google و TikTok بدون مشاكل",
-  "main": "server-v4-pro.js",
+  "name": "smart-web-proxy",
+  "version": "5.0.0",
+  "description": "وكيل ويب ذكي مع Puppeteer - YouTube و Google محترفة 100%",
+  "main": "server-v5-smart.js",
   "scripts": {
-    "start": "node server-v4-pro.js",
-    "dev": "nodemon server-v4-pro.js",
-    "test": "echo \"No tests yet\""
+    "start": "node server-v5-smart.js",
+    "dev": "nodemon server-v5-smart.js"
   },
   "keywords": [
     "proxy",
     "youtube",
     "google",
-    "tiktok",
-    "facebook",
+    "puppeteer",
     "web-proxy"
   ],
   "author": "",
@@ -23,7 +21,9 @@
     "cors": "^2.8.5",
     "node-fetch": "^2.7.0",
     "cookie-parser": "^1.4.6",
-    "zlib": "^1.0.5"
+    "puppeteer": "^21.6.1",
+    "http-proxy": "^1.18.1",
+    "axios": "^1.6.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
