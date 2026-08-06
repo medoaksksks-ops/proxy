@@ -1,34 +1,20 @@
 {
   "name": "smart-web-proxy",
   "version": "5.0.0",
-  "description": "وكيل ويب ذكي مع Puppeteer - YouTube و Google محترفة 100%",
   "main": "server-v5-smart.js",
   "scripts": {
-    "start": "node server-v5-smart.js",
-    "dev": "nodemon server-v5-smart.js"
+    "start": "node server-v5-smart.js"
   },
-  "keywords": [
-    "proxy",
-    "youtube",
-    "google",
-    "puppeteer",
-    "web-proxy"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "node-fetch": "^2.7.0",
+    "axios": "^1.6.2",
     "cookie-parser": "^1.4.6",
-    "puppeteer": "^21.6.1",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
     "http-proxy": "^1.18.1",
-    "axios": "^1.6.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^21.6.1"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": "20.x"
   }
 }
