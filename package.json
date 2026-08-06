@@ -1,7 +1,7 @@
 {
-  "name": "proxy-browser",
+  "name": "proxy-browser-pro",
   "version": "1.0.0",
-  "description": "Production-ready proxy browser supporting YouTube, Facebook, TikTok, Instagram, Twitter, Reddit, Wikipedia, Google, GitHub and all major websites",
+  "description": "Fast production proxy browser for YouTube, TikTok, Instagram and all websites",
   "main": "server.js",
   "type": "commonjs",
   "engines": {
@@ -11,28 +11,12 @@
     "start": "node server.js",
     "dev": "NODE_ENV=development node server.js"
   },
-  "keywords": [
-    "proxy",
-    "browser",
-    "youtube",
-    "facebook",
-    "tiktok",
-    "instagram",
-    "twitter",
-    "reddit",
-    "wikipedia",
-    "privacy",
-    "anonymity"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "node-fetch": "^2.7.0",
-    "cookie-parser": "^1.4.6",
-    "compression": "^1.7.4",
     "http-proxy": "^1.18.1",
-    "body-parser": "^1.20.2"
+    "compression": "^1.7.4",
+    "cookie-parser": "^1.4.6",
+    "cheerio": "^1.0.0-rc.12",
+    "url": "^0.11.0"
   }
 }
