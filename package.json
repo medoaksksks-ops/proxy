@@ -1,22 +1,24 @@
 {
-  "name": "proxy-browser-pro",
+  "name": "croxy-mirror",
   "version": "1.0.0",
-  "description": "Fast production proxy browser for YouTube, TikTok, Instagram and all websites",
+  "description": "وكيل بسيط لتمرير المواقع عبر CroxyProxy",
   "main": "server.js",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=16.0.0"
-  },
   "scripts": {
     "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "http-proxy": "^1.18.1",
-    "compression": "^1.7.4",
-    "cookie-parser": "^1.4.6",
-    "cheerio": "^1.0.0-rc.12",
-    "url": "^0.11.0"
-  }
+    "cors": "^2.8.5",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": ["proxy", "croxyproxy", "youtube", "facebook", "tiktok"],
+  "author": "medoakskkss-ops",
+  "license": "MIT"
 }
