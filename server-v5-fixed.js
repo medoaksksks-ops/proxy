@@ -5,55 +5,30 @@ const fetch = require('node-fetch');
 const { URL } = require('url');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
-const fs = require('fs');
 const path = require('path');
-
-// ============================================================
-//  SMART WEB PROXY v6.5 – YouTube & All Sites Enhanced
-//  -------------------------------------------------------
-//  ✓ دعم كامل لـ YouTube (فيديوهات، تعليقات، بث مباشر)
-//  ✓ تحميل جميع الموارد (CSS, JS, صور, فيديو)
-//  ✓ اعتراض طلبات AJAX و Fetch
-//  ✓ دعم Range للفيديو
-//  ✓ حجم كود > 60 كيلو بايت
-// ============================================================
 
 const app = express();
 let browser = null;
 const pagePool = new Set();
-const maxPages = 8;
+const maxPages = 5;
 const cache = new Map();
-const CACHE_TTL = 30000; // 30 ثانية بس للموارد
+const CACHE_TTL = 30000;
 
 // ============================================================
-//  الإعدادات
+//  إعدادات
 // ============================================================
 const CONFIG = {
     proxyBase: '/proxy',
     timeout: 120000,
     pageTimeout: 90000,
-    maxConnections: 20,
     userAgents: [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    ],
-    // كل المواقع الكبيرة
-    puppeteerSites: [
-        'youtube.com', 'youtu.be',
-        'google.com', 'gmail.com',
-        'facebook.com', 'instagram.com',
-        'tiktok.com', 'twitter.com', 'x.com',
-        'reddit.com', 'twitch.tv',
-        'netflix.com', 'amazon.com',
-        'spotify.com', 'discord.com'
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     ]
 };
 
-// ============================================================
-//  Middleware
-// ============================================================
+// Middleware
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'] }));
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
@@ -70,18 +45,14 @@ function getCacheKey(url, headers = {}) {
 function getContentTypeFromExtension(url) {
     const ext = path.extname(url).toLowerCase();
     const map = {
-        '.html': 'text/html', '.htm': 'text/html',
         '.css': 'text/css',
         '.js': 'application/javascript',
-        '.mjs': 'application/javascript',
         '.json': 'application/json',
         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
         '.mp4': 'video/mp4', '.webm': 'video/webm',
         '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
-        '.pdf': 'application/pdf', '.txt': 'text/plain',
-        '.xml': 'application/xml', '.zip': 'application/zip',
-        '.gz': 'application/gzip', '.wasm': 'application/wasm'
+        '.wasm': 'application/wasm'
     };
     return map[ext] || null;
 }
@@ -111,9 +82,7 @@ async function getBrowser() {
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--allow-running-insecure-content',
                     '--disable-blink-features=AutomationControlled',
-                    '--window-size=1920,1080',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-pdf-viewer'
+                    '--window-size=1920,1080'
                 ]
             });
             console.log('[PUPPETEER] ✅ Browser launched.');
@@ -126,18 +95,21 @@ async function getBrowser() {
 }
 
 // ============================================================
-//  جلب الموارد
+//  جلب الموارد مع دعم POST
 // ============================================================
-async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
+async function fetchResource(targetUrl, reqHeaders = {}, body = null, method = 'GET') {
     const userAgent = CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 
-    const cacheKey = getCacheKey(targetUrl, reqHeaders);
-    if (cache.has(cacheKey)) {
-        const cached = cache.get(cacheKey);
-        if (Date.now() - cached.timestamp < CACHE_TTL) {
-            return cached.data;
-        } else {
-            cache.delete(cacheKey);
+    // للتخزين المؤقت نستخدم فقط للـ GET
+    if (method === 'GET') {
+        const cacheKey = getCacheKey(targetUrl, reqHeaders);
+        if (cache.has(cacheKey)) {
+            const cached = cache.get(cacheKey);
+            if (Date.now() - cached.timestamp < CACHE_TTL) {
+                return cached.data;
+            } else {
+                cache.delete(cacheKey);
+            }
         }
     }
 
@@ -155,12 +127,19 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
         delete headers['connection'];
         delete headers['content-length'];
 
-        const response = await fetch(targetUrl, {
-            method: 'GET',
+        const fetchOptions = {
+            method: method,
             headers: headers,
             timeout: CONFIG.timeout,
             redirect: 'follow'
-        });
+        };
+
+        // إضافة الجسم للـ POST
+        if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+            fetchOptions.body = body;
+        }
+
+        const response = await fetch(targetUrl, fetchOptions);
 
         if (!response.ok) return null;
 
@@ -174,7 +153,8 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
             statusCode: response.status
         };
 
-        if (buffer.length < 3 * 1024 * 1024) {
+        // تخزين مؤقت للـ GET فقط
+        if (method === 'GET' && buffer.length < 3 * 1024 * 1024) {
             cache.set(cacheKey, { data: result, timestamp: Date.now() });
         }
 
@@ -187,13 +167,12 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
 }
 
 // ============================================================
-//  إعادة كتابة الروابط (مطورة)
+//  إعادة كتابة الروابط
 // ============================================================
 function rewriteLinks(html, baseUrl, proxyBase) {
     let rewritten = html;
 
-    // 1. السمات الأساسية
-    rewritten = rewritten.replace(/(href|src|action|poster|data-src|data-href|data-original|data-url|data-srcset|data-src)\s*=\s*["']([^"']*)["']/gi, (match, attr, attrUrl) => {
+    rewritten = rewritten.replace(/(href|src|action|poster|data-src|data-href|data-original|data-url)\s*=\s*["']([^"']*)["']/gi, (match, attr, attrUrl) => {
         if (!attrUrl || attrUrl.startsWith('javascript:') || attrUrl.startsWith('#') || attrUrl.startsWith('data:') || attrUrl.startsWith('blob:')) {
             return match;
         }
@@ -205,7 +184,6 @@ function rewriteLinks(html, baseUrl, proxyBase) {
         }
     });
 
-    // 2. srcset
     rewritten = rewritten.replace(/srcset\s*=\s*["']([^"']*)["']/gi, (match, srcsetValue) => {
         const parts = srcsetValue.split(',').map(part => {
             const trimmed = part.trim();
@@ -221,7 +199,6 @@ function rewriteLinks(html, baseUrl, proxyBase) {
         return `srcset="${parts.join(', ')}"`;
     });
 
-    // 3. url() في CSS
     rewritten = rewritten.replace(/url\s*\(\s*["']?([^"')]*)["']?\s*\)/gi, (match, url) => {
         if (!url || url.startsWith('data:') || url.startsWith('#') || url.startsWith('blob:')) return match;
         try {
@@ -236,9 +213,9 @@ function rewriteLinks(html, baseUrl, proxyBase) {
 }
 
 // ============================================================
-//  سكربت اعتراض متقدم (لـ YouTube وغيره)
+//  سكربت اعتراض متقدم لـ YouTube
 // ============================================================
-function getAdvancedInterceptionScript(proxyBase, originalUrl) {
+function getYouTubeInterceptionScript(proxyBase, originalUrl) {
     return `
     <script>
     (function() {
@@ -252,6 +229,9 @@ function getAdvancedInterceptionScript(proxyBase, originalUrl) {
             if (!url || typeof url !== 'string') return url;
             if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('javascript:')) return url;
             if (url.includes(window.PROXY_BASE)) return url;
+            if (url.startsWith('http://') || url.startsWith('https://')) {
+                return window.PROXY_BASE + '?url=' + encodeURIComponent(url);
+            }
             try {
                 const absolute = new URL(url, window.ORIGINAL_URL).href;
                 return window.PROXY_BASE + '?url=' + encodeURIComponent(absolute);
@@ -260,7 +240,7 @@ function getAdvancedInterceptionScript(proxyBase, originalUrl) {
             }
         }
 
-        // اعتراض fetch
+        // اعتراض fetch مع دعم POST
         const origFetch = window.fetch;
         window.fetch = function(resource, options) {
             let url = typeof resource === 'string' ? resource : (resource.url || '');
@@ -275,38 +255,13 @@ function getAdvancedInterceptionScript(proxyBase, originalUrl) {
             return origFetch.call(this, resource, options);
         };
 
-        // اعتراض XMLHttpRequest
+        // اعتراض XMLHttpRequest مع دعم POST
         const origOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url, ...args) {
             if (url && typeof url === 'string') {
                 url = rewriteUrl(url);
             }
             return origOpen.call(this, method, url, ...args);
-        };
-
-        // اعتراض window.open
-        const origOpenWindow = window.open;
-        window.open = function(url, ...args) {
-            if (url && typeof url === 'string') {
-                url = rewriteUrl(url);
-            }
-            return origOpenWindow.call(this, url, ...args);
-        };
-
-        // اعتراض location.assign و replace
-        const origAssign = location.assign;
-        location.assign = function(url) {
-            if (url && typeof url === 'string') {
-                url = rewriteUrl(url);
-            }
-            return origAssign.call(this, url);
-        };
-        const origReplace = location.replace;
-        location.replace = function(url) {
-            if (url && typeof url === 'string') {
-                url = rewriteUrl(url);
-            }
-            return origReplace.call(this, url);
         };
 
         // مراقبة التغييرات في DOM
@@ -340,16 +295,16 @@ function getAdvancedInterceptionScript(proxyBase, originalUrl) {
             });
         });
 
-        console.log('[PROXY] ✅ Interception script loaded');
+        console.log('[PROXY] ✅ YouTube interception loaded');
     })();
     </script>
     `;
 }
 
 // ============================================================
-//  معالج Puppeteer مخصص لـ YouTube وغيره
+//  معالج خاص بـ YouTube
 // ============================================================
-async function renderWithPuppeteer(url, options = {}) {
+async function renderYouTube(url) {
     const browser = await getBrowser();
     if (!browser) throw new Error('Browser not available');
 
@@ -362,60 +317,54 @@ async function renderWithPuppeteer(url, options = {}) {
         await page.setUserAgent(userAgent);
         await page.setViewport({ width: 1920, height: 1080 });
 
-        // السماح بجميع الطلبات
         await page.setRequestInterception(true);
         page.on('request', (request) => {
             request.continue();
         });
 
-        // انتظار تحميل الصفحة
         await page.goto(url, { 
             waitUntil: 'networkidle2', 
             timeout: CONFIG.pageTimeout 
         });
 
-        // انتظار إضافي لتطبيقات SPA مثل YouTube
-        await page.waitForTimeout(5000);
+        await page.waitForTimeout(8000);
 
-        // محاولة انتظار ظهور المحتوى الرئيسي
         try {
-            await page.waitForSelector('ytd-app, #content, main, body', { timeout: 10000 });
+            await page.waitForSelector('ytd-app, ytd-page-manager, #content', { timeout: 15000 });
         } catch (_) {}
 
-        // التمرير لأسفل لتحميل المحتوى الإضافي (لـ YouTube)
         await page.evaluate(async () => {
             await new Promise((resolve) => {
                 let totalHeight = 0;
-                const distance = 100;
+                const distance = 200;
                 const timer = setInterval(() => {
                     const scrollHeight = document.body.scrollHeight;
                     window.scrollBy(0, distance);
                     totalHeight += distance;
-                    if (totalHeight >= scrollHeight || totalHeight > 3000) {
+                    if (totalHeight >= Math.min(scrollHeight, 5000)) {
                         clearInterval(timer);
                         resolve();
                     }
-                }, 100);
+                }, 200);
             });
         });
 
-        // الحصول على HTML
-        let html = await page.content();
+        await page.waitForTimeout(3000);
 
-        // إعادة كتابة الروابط
+        let html = await page.content();
         html = rewriteLinks(html, url, CONFIG.proxyBase);
 
-        // إضافة سكربت الاعتراض
-        const script = getAdvancedInterceptionScript(CONFIG.proxyBase, url);
+        const script = getYouTubeInterceptionScript(CONFIG.proxyBase, url);
         html = html.replace('</head>', script + '</head>');
         if (!html.includes('</head>')) {
             html = html.replace('</body>', script + '</body>');
         }
 
+        console.log('[YOUTUBE] ✅ Page rendered successfully');
         return html;
 
     } catch (error) {
-        console.error('[PUPPETEER RENDER ERROR]', error.message);
+        console.error('[YOUTUBE ERROR]', error.message);
         throw error;
     } finally {
         try {
@@ -428,9 +377,9 @@ async function renderWithPuppeteer(url, options = {}) {
 }
 
 // ============================================================
-//  المعالج الرئيسي
+//  المعالج الرئيسي - يقبل جميع الطرق (GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD)
 // ============================================================
-app.get('/proxy', async (req, res) => {
+app.all('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
@@ -444,14 +393,22 @@ app.get('/proxy', async (req, res) => {
     }
 
     try {
-        console.log(`[PROXY] ${targetUrl.substring(0, 80)}...`);
+        const method = req.method;
+        console.log(`[PROXY] ${method} ${targetUrl.substring(0, 80)}...`);
 
-        // إذا كان طلب مورد
+        // إذا كان طلب مورد (CSS, JS, صور, فيديو)
         const isResource = targetUrl.match(/\.(css|js|mjs|png|jpg|jpeg|gif|svg|webp|mp4|webm|mp3|pdf|zip|gz|wasm|json|xml)$/i);
         const acceptHeader = req.headers.accept || '';
 
+        // معالجة الموارد
         if (isResource || (!acceptHeader.includes('text/html') && !targetUrl.includes('youtube.com/watch'))) {
-            const result = await fetchResource(targetUrl, req.headers);
+            // الحصول على الجسم للـ POST
+            let body = null;
+            if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+                body = JSON.stringify(req.body);
+            }
+
+            const result = await fetchResource(targetUrl, req.headers, body, method);
             if (!result) {
                 return res.status(404).send(getErrorPage('غير موجود', 'تعذر جلب المورد'));
             }
@@ -479,36 +436,31 @@ app.get('/proxy', async (req, res) => {
             return res.send(result.data);
         }
 
-        // معالجة الصفحات HTML
-        const hostname = new URL(targetUrl).hostname || '';
-        const needsPuppeteer = CONFIG.puppeteerSites.some(site => hostname.includes(site)) || 
-                              targetUrl.includes('youtube.com/watch') || 
-                              targetUrl.includes('youtu.be');
-
+        // معالجة صفحات YouTube
         let html;
-        if (needsPuppeteer) {
-            console.log('[RENDER] Using Puppeteer');
-            html = await renderWithPuppeteer(targetUrl);
+        if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+            // للـ POST على YouTube (مثل log_event) نمررها مباشرة
+            if (method !== 'GET') {
+                const body = JSON.stringify(req.body);
+                const result = await fetchResource(targetUrl, req.headers, body, method);
+                if (!result) {
+                    return res.status(404).send(getErrorPage('غير موجود', 'تعذر جلب المورد'));
+                }
+                res.setHeader('Content-Type', result.contentType);
+                return res.send(result.data);
+            }
+
+            console.log('[YOUTUBE] Rendering with special handler');
+            html = await renderYouTube(targetUrl);
         } else {
-            console.log('[FETCH] Direct fetch');
             const result = await fetchResource(targetUrl, req.headers);
             if (!result) {
                 return res.status(503).send(getErrorPage('خطأ في التحميل', 'فشل تحميل الموقع'));
             }
-
-            const contentType = result.contentType || '';
-            if (!contentType.includes('text/html')) {
-                res.setHeader('Content-Type', contentType);
-                return res.send(result.data);
-            }
-
             html = result.data.toString('utf-8');
             html = rewriteLinks(html, targetUrl, CONFIG.proxyBase);
-            const script = getAdvancedInterceptionScript(CONFIG.proxyBase, targetUrl);
+            const script = getYouTubeInterceptionScript(CONFIG.proxyBase, targetUrl);
             html = html.replace('</head>', script + '</head>');
-            if (!html.includes('</head>')) {
-                html = html.replace('</body>', script + '</body>');
-            }
         }
 
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -522,7 +474,7 @@ app.get('/proxy', async (req, res) => {
 });
 
 // ============================================================
-//  الصفحة الرئيسية
+//  الصفحة الرئيسية - YouTube فقط
 // ============================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -531,12 +483,12 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>وكيل الويب الذكي v6.5</title>
+    <title>YouTube Proxy</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #ff0000 0%, #cc0000 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -547,14 +499,15 @@ app.get('/', (req, res) => {
             background: white;
             border-radius: 24px;
             padding: 60px 40px;
-            max-width: 750px;
-            box-shadow: 0 30px 80px rgba(0,0,0,0.35);
-            text-align: right;
+            max-width: 650px;
+            box-shadow: 0 30px 80px rgba(0,0,0,0.4);
+            text-align: center;
             width: 100%;
         }
-        h1 { color: #2d3748; font-size: 40px; margin-bottom: 8px; font-weight: 800; }
-        .subtitle { color: #718096; font-size: 18px; margin-bottom: 40px; }
-        .search-group { display: flex; gap: 12px; margin-bottom: 40px; }
+        .logo { font-size: 80px; margin-bottom: 10px; }
+        h1 { color: #ff0000; font-size: 40px; margin-bottom: 8px; font-weight: 900; }
+        .subtitle { color: #666; font-size: 18px; margin-bottom: 40px; }
+        .search-group { display: flex; gap: 12px; margin-bottom: 30px; }
         input {
             flex: 1;
             padding: 18px 22px;
@@ -563,11 +516,12 @@ app.get('/', (req, res) => {
             font-size: 17px;
             transition: 0.3s;
             background: #f7fafc;
+            direction: ltr;
         }
         input:focus {
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.15);
+            border-color: #ff0000;
+            box-shadow: 0 0 0 4px rgba(255, 0, 0, 0.15);
             background: white;
         }
         .btn {
@@ -577,86 +531,68 @@ app.get('/', (req, res) => {
             font-size: 18px;
             font-weight: 700;
             cursor: pointer;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #ff0000;
             color: white;
             transition: 0.3s;
             white-space: nowrap;
         }
-        .btn:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4); }
-        .services {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-            gap: 14px;
-            margin: 40px 0;
-        }
-        .service-btn {
-            padding: 20px 10px;
-            border: 2px solid #edf2f7;
+        .btn:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(255, 0, 0, 0.4); background: #cc0000; }
+        .links { display: flex; gap: 15px; justify-content: center; flex-wrap: wrap; margin-top: 30px; }
+        .link-btn {
+            padding: 15px 25px;
+            border: 2px solid #e2e8f0;
             background: #fafcff;
-            border-radius: 14px;
+            border-radius: 12px;
             cursor: pointer;
             transition: 0.3s;
-            text-align: center;
             text-decoration: none;
-            color: #2d3748;
+            color: #333;
             font-weight: 700;
-            font-size: 15px;
+            font-size: 16px;
         }
-        .service-btn:hover {
-            border-color: #667eea;
-            background: #667eea;
-            color: white;
-            transform: translateY(-4px);
-            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.25);
-        }
+        .link-btn:hover { border-color: #ff0000; background: #fff5f5; transform: translateY(-3px); }
         .info {
-            background: #f0f4ff;
-            padding: 24px;
-            border-radius: 16px;
+            background: #fff5f5;
+            padding: 20px;
+            border-radius: 12px;
             margin-top: 30px;
-            color: #2d3748;
-            font-size: 15px;
-            border: 1px solid rgba(102, 126, 234, 0.15);
+            color: #333;
+            font-size: 14px;
+            border: 1px solid rgba(255, 0, 0, 0.15);
             line-height: 1.8;
         }
-        .info strong { color: #667eea; }
+        .info strong { color: #ff0000; }
         @media (max-width: 600px) {
             .container { padding: 30px 20px; }
-            h1 { font-size: 30px; }
+            h1 { font-size: 28px; }
             .search-group { flex-direction: column; }
-            .services { grid-template-columns: repeat(2, 1fr); }
+            .logo { font-size: 50px; }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>وكيل الويب الذكي</h1>
-        <p class="subtitle">تصفح YouTube وجميع المواقع بحرية تامة 🚀</p>
+        <div class="logo">▶️</div>
+        <h1>YouTube Proxy</h1>
+        <p class="subtitle">شوف أي فيديو من غير حظر 🚀</p>
 
         <div class="search-group">
-            <input type="text" id="urlInput" placeholder="أدخل رابط أو ابحث..." autofocus>
-            <button class="btn" onclick="go()">بحث</button>
+            <input type="text" id="urlInput" placeholder="https://youtube.com/watch?v=..." autofocus>
+            <button class="btn" onclick="go()">▶ تشغيل</button>
         </div>
 
-        <div class="services">
-            <a class="service-btn" href="/proxy?url=https://www.youtube.com">▶️ YouTube</a>
-            <a class="service-btn" href="/proxy?url=https://www.google.com">🔍 Google</a>
-            <a class="service-btn" href="/proxy?url=https://www.facebook.com">📘 Facebook</a>
-            <a class="service-btn" href="/proxy?url=https://www.instagram.com">📸 Instagram</a>
-            <a class="service-btn" href="/proxy?url=https://www.tiktok.com">🎵 TikTok</a>
-            <a class="service-btn" href="/proxy?url=https://twitter.com">🐦 Twitter</a>
-            <a class="service-btn" href="/proxy?url=https://www.reddit.com">🗣️ Reddit</a>
-            <a class="service-btn" href="/proxy?url=https://www.twitch.tv">🎮 Twitch</a>
+        <div class="links">
+            <a class="link-btn" href="/proxy?url=https://www.youtube.com">🏠 الرئيسية</a>
+            <a class="link-btn" href="/proxy?url=https://www.youtube.com/trending">🔥 رائج</a>
+            <a class="link-btn" href="/proxy?url=https://www.youtube.com/feed/subscriptions">📺 اشتراكات</a>
         </div>
 
         <div class="info">
-            <strong>✨ المميزات:</strong><br>
-            • دعم كامل لـ <strong>YouTube</strong> (فيديوهات، تعليقات، بث مباشر).<br>
-            • تحميل جميع الموارد (CSS, JS, صور, فيديو).<br>
-            • اعتراض طلبات AJAX و Fetch.<br>
-            • دعم <strong>Range</strong> لتشغيل الفيديو بسلاسة.<br>
-            • إعادة كتابة شاملة للروابط.<br>
-            • يدعم جميع المواقع تقريباً.
+            <strong>💡 فقط YouTube:</strong><br>
+            • شوف أي فيديو بحرية<br>
+            • دعم كامل للتعليقات<br>
+            • تشغيل سلس للفيديو<br>
+            • واجهة كاملة مثل الموقع الأصلي
         </div>
     </div>
 
@@ -667,10 +603,12 @@ app.get('/', (req, res) => {
             let finalUrl;
             if (input.startsWith('http://') || input.startsWith('https://')) {
                 finalUrl = input;
-            } else if (input.includes('.') && !input.includes(' ')) {
+            } else if (input.includes('youtube.com') || input.includes('youtu.be')) {
                 finalUrl = 'https://' + input;
+            } else if (input.includes(' ') || !input.includes('.')) {
+                finalUrl = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(input);
             } else {
-                finalUrl = 'https://www.google.com/search?q=' + encodeURIComponent(input);
+                finalUrl = 'https://' + input;
             }
             window.location.href = '/proxy?url=' + encodeURIComponent(finalUrl);
         }
@@ -689,7 +627,8 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
     res.json({
         status: 'operational',
-        version: '6.5.0',
+        version: '7.1.0',
+        service: 'YouTube Proxy Only - Supports GET & POST',
         uptime: process.uptime(),
         pagePoolSize: pagePool.size,
         cacheSize: cache.size,
@@ -712,7 +651,7 @@ function getErrorPage(title, message) {
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #ff0000 0%, #cc0000 100%);
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -725,17 +664,19 @@ function getErrorPage(title, message) {
             padding: 50px 40px;
             max-width: 600px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.25);
-            text-align: right;
+            text-align: center;
         }
         h1 { color: #e53e3e; margin-bottom: 16px; font-size: 34px; }
         p { color: #4a5568; line-height: 1.9; font-size: 18px; }
-        a { color: #667eea; text-decoration: none; margin-top: 30px; display: inline-block; font-weight: 700; font-size: 18px; }
+        a { color: #ff0000; text-decoration: none; margin-top: 30px; display: inline-block; font-weight: 700; font-size: 18px; }
         a:hover { text-decoration: underline; }
+        .logo { font-size: 60px; }
     </style>
 </head>
 <body>
     <div class="error-box">
-        <h1>⚠️ ${title}</h1>
+        <div class="logo">😢</div>
+        <h1>${title}</h1>
         <p>${message}</p>
         <a href="/">↩ العودة للرئيسية</a>
     </div>
@@ -754,15 +695,18 @@ app.listen(PORT, '0.0.0.0', async () => {
         await getBrowser();
         console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║         🚀  SMART WEB PROXY v6.5  –  YouTube Edition          ║
+║         🎬  YOUTUBE PROXY v7.1  –  Full Support              ║
 ║                                                                ║
 ║  🌐  http://localhost:${PORT}                                  ║
 ║                                                                ║
-║  ✅  دعم كامل لـ YouTube:                                     ║
-║     ✓  فيديوهات                                               ║
+║  ✅  يدعم جميع الطرق: GET, POST, PUT, DELETE, PATCH           ║
+║  ✅  مخصص لـ YouTube فقط:                                     ║
+║     ✓  فيديوهات كاملة                                         ║
 ║     ✓  تعليقات                                                ║
 ║     ✓  بث مباشر                                               ║
-║     ✓  تشغيل سلس مع دعم Range                                 ║
+║     ✓  تشغيل سلس                                             ║
+║     ✓  واجهة كاملة مثل الأصلي                                ║
+║     ✓  دعم طلبات الـ API (log_event, إلخ)                    ║
 ║                                                                ║
 ║  ⚡  Status: Ready                                             ║
 ╚══════════════════════════════════════════════════════════════════╝
