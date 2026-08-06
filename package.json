@@ -1,24 +1,26 @@
 {
-  "name": "croxyproxy-server",
-  "version": "2.1.0",
-  "description": "وكيل CroxyProxy متقدم",
-  "main": "server-fixed.js",
+  "name": "advanced-web-proxy",
+  "version": "3.0.0",
+  "description": "وكيل ويب متقدم يدعم YouTube و TikTok و Facebook",
+  "main": "server-pro.js",
   "scripts": {
-    "start": "node server-fixed.js",
-    "dev": "nodemon server-fixed.js"
+    "start": "node server-pro.js",
+    "dev": "nodemon server-pro.js"
   },
   "keywords": [
     "proxy",
-    "croxyproxy",
     "web-proxy",
-    "vps"
+    "youtube",
+    "tiktok",
+    "facebook"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "cookie-parser": "^1.4.6"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
