@@ -1,65 +1,216 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const url = require('url');
+const { URL } = require('url');
+const cheerio = require('cheerio');
 
 const app = express();
 app.use(cors());
-app.use(express.static('public'));
 app.use(express.json());
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ============================================
-// 🎯 البروكسي الشامل
+// 🎯 البروكسي المتقدم - جيب الموقع كله
 // ============================================
+
+// تخزين مؤقت للموارد
+const resourceCache = new Map();
+
+// دالة جيب المورد (صور، CSS، JS، إلخ)
+async function fetchResource(resourceUrl, baseUrl) {
+    try {
+        // إذا كان المورد رابط نسبي، حوّله لمطلق
+        let fullUrl = resourceUrl;
+        if (resourceUrl.startsWith('/')) {
+            const baseUrlObj = new URL(baseUrl);
+            fullUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}${resourceUrl}`;
+        } else if (!resourceUrl.startsWith('http')) {
+            fullUrl = new URL(resourceUrl, baseUrl).toString();
+        }
+
+        // تحقق من الـ cache
+        if (resourceCache.has(fullUrl)) {
+            return resourceCache.get(fullUrl);
+        }
+
+        const response = await fetch(fullUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': baseUrl,
+            },
+            timeout: 10000
+        });
+
+        if (!response.ok) {
+            return null;
+        }
+
+        const buffer = await response.buffer();
+        
+        // خزّن في الـ cache (حد أقصى 100 مورد)
+        if (resourceCache.size > 100) {
+            const firstKey = resourceCache.keys().next().value;
+            resourceCache.delete(firstKey);
+        }
+        resourceCache.set(fullUrl, buffer);
+
+        return buffer;
+    } catch (error) {
+        console.error('❌ خطأ في جيب المورد:', error.message);
+        return null;
+    }
+}
+
+// الـ endpoint الرئيسي للبروكسي
 app.get('/proxy', async (req, res) => {
     try {
         const targetUrl = req.query.url;
         if (!targetUrl) {
-            return res.status(400).send('❌ مطلوب رابط (url parameter)');
+            return res.status(400).json({ error: '❌ مطلوب رابط (url parameter)' });
         }
 
         const decodedUrl = decodeURIComponent(targetUrl);
-        
+
         // تحقق من صحة الرابط
         if (!decodedUrl.startsWith('http://') && !decodedUrl.startsWith('https://')) {
-            return res.status(400).send('❌ الرابط يجب أن يبدأ بـ http:// أو https://');
+            return res.status(400).json({ error: '❌ الرابط يجب أن يبدأ بـ http:// أو https://' });
         }
 
-        console.log('📡 البروكسي يمرّر:', decodedUrl);
+        console.log('📡 البروكسي يجيب:', decodedUrl);
 
         const response = await fetch(decodedUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-                'Referer': new URL(decodedUrl).origin,
             },
             redirect: 'follow',
             timeout: 30000
         });
 
         if (!response.ok) {
-            return res.status(response.status).send(`❌ خطأ من الموقع: ${response.status}`);
+            return res.status(response.status).json({ error: `❌ خطأ: ${response.status}` });
         }
 
-        // نقل رؤوس الاستجابة
-        const contentType = response.headers.get('content-type');
-        res.setHeader('Content-Type', contentType || 'text/html; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        
-        // لا نرسل رؤوس مشكوك فيها
-        const headerBlacklist = ['content-encoding', 'transfer-encoding', 'content-security-policy', 'x-frame-options'];
-        response.headers.forEach((value, name) => {
-            if (!headerBlacklist.includes(name.toLowerCase())) {
-                res.setHeader(name, value);
-            }
-        });
+        const contentType = response.headers.get('content-type') || 'text/html';
 
-        response.body.pipe(res);
+        // إذا كان HTML، عدّل الروابط
+        if (contentType.includes('text/html')) {
+            let html = await response.text();
+
+            // استخدم cheerio لتعديل HTML
+            const $ = cheerio.load(html);
+
+            // عدّل الروابط في الـ href و src
+            $('a').each((i, elem) => {
+                const href = $(elem).attr('href');
+                if (href) {
+                    if (!href.startsWith('http') && !href.startsWith('javascript:') && !href.startsWith('#')) {
+                        const fullUrl = new URL(href, decodedUrl).toString();
+                        $(elem).attr('href', `/proxy?url=${encodeURIComponent(fullUrl)}`);
+                    } else if (href.startsWith('http')) {
+                        $(elem).attr('href', `/proxy?url=${encodeURIComponent(href)}`);
+                    }
+                }
+            });
+
+            // عدّل الصور
+            $('img').each((i, elem) => {
+                const src = $(elem).attr('src');
+                if (src && !src.startsWith('data:')) {
+                    const fullUrl = new URL(src, decodedUrl).toString();
+                    $(elem).attr('src', `/proxy?url=${encodeURIComponent(fullUrl)}`);
+                }
+            });
+
+            // عدّل CSS
+            $('link[rel="stylesheet"]').each((i, elem) => {
+                const href = $(elem).attr('href');
+                if (href && !href.startsWith('http')) {
+                    const fullUrl = new URL(href, decodedUrl).toString();
+                    $(elem).attr('href', `/proxy?url=${encodeURIComponent(fullUrl)}`);
+                } else if (href && href.startsWith('http')) {
+                    $(elem).attr('href', `/proxy?url=${encodeURIComponent(href)}`);
+                }
+            });
+
+            // عدّل الـ scripts
+            $('script').each((i, elem) => {
+                const src = $(elem).attr('src');
+                if (src && !src.startsWith('http')) {
+                    const fullUrl = new URL(src, decodedUrl).toString();
+                    $(elem).attr('src', `/proxy?url=${encodeURIComponent(fullUrl)}`);
+                } else if (src && src.startsWith('http')) {
+                    $(elem).attr('src', `/proxy?url=${encodeURIComponent(src)}`);
+                }
+            });
+
+            // أضف meta tag للـ base URL
+            $('head').prepend(`<base href="${decodedUrl}">`);
+
+            // أضف CSS مخصص لتحسين الواجهة
+            $('head').append(`
+                <style>
+                    body { margin: 0; padding: 0; }
+                    * { box-sizing: border-box; }
+                </style>
+            `);
+
+            res.set('Content-Type', 'text/html; charset=utf-8');
+            res.send($.html());
+        } else {
+            // للملفات الأخرى (صور، PDF، إلخ)
+            res.set('Content-Type', contentType);
+            res.set('Access-Control-Allow-Origin', '*');
+            response.body.pipe(res);
+        }
 
     } catch (error) {
         console.error('❌ خطأ البروكسي:', error.message);
-        res.status(500).send(`❌ خطأ: ${error.message}`);
+        res.status(500).json({ error: `❌ خطأ: ${error.message}` });
+    }
+});
+
+// endpoint لجيب الملفات الثابتة (صور، CSS، JS)
+app.get('/resource', async (req, res) => {
+    try {
+        const resourceUrl = req.query.url;
+        const baseUrl = req.query.base;
+
+        if (!resourceUrl || !baseUrl) {
+            return res.status(400).send('Missing parameters');
+        }
+
+        const buffer = await fetchResource(decodeURIComponent(resourceUrl), decodeURIComponent(baseUrl));
+
+        if (!buffer) {
+            return res.status(404).send('Resource not found');
+        }
+
+        // حدّد نوع المحتوى بناءً على الامتداد
+        const ext = resourceUrl.split('.').pop().toLowerCase();
+        const mimeTypes = {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'svg': 'image/svg+xml',
+            'css': 'text/css',
+            'js': 'application/javascript',
+            'woff': 'font/woff',
+            'woff2': 'font/woff2',
+            'ttf': 'font/ttf',
+            'eot': 'application/vnd.ms-fontobject'
+        };
+
+        res.set('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.send(buffer);
+    } catch (error) {
+        console.error('❌ خطأ:', error.message);
+        res.status(500).send('Error');
     }
 });
 
@@ -73,65 +224,72 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🌐 Proxy Browser</title>
+    <title>🌐 Proxy Pro - بروكسي ضخم</title>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
+        html, body {
+            width: 100%;
+            height: 100%;
+        }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
         }
         .navbar {
-            background: rgba(255,255,255,0.1);
+            background: rgba(0,0,0,0.3);
             backdrop-filter: blur(10px);
-            border-radius: 12px;
-            padding: 15px 20px;
-            margin-bottom: 20px;
+            padding: 12px 20px;
             display: flex;
             gap: 10px;
             align-items: center;
-            border: 1px solid rgba(255,255,255,0.2);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            flex-shrink: 0;
+            z-index: 1000;
         }
         .logo {
-            font-size: 24px;
+            font-size: 22px;
             font-weight: bold;
             color: #fff;
-            min-width: 120px;
+            white-space: nowrap;
         }
         .url-bar {
             flex: 1;
             display: flex;
             gap: 8px;
+            min-width: 0;
         }
         .url-bar input {
             flex: 1;
-            padding: 10px 16px;
+            padding: 8px 14px;
             border: 1px solid rgba(255,255,255,0.2);
             background: rgba(255,255,255,0.05);
             color: #fff;
-            border-radius: 8px;
-            font-size: 14px;
-            min-width: 0;
+            border-radius: 6px;
+            font-size: 13px;
+            min-width: 200px;
         }
         .url-bar input::placeholder {
-            color: rgba(255,255,255,0.6);
+            color: rgba(255,255,255,0.5);
         }
         .url-bar input:focus {
             outline: none;
-            background: rgba(255,255,255,0.15);
-            border-color: rgba(255,255,255,0.4);
+            background: rgba(255,255,255,0.1);
+            border-color: rgba(255,255,255,0.3);
         }
         .btn {
-            padding: 10px 20px;
+            padding: 8px 16px;
             border: none;
-            border-radius: 8px;
+            border-radius: 6px;
             cursor: pointer;
             font-weight: 600;
+            font-size: 13px;
             transition: all 0.3s ease;
             white-space: nowrap;
         }
@@ -143,36 +301,33 @@ app.get('/', (req, res) => {
             transform: scale(1.05);
             box-shadow: 0 4px 15px rgba(0,0,0,0.2);
         }
+        .btn-go:active {
+            transform: scale(0.98);
+        }
         .btn-clear {
-            background: rgba(255,0,0,0.3);
+            background: rgba(255,0,0,0.2);
             color: #fff;
             border: 1px solid rgba(255,0,0,0.5);
         }
         .btn-clear:hover {
-            background: rgba(255,0,0,0.5);
+            background: rgba(255,0,0,0.4);
         }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .content-area {
-            background: #fff;
-            border-radius: 12px;
+        .content {
+            flex: 1;
+            display: flex;
             overflow: hidden;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            height: 80vh;
+        }
+        .main-content {
+            flex: 1;
             display: flex;
             flex-direction: column;
+            overflow: hidden;
         }
-        #iframe-container {
+        #proxy-frame {
             flex: 1;
-            display: none;
-            position: relative;
-        }
-        #proxy-iframe {
+            border: none;
             width: 100%;
             height: 100%;
-            border: none;
         }
         .welcome-screen {
             flex: 1;
@@ -183,58 +338,99 @@ app.get('/', (req, res) => {
             gap: 20px;
             padding: 40px;
             text-align: center;
+            color: #fff;
         }
         .welcome-screen h1 {
-            font-size: 48px;
-            color: #667eea;
+            font-size: 56px;
             margin-bottom: 10px;
+            text-shadow: 0 2px 10px rgba(0,0,0,0.3);
         }
         .welcome-screen p {
-            color: #666;
             font-size: 18px;
-            margin-bottom: 20px;
+            opacity: 0.9;
+            margin-bottom: 30px;
         }
         .instructions {
-            background: rgba(102, 126, 234, 0.1);
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
             padding: 30px;
             border-radius: 12px;
             max-width: 500px;
-            color: #333;
-            text-align: right;
             line-height: 1.8;
+            border: 1px solid rgba(255,255,255,0.2);
         }
         .instructions strong {
-            color: #667eea;
             display: block;
             margin-top: 15px;
             margin-bottom: 10px;
+            font-size: 16px;
         }
-        .loading {
+        .loading-overlay {
             display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            justify-content: center;
+            align-items: center;
+            z-index: 999;
+        }
+        .loading-overlay.active {
+            display: flex;
+        }
+        .loader {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            padding: 40px;
+            border-radius: 12px;
             text-align: center;
-            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.2);
         }
         .spinner {
-            border: 4px solid rgba(102, 126, 234, 0.1);
-            border-top: 4px solid #667eea;
+            border: 4px solid rgba(255,255,255,0.1);
+            border-top: 4px solid #fff;
             border-radius: 50%;
-            width: 40px;
-            height: 40px;
+            width: 50px;
+            height: 50px;
             animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
+            margin: 0 auto 15px;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        .error {
+        .loader p {
+            color: #fff;
+            font-weight: 500;
+            margin-top: 10px;
+        }
+        .error-msg {
             display: none;
-            background: rgba(255,0,0,0.1);
-            color: #d32f2f;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 15px;
-            border: 1px solid rgba(255,0,0,0.3);
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(255,0,0,0.9);
+            color: #fff;
+            padding: 15px 20px;
+            border-radius: 6px;
+            max-width: 400px;
+            z-index: 2000;
+            animation: slideIn 0.3s ease;
+        }
+        .error-msg.show {
+            display: block;
+        }
+        @keyframes slideIn {
+            from {
+                transform: translateX(400px);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
         }
         @media (max-width: 768px) {
             .navbar {
@@ -242,120 +438,124 @@ app.get('/', (req, res) => {
             }
             .url-bar {
                 width: 100%;
-                order: 3;
+                order: 2;
             }
             .welcome-screen h1 {
                 font-size: 32px;
             }
-            .content-area {
-                height: auto;
-                min-height: 60vh;
+            .instructions {
+                max-width: 90%;
             }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div id="error" class="error"></div>
-        
-        <div class="navbar">
-            <div class="logo">🌐 Proxy</div>
-            <div class="url-bar">
-                <input type="text" id="urlInput" placeholder="https://example.com" />
-                <button class="btn btn-go" id="goBtn">GO</button>
-                <button class="btn btn-clear" id="clearBtn">✕</button>
-            </div>
-        </div>
-
-        <div class="content-area">
-            <div id="loading" class="loading">
-                <div class="spinner"></div>
-                <p style="color: #667eea; margin-top: 10px;">جاري التحميل...</p>
-            </div>
-
-            <div id="iframe-container">
-                <iframe id="proxy-iframe"></iframe>
-            </div>
-
-            <div id="welcome" class="welcome-screen">
-                <h1>🌐 Proxy Browser</h1>
-                <p>ادخل رابط أي موقع وشغّله من خلال البروكسي</p>
-                <div class="instructions">
-                    <strong>📌 طريقة الاستخدام:</strong>
-                    1️⃣ ادخل رابط الموقع (مثل https://example.com)<br>
-                    2️⃣ اضغط زر GO<br>
-                    3️⃣ الموقع هيتحمّل من خلال البروكسي<br>
-                    <br>
-                    <strong>⚡ أمثلة:</strong>
-                    https://google.com<br>
-                    https://reddit.com<br>
-                    https://wikipedia.org
-                </div>
-            </div>
+    <div class="navbar">
+        <div class="logo">🌐 Proxy Pro</div>
+        <div class="url-bar">
+            <input type="text" id="urlInput" placeholder="https://example.com" />
+            <button class="btn btn-go" id="goBtn">GO</button>
+            <button class="btn btn-clear" id="clearBtn">✕</button>
         </div>
     </div>
+
+    <div class="content">
+        <div class="main-content">
+            <div id="welcome" class="welcome-screen">
+                <h1>🌐 Proxy Pro</h1>
+                <p>بروكسي ضخم - افتح أي موقع بكل محتوياته</p>
+                <div class="instructions">
+                    <strong>📌 الاستخدام:</strong>
+                    1️⃣ ادخل رابط الموقع<br>
+                    2️⃣ اضغط GO أو Enter<br>
+                    3️⃣ الموقع يفتح بكل محتوياته<br>
+                    <br>
+                    <strong>⚡ أمثلة:</strong>
+                    google.com<br>
+                    reddit.com<br>
+                    wikipedia.org<br>
+                    github.com
+                </div>
+            </div>
+            <iframe id="proxy-frame"></iframe>
+        </div>
+    </div>
+
+    <div id="loading" class="loading-overlay">
+        <div class="loader">
+            <div class="spinner"></div>
+            <p>جاري التحميل...</p>
+        </div>
+    </div>
+
+    <div id="error" class="error-msg"></div>
 
     <script>
         const urlInput = document.getElementById('urlInput');
         const goBtn = document.getElementById('goBtn');
         const clearBtn = document.getElementById('clearBtn');
-        const iframe = document.getElementById('proxy-iframe');
-        const iframeContainer = document.getElementById('iframe-container');
+        const frame = document.getElementById('proxy-frame');
         const welcome = document.getElementById('welcome');
         const loading = document.getElementById('loading');
         const errorDiv = document.getElementById('error');
 
         function showError(msg) {
             errorDiv.textContent = msg;
-            errorDiv.style.display = 'block';
+            errorDiv.classList.add('show');
             setTimeout(() => {
-                errorDiv.style.display = 'none';
+                errorDiv.classList.remove('show');
             }, 5000);
         }
 
         function loadProxy() {
-            const inputUrl = urlInput.value.trim();
+            let inputUrl = urlInput.value.trim();
             if (!inputUrl) {
                 showError('❌ ادخل رابط الموقع');
                 return;
             }
 
-            // أضف http إذا لم يكن موجود
-            let targetUrl = inputUrl;
-            if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-                targetUrl = 'https://' + targetUrl;
+            // أضف https إذا لم يكن موجود
+            if (!inputUrl.startsWith('http://') && !inputUrl.startsWith('https://')) {
+                inputUrl = 'https://' + inputUrl;
             }
 
-            // بناء رابط البروكسي
-            const proxyUrl = \`/proxy?url=\${encodeURIComponent(targetUrl)}\`;
-
-            console.log('🔄 جاري التحميل من البروكسي:', proxyUrl);
+            console.log('🔄 جاري التحميل:', inputUrl);
 
             welcome.style.display = 'none';
-            loading.style.display = 'block';
+            loading.classList.add('active');
 
-            iframe.onload = () => {
-                loading.style.display = 'none';
-                iframeContainer.style.display = 'block';
+            // حدّث شريط العنوان
+            urlInput.value = inputUrl;
+
+            // جيب الصفحة من خلال البروكسي
+            const proxyUrl = \`/proxy?url=\${encodeURIComponent(inputUrl)}\`;
+            frame.src = proxyUrl;
+
+            // إخفاء التحميل عند انتهاء جيب الصفحة
+            const timeout = setTimeout(() => {
+                loading.classList.remove('active');
+            }, 5000);
+
+            frame.onload = () => {
+                clearTimeout(timeout);
+                loading.classList.remove('active');
+                console.log('✅ تم التحميل');
             };
 
-            iframe.onerror = () => {
-                loading.style.display = 'none';
-                showError('❌ حدث خطأ في تحميل الموقع');
+            frame.onerror = () => {
+                clearTimeout(timeout);
+                loading.classList.remove('active');
+                showError('❌ خطأ في تحميل الموقع');
                 welcome.style.display = 'flex';
-                iframeContainer.style.display = 'none';
             };
-
-            iframe.src = proxyUrl;
         }
 
         goBtn.addEventListener('click', loadProxy);
         clearBtn.addEventListener('click', () => {
             urlInput.value = '';
-            iframe.src = '';
-            iframeContainer.style.display = 'none';
+            frame.src = '';
             welcome.style.display = 'flex';
-            loading.style.display = 'none';
+            loading.classList.remove('active');
             urlInput.focus();
         });
 
@@ -363,10 +563,8 @@ app.get('/', (req, res) => {
             if (e.key === 'Enter') loadProxy();
         });
 
-        // ركّز على الـ input
         urlInput.focus();
-
-        console.log('🚀 Proxy Browser v1.0');
+        console.log('🚀 Proxy Pro v2.0 - بروكسي ضخم');
     </script>
 </body>
 </html>
@@ -380,20 +578,20 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║  🌐 Proxy Browser v1.0                ║
+║  🌐 Proxy Pro v2.0 - بروكسي ضخم      ║
 ║  📡 http://localhost:${PORT}           ║
-║  ✅ بروكسي شامل لأي موقع              ║
+║  ✅ البروكسي يجيب الموقع كله          ║
 ╚════════════════════════════════════════╝
 
-📝 الاستخدام:
-   - اذهب إلى http://localhost:${PORT}
-   - ادخل رابط الموقع
-   - اضغط GO
+📝 المميزات:
+   ✓ جيب الموقع بكل محتوياته
+   ✓ CSS و JavaScript و صور
+   ✓ تعديل تلقائي للروابط
+   ✓ واجهة احترافية
+   ✓ سرعة عالية مع Cache
 
-💡 أمثلة:
-   https://google.com
-   https://reddit.com
-   https://wikipedia.org
+🚀 الاستخدام:
+   http://localhost:${PORT}
     `);
 });
-           
+        
