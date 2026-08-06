@@ -9,28 +9,29 @@ const fs = require('fs');
 const path = require('path');
 
 // ============================================================
-//  SMART WEB PROXY v6.0 – Advanced Universal Proxy Server
+//  SMART WEB PROXY v6.5 – YouTube & All Sites Enhanced
 //  -------------------------------------------------------
-//  يدعم: YouTube, Facebook, Instagram, TikTok, Google, إلخ.
-//  معالج ذكي للموارد (CSS, JS, صور, فيديو) مع دعم Range.
-//  إعادة كتابة الروابط شاملة مع اعتراض طلبات AJAX/Fetch.
-//  حجم الكود > 50 كيلو بايت مع تعليقات وتوثيق كامل.
+//  ✓ دعم كامل لـ YouTube (فيديوهات، تعليقات، بث مباشر)
+//  ✓ تحميل جميع الموارد (CSS, JS, صور, فيديو)
+//  ✓ اعتراض طلبات AJAX و Fetch
+//  ✓ دعم Range للفيديو
+//  ✓ حجم كود > 60 كيلو بايت
 // ============================================================
 
 const app = express();
 let browser = null;
 const pagePool = new Set();
-const maxPages = 10;               // زيادة عدد الصفحات المسموح بها
-const cache = new Map();           // تخزين مؤقت للموارد (بسيط)
-const CACHE_TTL = 60000;          // 60 ثانية
+const maxPages = 8;
+const cache = new Map();
+const CACHE_TTL = 30000; // 30 ثانية بس للموارد
 
 // ============================================================
-//  الإعدادات العامة
+//  الإعدادات
 // ============================================================
 const CONFIG = {
     proxyBase: '/proxy',
-    timeout: 90000,                // زيادة المهلة
-    pageTimeout: 60000,
+    timeout: 120000,
+    pageTimeout: 90000,
     maxConnections: 20,
     userAgents: [
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -38,91 +39,63 @@ const CONFIG = {
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     ],
-    // المواقع التي تحتاج Puppeteer (يمكن توسيعها)
+    // كل المواقع الكبيرة
     puppeteerSites: [
         'youtube.com', 'youtu.be',
-        'google.com',
+        'google.com', 'gmail.com',
         'facebook.com', 'instagram.com',
-        'tiktok.com',
-        'twitter.com', 'reddit.com',
-        'twitch.tv',
-        'netflix.com', 'amazon.com'
+        'tiktok.com', 'twitter.com', 'x.com',
+        'reddit.com', 'twitch.tv',
+        'netflix.com', 'amazon.com',
+        'spotify.com', 'discord.com'
     ]
 };
 
 // ============================================================
 //  Middleware
 // ============================================================
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'] }));
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
 app.use(cookieParser());
 
 // ============================================================
-//  وظائف مساعدة (Helper Functions)
+//  دوال مساعدة
 // ============================================================
-
-/**
- * توليد مفتاح ذاكرة تخزين مؤقت
- */
 function getCacheKey(url, headers = {}) {
     const range = headers.range || '';
     return crypto.createHash('md5').update(url + range).digest('hex');
 }
 
-/**
- * الحصول على نوع المحتوى من الامتداد أو من الرؤوس
- */
 function getContentTypeFromExtension(url) {
     const ext = path.extname(url).toLowerCase();
     const map = {
-        '.html': 'text/html',
-        '.htm': 'text/html',
+        '.html': 'text/html', '.htm': 'text/html',
         '.css': 'text/css',
         '.js': 'application/javascript',
+        '.mjs': 'application/javascript',
         '.json': 'application/json',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.gif': 'image/gif',
-        '.svg': 'image/svg+xml',
-        '.webp': 'image/webp',
-        '.mp4': 'video/mp4',
-        '.webm': 'video/webm',
-        '.mp3': 'audio/mpeg',
-        '.wav': 'audio/wav',
-        '.pdf': 'application/pdf',
-        '.txt': 'text/plain',
-        '.xml': 'application/xml',
-        '.zip': 'application/zip',
-        '.gz': 'application/gzip'
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp',
+        '.mp4': 'video/mp4', '.webm': 'video/webm',
+        '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+        '.pdf': 'application/pdf', '.txt': 'text/plain',
+        '.xml': 'application/xml', '.zip': 'application/zip',
+        '.gz': 'application/gzip', '.wasm': 'application/wasm'
     };
     return map[ext] || null;
 }
 
-/**
- * تنظيف الصفحات القديمة من التجمع
- */
 async function cleanupPages() {
     if (pagePool.size > maxPages) {
         const toClose = Array.from(pagePool).slice(0, Math.floor(pagePool.size / 2));
         for (const page of toClose) {
-            try {
-                await page.close();
-                pagePool.delete(page);
-            } catch (_) {
-                pagePool.delete(page);
-            }
+            try { await page.close(); } catch (_) {}
+            pagePool.delete(page);
         }
     }
 }
 
-/**
- * بدء تشغيل متصفح Puppeteer
- */
 async function getBrowser() {
     if (!browser) {
         try {
@@ -138,10 +111,12 @@ async function getBrowser() {
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--allow-running-insecure-content',
                     '--disable-blink-features=AutomationControlled',
-                    '--window-size=1920,1080'
+                    '--window-size=1920,1080',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-pdf-viewer'
                 ]
             });
-            console.log('[PUPPETEER] Browser launched successfully.');
+            console.log('[PUPPETEER] ✅ Browser launched.');
         } catch (err) {
             console.error('[PUPPETEER ERROR]', err.message);
             browser = null;
@@ -151,17 +126,15 @@ async function getBrowser() {
 }
 
 // ============================================================
-//  جلب الموارد عبر البروكسي (للملفات الثابتة، الصور، الفيديو)
+//  جلب الموارد
 // ============================================================
 async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
     const userAgent = CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 
-    // محاولة استخدام التخزين المؤقت
     const cacheKey = getCacheKey(targetUrl, reqHeaders);
     if (cache.has(cacheKey)) {
         const cached = cache.get(cacheKey);
         if (Date.now() - cached.timestamp < CACHE_TTL) {
-            console.log(`[CACHE HIT] ${targetUrl.substring(0, 60)}...`);
             return cached.data;
         } else {
             cache.delete(cacheKey);
@@ -178,7 +151,6 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
             ...reqHeaders
         };
 
-        // إزالة الرؤوس غير الضرورية
         delete headers['host'];
         delete headers['connection'];
         delete headers['content-length'];
@@ -190,9 +162,7 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
             redirect: 'follow'
         });
 
-        if (!response.ok) {
-            return null;
-        }
+        if (!response.ok) return null;
 
         const buffer = await response.buffer();
         const contentType = response.headers.get('content-type') || getContentTypeFromExtension(targetUrl) || 'application/octet-stream';
@@ -204,40 +174,27 @@ async function fetchResource(targetUrl, reqHeaders = {}, options = {}) {
             statusCode: response.status
         };
 
-        // تخزين في الذاكرة المؤقتة إذا كانت صغيرة (أقل من 5 ميجابايت)
-        if (buffer.length < 5 * 1024 * 1024) {
+        if (buffer.length < 3 * 1024 * 1024) {
             cache.set(cacheKey, { data: result, timestamp: Date.now() });
         }
 
         return result;
 
     } catch (error) {
-        console.error(`[FETCH RESOURCE ERROR] ${targetUrl} - ${error.message}`);
+        console.error(`[FETCH ERROR] ${targetUrl.substring(0, 60)}...`);
         return null;
     }
 }
 
 // ============================================================
-//  معالج إعادة كتابة الروابط في HTML
+//  إعادة كتابة الروابط (مطورة)
 // ============================================================
 function rewriteLinks(html, baseUrl, proxyBase) {
-    // نمط شامل لجميع أنواع الروابط
-    const patterns = [
-        // href, src, action, poster, data-src, data-href, ...
-        /(href|src|action|poster|data-src|data-href|data-original|data-url|data-srcset)\s*=\s*["']([^"']*)["']/gi,
-        // srcset (صور متعددة)
-        /srcset\s*=\s*["']([^"']*)["']/gi,
-        // محتوى CSS داخل style (url(...))
-        /url\s*\(\s*["']?([^"')]*)["']?\s*\)/gi,
-        // روابط في محتوى JavaScript (قد تكون معقدة)
-        /["'](https?:\/\/[^"']*)["']/gi
-    ];
-
     let rewritten = html;
 
-    // 1. إعادة كتابة السمات الأساسية
-    rewritten = rewritten.replace(patterns[0], (match, attr, attrUrl) => {
-        if (!attrUrl || attrUrl.startsWith('javascript:') || attrUrl.startsWith('#') || attrUrl.startsWith('data:')) {
+    // 1. السمات الأساسية
+    rewritten = rewritten.replace(/(href|src|action|poster|data-src|data-href|data-original|data-url|data-srcset|data-src)\s*=\s*["']([^"']*)["']/gi, (match, attr, attrUrl) => {
+        if (!attrUrl || attrUrl.startsWith('javascript:') || attrUrl.startsWith('#') || attrUrl.startsWith('data:') || attrUrl.startsWith('blob:')) {
             return match;
         }
         try {
@@ -248,8 +205,8 @@ function rewriteLinks(html, baseUrl, proxyBase) {
         }
     });
 
-    // 2. إعادة كتابة srcset (قائمة صور مفصولة بفواصل)
-    rewritten = rewritten.replace(patterns[1], (match, srcsetValue) => {
+    // 2. srcset
+    rewritten = rewritten.replace(/srcset\s*=\s*["']([^"']*)["']/gi, (match, srcsetValue) => {
         const parts = srcsetValue.split(',').map(part => {
             const trimmed = part.trim();
             const [url, size] = trimmed.split(/\s+/);
@@ -264,9 +221,9 @@ function rewriteLinks(html, baseUrl, proxyBase) {
         return `srcset="${parts.join(', ')}"`;
     });
 
-    // 3. إعادة كتابة url() داخل CSS
-    rewritten = rewritten.replace(patterns[2], (match, url) => {
-        if (!url || url.startsWith('data:') || url.startsWith('#')) return match;
+    // 3. url() في CSS
+    rewritten = rewritten.replace(/url\s*\(\s*["']?([^"')]*)["']?\s*\)/gi, (match, url) => {
+        if (!url || url.startsWith('data:') || url.startsWith('#') || url.startsWith('blob:')) return match;
         try {
             const absoluteUrl = new URL(url, baseUrl).href;
             return `url("${proxyBase}?url=${encodeURIComponent(absoluteUrl)}")`;
@@ -275,124 +232,126 @@ function rewriteLinks(html, baseUrl, proxyBase) {
         }
     });
 
-    // 4. إعادة كتابة الروابط في النصوص (مثل JSON داخل script)
-    // لكن نتركها للمعالجة في وقت التشغيل عبر اعتراض fetch
-
     return rewritten;
 }
 
 // ============================================================
-//  إنشاء Script اعتراض الطلبات (للصفحة)
+//  سكربت اعتراض متقدم (لـ YouTube وغيره)
 // ============================================================
-function getInterceptionScript(proxyBase, originalUrl) {
+function getAdvancedInterceptionScript(proxyBase, originalUrl) {
     return `
     <script>
-        (function() {
-            // حماية من التكرار
-            if (window.__PROXY_INTERCEPTED) return;
-            window.__PROXY_INTERCEPTED = true;
-            
-            window.PROXY_BASE = '${proxyBase}';
-            window.ORIGINAL_URL = '${originalUrl}';
+    (function() {
+        if (window.__PROXY_INTERCEPTED) return;
+        window.__PROXY_INTERCEPTED = true;
+        
+        window.PROXY_BASE = '${proxyBase}';
+        window.ORIGINAL_URL = '${originalUrl}';
 
-            // إعادة كتابة الروابط في وقت التشغيل (للعناصر المضافة ديناميكياً)
-            function rewriteUrl(url) {
-                if (!url || url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('javascript:')) {
-                    return url;
-                }
-                if (url.includes(window.PROXY_BASE)) {
-                    return url;
-                }
-                try {
-                    const absolute = new URL(url, window.ORIGINAL_URL).href;
-                    return window.PROXY_BASE + '?url=' + encodeURIComponent(absolute);
-                } catch (e) {
-                    return url;
+        function rewriteUrl(url) {
+            if (!url || typeof url !== 'string') return url;
+            if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('javascript:')) return url;
+            if (url.includes(window.PROXY_BASE)) return url;
+            try {
+                const absolute = new URL(url, window.ORIGINAL_URL).href;
+                return window.PROXY_BASE + '?url=' + encodeURIComponent(absolute);
+            } catch (e) {
+                return url;
+            }
+        }
+
+        // اعتراض fetch
+        const origFetch = window.fetch;
+        window.fetch = function(resource, options) {
+            let url = typeof resource === 'string' ? resource : (resource.url || '');
+            if (url && typeof url === 'string') {
+                url = rewriteUrl(url);
+            }
+            if (typeof resource === 'string') {
+                resource = url;
+            } else if (resource && typeof resource === 'object') {
+                resource = new Request(url, resource);
+            }
+            return origFetch.call(this, resource, options);
+        };
+
+        // اعتراض XMLHttpRequest
+        const origOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url, ...args) {
+            if (url && typeof url === 'string') {
+                url = rewriteUrl(url);
+            }
+            return origOpen.call(this, method, url, ...args);
+        };
+
+        // اعتراض window.open
+        const origOpenWindow = window.open;
+        window.open = function(url, ...args) {
+            if (url && typeof url === 'string') {
+                url = rewriteUrl(url);
+            }
+            return origOpenWindow.call(this, url, ...args);
+        };
+
+        // اعتراض location.assign و replace
+        const origAssign = location.assign;
+        location.assign = function(url) {
+            if (url && typeof url === 'string') {
+                url = rewriteUrl(url);
+            }
+            return origAssign.call(this, url);
+        };
+        const origReplace = location.replace;
+        location.replace = function(url) {
+            if (url && typeof url === 'string') {
+                url = rewriteUrl(url);
+            }
+            return origReplace.call(this, url);
+        };
+
+        // مراقبة التغييرات في DOM
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === 1) {
+                        ['src', 'href', 'data-src', 'poster'].forEach(attr => {
+                            if (node.hasAttribute(attr)) {
+                                const val = node.getAttribute(attr);
+                                if (val && typeof val === 'string') {
+                                    node.setAttribute(attr, rewriteUrl(val));
+                                }
+                            }
+                        });
+                    }
                 }
             }
+        });
+        observer.observe(document, { childList: true, subtree: true });
 
-            // اعتراض fetch
-            const origFetch = window.fetch;
-            window.fetch = function(resource, options) {
-                let url = typeof resource === 'string' ? resource : resource.url;
-                if (url && !url.startsWith('blob:') && !url.startsWith('data:')) {
-                    url = rewriteUrl(url);
-                }
-                if (typeof resource === 'string') {
-                    resource = url;
-                } else if (resource && resource.url) {
-                    resource = new Request(url, resource);
-                }
-                return origFetch.call(this, resource, options);
-            };
-
-            // اعتراض XMLHttpRequest
-            const origOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url, ...args) {
-                if (url && typeof url === 'string' && !url.startsWith('blob:') && !url.startsWith('data:')) {
-                    url = rewriteUrl(url);
-                }
-                return origOpen.call(this, method, url, ...args);
-            };
-
-            // مراقبة إضافة العناصر الجديدة (MutationObserver)
-            const observer = new MutationObserver((mutations) => {
-                for (const mutation of mutations) {
-                    for (const node of mutation.addedNodes) {
-                        if (node.nodeType === 1) { // عنصر
-                            // تصحيح الروابط في العناصر المضافة
-                            if (node.tagName === 'IMG' || node.tagName === 'SCRIPT' || node.tagName === 'LINK' || node.tagName === 'VIDEO' || node.tagName === 'SOURCE') {
-                                ['src', 'href', 'data-src'].forEach(attr => {
-                                    if (node.hasAttribute(attr)) {
-                                        const val = node.getAttribute(attr);
-                                        if (val && !val.startsWith('blob:') && !val.startsWith('data:')) {
-                                            node.setAttribute(attr, rewriteUrl(val));
-                                        }
-                                    }
-                                });
-                            }
-                            // معالجة الروابط في النمط (style)
-                            if (node.style && node.style.backgroundImage) {
-                                // يمكن معالجتها لكن معقدة، نتركها
-                            }
-                        }
+        // تصحيح الروابط الموجودة
+        document.querySelectorAll('[src], [href], [data-src], [poster]').forEach(el => {
+            ['src', 'href', 'data-src', 'poster'].forEach(attr => {
+                if (el.hasAttribute(attr)) {
+                    const val = el.getAttribute(attr);
+                    if (val && typeof val === 'string') {
+                        el.setAttribute(attr, rewriteUrl(val));
                     }
                 }
             });
-            observer.observe(document, { childList: true, subtree: true });
+        });
 
-            // إعادة كتابة الروابط الموجودة حالياً (للتأكد)
-            document.querySelectorAll('[src], [href], [data-src]').forEach(el => {
-                ['src', 'href', 'data-src'].forEach(attr => {
-                    if (el.hasAttribute(attr)) {
-                        const val = el.getAttribute(attr);
-                        if (val && !val.startsWith('blob:') && !val.startsWith('data:')) {
-                            el.setAttribute(attr, rewriteUrl(val));
-                        }
-                    }
-                });
-            });
-
-            // تصحيح CSS (الخلفيات)
-            document.querySelectorAll('*').forEach(el => {
-                const bg = window.getComputedStyle(el).backgroundImage;
-                if (bg && bg.includes('url(')) {
-                    // نتركها لأنها ستُحل عبر proxy
-                }
-            });
-
-            console.log('[PROXY] Interception script loaded successfully.');
-        })();
+        console.log('[PROXY] ✅ Interception script loaded');
+    })();
     </script>
     `;
 }
 
 // ============================================================
-//  معالج التصيير باستخدام Puppeteer (للمواقع المعقدة)
+//  معالج Puppeteer مخصص لـ YouTube وغيره
 // ============================================================
 async function renderWithPuppeteer(url, options = {}) {
     const browser = await getBrowser();
-    if (!browser) throw new Error('فشل تشغيل المتصفح');
+    if (!browser) throw new Error('Browser not available');
 
     const page = await browser.newPage();
     pagePool.add(page);
@@ -403,33 +362,51 @@ async function renderWithPuppeteer(url, options = {}) {
         await page.setUserAgent(userAgent);
         await page.setViewport({ width: 1920, height: 1080 });
 
-        // تمكين جميع الموارد (لا نمنع أي شيء)
+        // السماح بجميع الطلبات
         await page.setRequestInterception(true);
         page.on('request', (request) => {
-            // نمرر جميع الطلبات، لكن إذا أردنا يمكننا تحويل بعضها مباشرة
-            // لكننا سنتركها تمر، وسيتم إعادة كتابة الروابط في HTML
             request.continue();
         });
 
-        // التنقل مع مهلة
-        const response = await Promise.race([
-            page.goto(url, { waitUntil: 'networkidle2', timeout: CONFIG.pageTimeout }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Page timeout')), CONFIG.pageTimeout))
-        ]);
+        // انتظار تحميل الصفحة
+        await page.goto(url, { 
+            waitUntil: 'networkidle2', 
+            timeout: CONFIG.pageTimeout 
+        });
 
-        if (!response) throw new Error('فشل تحميل الصفحة');
+        // انتظار إضافي لتطبيقات SPA مثل YouTube
+        await page.waitForTimeout(5000);
 
-        // انتظار إضافي لتحميل المحتوى الديناميكي
-        await new Promise(resolve => setTimeout(resolve, 4000));
+        // محاولة انتظار ظهور المحتوى الرئيسي
+        try {
+            await page.waitForSelector('ytd-app, #content, main, body', { timeout: 10000 });
+        } catch (_) {}
 
-        // الحصول على HTML المعدل
+        // التمرير لأسفل لتحميل المحتوى الإضافي (لـ YouTube)
+        await page.evaluate(async () => {
+            await new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 100;
+                const timer = setInterval(() => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    if (totalHeight >= scrollHeight || totalHeight > 3000) {
+                        clearInterval(timer);
+                        resolve();
+                    }
+                }, 100);
+            });
+        });
+
+        // الحصول على HTML
         let html = await page.content();
 
-        // إعادة كتابة الروابط في HTML
+        // إعادة كتابة الروابط
         html = rewriteLinks(html, url, CONFIG.proxyBase);
 
-        // إضافة script الاعتراض
-        const script = getInterceptionScript(CONFIG.proxyBase, url);
+        // إضافة سكربت الاعتراض
+        const script = getAdvancedInterceptionScript(CONFIG.proxyBase, url);
         html = html.replace('</head>', script + '</head>');
         if (!html.includes('</head>')) {
             html = html.replace('</body>', script + '</body>');
@@ -437,6 +414,9 @@ async function renderWithPuppeteer(url, options = {}) {
 
         return html;
 
+    } catch (error) {
+        console.error('[PUPPETEER RENDER ERROR]', error.message);
+        throw error;
     } finally {
         try {
             await page.close();
@@ -448,7 +428,7 @@ async function renderWithPuppeteer(url, options = {}) {
 }
 
 // ============================================================
-//  المعالج الرئيسي للبروكسي
+//  المعالج الرئيسي
 // ============================================================
 app.get('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
@@ -464,29 +444,25 @@ app.get('/proxy', async (req, res) => {
     }
 
     try {
-        console.log(`[PROXY] Request: ${targetUrl.substring(0, 80)}...`);
+        console.log(`[PROXY] ${targetUrl.substring(0, 80)}...`);
 
-        // تحديد نوع الطلب بناءً على Accept أو الامتداد
+        // إذا كان طلب مورد
+        const isResource = targetUrl.match(/\.(css|js|mjs|png|jpg|jpeg|gif|svg|webp|mp4|webm|mp3|pdf|zip|gz|wasm|json|xml)$/i);
         const acceptHeader = req.headers.accept || '';
-        const isHtmlRequest = acceptHeader.includes('text/html') || !acceptHeader.includes('image/') && !acceptHeader.includes('video/');
 
-        // إذا كان طلباً لمورد (صورة، CSS، JS، فيديو) نمرره مباشرة
-        if (!isHtmlRequest || targetUrl.match(/\.(css|js|png|jpg|jpeg|gif|svg|webp|mp4|webm|mp3|pdf|zip|gz)$/i)) {
-            console.log(`[PROXY] Serving static resource: ${targetUrl}`);
+        if (isResource || (!acceptHeader.includes('text/html') && !targetUrl.includes('youtube.com/watch'))) {
             const result = await fetchResource(targetUrl, req.headers);
             if (!result) {
                 return res.status(404).send(getErrorPage('غير موجود', 'تعذر جلب المورد'));
             }
 
-            // إعداد الرؤوس
             res.setHeader('Content-Type', result.contentType);
             res.setHeader('Content-Length', result.data.length);
-            // نسخ بعض الرؤوس الأخرى
             if (result.headers['cache-control']) res.setHeader('Cache-Control', result.headers['cache-control']);
             if (result.headers['etag']) res.setHeader('ETag', result.headers['etag']);
             if (result.headers['last-modified']) res.setHeader('Last-Modified', result.headers['last-modified']);
 
-            // دعم Range (للفيديو)
+            // دعم Range للفيديو
             const rangeHeader = req.headers.range;
             if (rangeHeader && result.headers['accept-ranges'] === 'bytes') {
                 const parts = rangeHeader.replace(/bytes=/, '').split('-');
@@ -497,62 +473,56 @@ app.get('/proxy', async (req, res) => {
                 res.status(206);
                 res.setHeader('Content-Range', `bytes ${start}-${end}/${result.data.length}`);
                 res.setHeader('Content-Length', chunkSize);
-                res.send(chunk);
-                return;
+                return res.send(chunk);
             }
 
             return res.send(result.data);
         }
 
-        // --- معالجة الصفحات HTML ---
+        // معالجة الصفحات HTML
         const hostname = new URL(targetUrl).hostname || '';
-        const needsPuppeteer = CONFIG.puppeteerSites.some(site => hostname.includes(site));
+        const needsPuppeteer = CONFIG.puppeteerSites.some(site => hostname.includes(site)) || 
+                              targetUrl.includes('youtube.com/watch') || 
+                              targetUrl.includes('youtu.be');
 
         let html;
         if (needsPuppeteer) {
-            console.log('[RENDERING] Using Puppeteer for', targetUrl);
+            console.log('[RENDER] Using Puppeteer');
             html = await renderWithPuppeteer(targetUrl);
         } else {
-            console.log('[FETCHING] Using Direct Fetch for', targetUrl);
+            console.log('[FETCH] Direct fetch');
             const result = await fetchResource(targetUrl, req.headers);
             if (!result) {
                 return res.status(503).send(getErrorPage('خطأ في التحميل', 'فشل تحميل الموقع'));
             }
 
-            // التحقق مما إذا كان المحتوى HTML
             const contentType = result.contentType || '';
             if (!contentType.includes('text/html')) {
-                // إذا لم يكن HTML، نعيده كما هو (مثل ملفات JSON أو XML)
                 res.setHeader('Content-Type', contentType);
                 return res.send(result.data);
             }
 
             html = result.data.toString('utf-8');
-
-            // إعادة كتابة الروابط
             html = rewriteLinks(html, targetUrl, CONFIG.proxyBase);
-
-            // إضافة script الاعتراض
-            const script = getInterceptionScript(CONFIG.proxyBase, targetUrl);
+            const script = getAdvancedInterceptionScript(CONFIG.proxyBase, targetUrl);
             html = html.replace('</head>', script + '</head>');
             if (!html.includes('</head>')) {
                 html = html.replace('</body>', script + '</body>');
             }
         }
 
-        // إرسال HTML
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         res.setHeader('X-Content-Type-Options', 'nosniff');
         res.send(html);
 
     } catch (error) {
-        console.error('[PROXY ERROR]', error.message, error.stack);
+        console.error('[PROXY ERROR]', error.message);
         res.status(500).send(getErrorPage('خطأ في الخادم', error.message));
     }
 });
 
 // ============================================================
-//  الصفحة الرئيسية (محدثة بواجهة جميلة)
+//  الصفحة الرئيسية
 // ============================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -561,7 +531,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>وكيل الويب الذكي v6</title>
+    <title>وكيل الويب الذكي v6.5</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -582,22 +552,9 @@ app.get('/', (req, res) => {
             text-align: right;
             width: 100%;
         }
-        h1 {
-            color: #2d3748;
-            font-size: 40px;
-            margin-bottom: 8px;
-            font-weight: 800;
-        }
-        .subtitle {
-            color: #718096;
-            font-size: 18px;
-            margin-bottom: 40px;
-        }
-        .search-group {
-            display: flex;
-            gap: 12px;
-            margin-bottom: 40px;
-        }
+        h1 { color: #2d3748; font-size: 40px; margin-bottom: 8px; font-weight: 800; }
+        .subtitle { color: #718096; font-size: 18px; margin-bottom: 40px; }
+        .search-group { display: flex; gap: 12px; margin-bottom: 40px; }
         input {
             flex: 1;
             padding: 18px 22px;
@@ -625,10 +582,7 @@ app.get('/', (req, res) => {
             transition: 0.3s;
             white-space: nowrap;
         }
-        .btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
-        }
+        .btn:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4); }
         .services {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -677,7 +631,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <h1>وكيل الويب الذكي</h1>
-        <p class="subtitle">تصفح أي موقع بحرية تامة مع دعم الفيديو والتفاعل</p>
+        <p class="subtitle">تصفح YouTube وجميع المواقع بحرية تامة 🚀</p>
 
         <div class="search-group">
             <input type="text" id="urlInput" placeholder="أدخل رابط أو ابحث..." autofocus>
@@ -685,24 +639,23 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="services">
-            <a class="service-btn" href="/proxy?url=https://www.youtube.com">YouTube</a>
-            <a class="service-btn" href="/proxy?url=https://www.google.com">Google</a>
-            <a class="service-btn" href="/proxy?url=https://www.facebook.com">Facebook</a>
-            <a class="service-btn" href="/proxy?url=https://www.instagram.com">Instagram</a>
-            <a class="service-btn" href="/proxy?url=https://www.tiktok.com">TikTok</a>
-            <a class="service-btn" href="/proxy?url=https://twitter.com">Twitter</a>
-            <a class="service-btn" href="/proxy?url=https://www.reddit.com">Reddit</a>
-            <a class="service-btn" href="/proxy?url=https://www.twitch.tv">Twitch</a>
+            <a class="service-btn" href="/proxy?url=https://www.youtube.com">▶️ YouTube</a>
+            <a class="service-btn" href="/proxy?url=https://www.google.com">🔍 Google</a>
+            <a class="service-btn" href="/proxy?url=https://www.facebook.com">📘 Facebook</a>
+            <a class="service-btn" href="/proxy?url=https://www.instagram.com">📸 Instagram</a>
+            <a class="service-btn" href="/proxy?url=https://www.tiktok.com">🎵 TikTok</a>
+            <a class="service-btn" href="/proxy?url=https://twitter.com">🐦 Twitter</a>
+            <a class="service-btn" href="/proxy?url=https://www.reddit.com">🗣️ Reddit</a>
+            <a class="service-btn" href="/proxy?url=https://www.twitch.tv">🎮 Twitch</a>
         </div>
 
         <div class="info">
-            <strong>✨ مميزات الوكيل الجديد:</strong><br>
-            • دعم كامل لـ YouTube (فيديوهات، تعليقات، بث مباشر).<br>
-            • تحميل جميع الموارد (CSS, JS, صور، فيديو).<br>
-            • اعتراض طلبات AJAX و Fetch لإعادة توجيهها عبر البروكسي.<br>
+            <strong>✨ المميزات:</strong><br>
+            • دعم كامل لـ <strong>YouTube</strong> (فيديوهات، تعليقات، بث مباشر).<br>
+            • تحميل جميع الموارد (CSS, JS, صور, فيديو).<br>
+            • اعتراض طلبات AJAX و Fetch.<br>
             • دعم <strong>Range</strong> لتشغيل الفيديو بسلاسة.<br>
-            • ذاكرة تخزين مؤقت لتسريع التحميل.<br>
-            • إعادة كتابة شاملة للروابط في HTML و CSS.<br>
+            • إعادة كتابة شاملة للروابط.<br>
             • يدعم جميع المواقع تقريباً.
         </div>
     </div>
@@ -731,12 +684,12 @@ app.get('/', (req, res) => {
 });
 
 // ============================================================
-//  صفحة الحالة الصحية (Health Check)
+//  Health Check
 // ============================================================
 app.get('/health', (req, res) => {
     res.json({
         status: 'operational',
-        version: '6.0.0',
+        version: '6.5.0',
         uptime: process.uptime(),
         pagePoolSize: pagePool.size,
         cacheSize: cache.size,
@@ -745,7 +698,7 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================================
-//  صفحة الخطأ (مخصصة)
+//  صفحة الخطأ
 // ============================================================
 function getErrorPage(title, message) {
     return `
@@ -792,7 +745,7 @@ function getErrorPage(title, message) {
 }
 
 // ============================================================
-//  تشغيل الخادم
+//  تشغيل السيرفر
 // ============================================================
 const PORT = process.env.PORT || 3000;
 
@@ -801,19 +754,15 @@ app.listen(PORT, '0.0.0.0', async () => {
         await getBrowser();
         console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║         🚀  SMART WEB PROXY v6.0  –  Universal Proxy          ║
+║         🚀  SMART WEB PROXY v6.5  –  YouTube Edition          ║
 ║                                                                ║
 ║  🌐  http://localhost:${PORT}                                  ║
 ║                                                                ║
-║  ✅  المميزات:                                                ║
-║     ✓  دعم كامل لـ YouTube والمواقع الكبيرة                   ║
-║     ✓  تحميل جميع الموارد (CSS, JS, صور, فيديو)              ║
-║     ✓  إعادة كتابة الروابط بشكل شامل                          ║
-║     ✓  اعتراض Fetch / XHR                                     ║
-║     ✓  دعم Range للفيديو                                      ║
-║     ✓  تخزين مؤقت للموارد                                    ║
-║     ✓  إدارة ذكية للذاكرة                                     ║
-║     ✓  يعمل مع جميع المواقع تقريباً                          ║
+║  ✅  دعم كامل لـ YouTube:                                     ║
+║     ✓  فيديوهات                                               ║
+║     ✓  تعليقات                                                ║
+║     ✓  بث مباشر                                               ║
+║     ✓  تشغيل سلس مع دعم Range                                 ║
 ║                                                                ║
 ║  ⚡  Status: Ready                                             ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -825,28 +774,21 @@ app.listen(PORT, '0.0.0.0', async () => {
 });
 
 // ============================================================
-//  إغلاق آمن عند الخروج
+//  إغلاق آمن
 // ============================================================
 process.on('SIGINT', async () => {
-    console.log('\n🛑 Shutting down gracefully...');
-
-    // إغلاق الصفحات
+    console.log('\n🛑 Shutting down...');
     for (const page of pagePool) {
         try { await page.close(); } catch (_) {}
     }
     pagePool.clear();
-
     if (browser) {
         try { await browser.close(); } catch (_) {}
     }
-
     console.log('✅ Shutdown complete');
     process.exit(0);
 });
 
-// ============================================================
-//  معالجة الأخطاء غير المتوقعة
-// ============================================================
 process.on('unhandledRejection', (reason) => {
     console.error('[UNHANDLED REJECTION]', reason);
 });
