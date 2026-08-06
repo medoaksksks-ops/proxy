@@ -1,18 +1,20 @@
 {
-  "name": "advanced-web-proxy",
-  "version": "3.0.0",
-  "description": "وكيل ويب متقدم يدعم YouTube و TikTok و Facebook",
-  "main": "server-pro.js",
+  "name": "advanced-web-proxy-pro",
+  "version": "4.0.0",
+  "description": "وكيل ويب متقدم Pro يدعم YouTube و Google و TikTok بدون مشاكل",
+  "main": "server-v4-pro.js",
   "scripts": {
-    "start": "node server-pro.js",
-    "dev": "nodemon server-pro.js"
+    "start": "node server-v4-pro.js",
+    "dev": "nodemon server-v4-pro.js",
+    "test": "echo \"No tests yet\""
   },
   "keywords": [
     "proxy",
-    "web-proxy",
     "youtube",
+    "google",
     "tiktok",
-    "facebook"
+    "facebook",
+    "web-proxy"
   ],
   "author": "",
   "license": "MIT",
@@ -20,7 +22,8 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "node-fetch": "^2.7.0",
-    "cookie-parser": "^1.4.6"
+    "cookie-parser": "^1.4.6",
+    "zlib": "^1.0.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
