@@ -1,11 +1,11 @@
 {
   "name": "proxy-browser",
   "version": "1.0.0",
-  "description": "Production-ready proxy browser with full URL rewriting",
+  "description": "Production-ready proxy browser supporting YouTube, Facebook, TikTok, Instagram, Twitter, Reddit, Wikipedia, Google, GitHub and all major websites",
   "main": "server.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=16.0.0"
   },
   "scripts": {
     "start": "node server.js",
@@ -14,8 +14,15 @@
   "keywords": [
     "proxy",
     "browser",
-    "web-proxy",
-    "url-rewriting"
+    "youtube",
+    "facebook",
+    "tiktok",
+    "instagram",
+    "twitter",
+    "reddit",
+    "wikipedia",
+    "privacy",
+    "anonymity"
   ],
   "author": "",
   "license": "MIT",
@@ -23,10 +30,9 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "node-fetch": "^2.7.0",
-    "parse5": "^7.1.2",
     "cookie-parser": "^1.4.6",
-    "http-proxy-agent": "^7.0.0",
-    "https-proxy-agent": "^7.0.0",
-    "compression": "^1.7.4"
+    "compression": "^1.7.4",
+    "http-proxy": "^1.18.1",
+    "body-parser": "^1.20.2"
   }
 }
