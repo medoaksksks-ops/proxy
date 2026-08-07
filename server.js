@@ -195,6 +195,187 @@ async function getVideoStreamUrl(videoId, format = 'best') {
 }
 
 /**
+ * البحث عن فيديوهات على يوتيوب باستخدام yt-dlp
+ */
+async function searchVideos(query, limit = 10) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const cookies = await getCookiesFromFirebase();
+      if (cookies && cookies.trim()) {
+        await writeCookiesToFile(cookies);
+      }
+
+      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
+      const safeQuery = query.replace(/"/g, '\\"');
+      const cmd = `yt-dlp "ytsearch${limit}:${safeQuery}" --dump-json --no-warnings --flat-playlist ${cookiesFlag}`;
+
+      log.info(`🔎 Searching: "${query}" (limit ${limit})`);
+
+      const result = execSync(cmd, {
+        timeout: TIMEOUT,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024 * 10
+      });
+
+      const items = result
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => {
+          const item = JSON.parse(line);
+          return {
+            id: item.id,
+            title: item.title,
+            author: item.uploader || item.channel || 'Unknown',
+            channelId: item.channel_id || '',
+            duration: item.duration || 0,
+            thumbnail: item.thumbnails?.length
+              ? item.thumbnails[item.thumbnails.length - 1].url
+              : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
+            viewCount: item.view_count || 0
+          };
+        });
+
+      resolve(items);
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * جلب الفيديوهات المقترحة/ذات الصلة (related) لفيديو معين
+ * بيستخدم playlist المكسات التلقائية اللي يوتيوب بيولدها (RD + videoId)
+ */
+async function getRelatedVideos(videoId, limit = 10) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const cookies = await getCookiesFromFirebase();
+      if (cookies && cookies.trim()) {
+        await writeCookiesToFile(cookies);
+      }
+
+      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
+      const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+      const cmd = `yt-dlp "${url}" --dump-json --no-warnings --flat-playlist --playlist-end ${limit + 1} ${cookiesFlag}`;
+
+      log.info(`🧭 Fetching related videos for: ${videoId}`);
+
+      const result = execSync(cmd, {
+        timeout: TIMEOUT,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024 * 10
+      });
+
+      const items = result
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => {
+          const item = JSON.parse(line);
+          return {
+            id: item.id,
+            title: item.title,
+            author: item.uploader || item.channel || 'Unknown',
+            channelId: item.channel_id || '',
+            duration: item.duration || 0,
+            thumbnail: item.thumbnails?.length
+              ? item.thumbnails[item.thumbnails.length - 1].url
+              : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
+            viewCount: item.view_count || 0
+          };
+        })
+        // شيل نفس الفيديو الأصلي من النتائج لو ظهر
+        .filter(item => item.id !== videoId)
+        .slice(0, limit);
+
+      resolve(items);
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * GET /search?q=QUERY&limit=10
+ */
+app.get('/search', async (req, res) => {
+  const { q: query, limit = 10 } = req.query;
+
+  if (!query || !query.trim()) {
+    return res.status(400).json({
+      error: 'كلمة البحث مطلوبة',
+      example: '/search?q=funny+cats&limit=10'
+    });
+  }
+
+  const searchLimit = Math.min(parseInt(limit, 10) || 10, 30);
+  const cacheKey = `search_${query}_${searchLimit}`;
+  const cached = infoCache.get(cacheKey);
+
+  if (cached) {
+    log.info(`📦 Search from cache: "${query}"`);
+    return res.json(cached);
+  }
+
+  try {
+    const results = await searchVideos(query, searchLimit);
+    const response = { query, count: results.length, results };
+
+    infoCache.set(cacheKey, response);
+    log.success(`✅ Search done: "${query}" (${results.length} نتيجة)`);
+
+    res.json(response);
+  } catch (error) {
+    log.error(`Error searching: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر تنفيذ البحث',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /related?v=VIDEO_ID&limit=10
+ * فيديوهات مقترحة/ذات صلة بفيديو معين
+ */
+app.get('/related', async (req, res) => {
+  const { v: videoId, limit = 10 } = req.query;
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({
+      error: 'Video ID مطلوب وصحيح (11 حرف)',
+      example: '/related?v=dQw4w9WgXcQ&limit=10'
+    });
+  }
+
+  const relatedLimit = Math.min(parseInt(limit, 10) || 10, 30);
+  const cacheKey = `related_${videoId}_${relatedLimit}`;
+  const cached = infoCache.get(cacheKey);
+
+  if (cached) {
+    log.info(`📦 Related from cache: ${videoId}`);
+    return res.json(cached);
+  }
+
+  try {
+    const results = await getRelatedVideos(videoId, relatedLimit);
+    const response = { id: videoId, count: results.length, results };
+
+    infoCache.set(cacheKey, response);
+    log.success(`✅ Related done: ${videoId} (${results.length} نتيجة)`);
+
+    res.json(response);
+  } catch (error) {
+    log.error(`Error fetching related: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الفيديوهات المقترحة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
  * GET /video?v=VIDEO_ID
  */
 app.get('/video', async (req, res) => {
@@ -517,11 +698,15 @@ app.get('/', (req, res) => {
       video: '/video?v=VIDEO_ID&format=best[height<=720]',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
+      search: '/search?q=QUERY&limit=10',
+      related: '/related?v=VIDEO_ID&limit=10',
       health: '/health',
       cookiesStatus: '/api/cookies-status'
     },
     examples: {
       'Play video': '/video?v=dQw4w9WgXcQ',
+      'Search videos': '/search?q=funny+cats',
+      'Related videos': '/related?v=dQw4w9WgXcQ',
       'Check cookies': '/api/cookies-status'
     }
   });
