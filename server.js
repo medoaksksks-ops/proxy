@@ -257,17 +257,8 @@ async function getRelatedVideos(videoId, limit = 10) {
 
       const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
       const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-      const cmd = `yt-dlp "${url}" --dump-json --no-warnings --flat-playlist --playlist-end ${limit + 1} ${cookiesFlag}`;
 
-      log.info(`🧭 Fetching related videos for: ${videoId}`);
-
-      const result = execSync(cmd, {
-        timeout: TIMEOUT,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 10
-      });
-
-      const items = result
+      const parseItems = (raw) => raw
         .trim()
         .split('\n')
         .filter(Boolean)
@@ -288,6 +279,35 @@ async function getRelatedVideos(videoId, limit = 10) {
         // شيل نفس الفيديو الأصلي من النتائج لو ظهر
         .filter(item => item.id !== videoId)
         .slice(0, limit);
+
+      log.info(`🧭 Fetching related videos for: ${videoId}`);
+
+      // المحاولة الأولى: flat-playlist (أسرع)
+      const flatCmd = `yt-dlp "${url}" --dump-json --no-warnings --flat-playlist --yes-playlist --playlist-end ${limit + 1} ${cookiesFlag}`;
+      let items = [];
+
+      try {
+        const result = execSync(flatCmd, {
+          timeout: TIMEOUT,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024 * 10
+        });
+        items = parseItems(result);
+      } catch (e) {
+        log.warn(`Flat related fetch failed: ${e.message}`);
+      }
+
+      // لو ملقاش نتائج، جرب استخراج كامل (من غير flat-playlist)
+      if (items.length === 0) {
+        log.warn('⚠️  Flat related empty, retrying with full extraction...');
+        const fullCmd = `yt-dlp "${url}" --dump-json --no-warnings --yes-playlist --playlist-end ${limit + 1} --skip-download ${cookiesFlag}`;
+        const result = execSync(fullCmd, {
+          timeout: TIMEOUT,
+          encoding: 'utf-8',
+          maxBuffer: 1024 * 1024 * 10
+        });
+        items = parseItems(result);
+      }
 
       resolve(items);
     } catch (error) {
