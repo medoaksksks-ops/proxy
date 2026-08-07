@@ -1,11 +1,14 @@
 const express = require('express');
-const { execSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const NodeCache = require('node-cache');
 const https = require('https');
 require('dotenv').config();
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,16 +26,15 @@ app.use(cors({
 }));
 
 app.use(express.json());
-app.use(express.text({ limit: '10mb' })); // ← اضيفنا الـ text parser
+app.use(express.text({ limit: '10mb' }));
 
-// Cache
-const infoCache = new NodeCache({ stdTTL: 7200 });
-const streamCache = new NodeCache({ stdTTL: 1800 });
-const cookiesCache = new NodeCache({ stdTTL: 300 }); // 5 دقائق
+// ---------------- Cache ----------------
+const infoCache = new NodeCache({ stdTTL: 7200 });          // معلومات فيديو/بحث/related: ساعتين
+const trendingCache = new NodeCache({ stdTTL: 1200 });      // الرائج: 20 دقيقة
+const streamCache = new NodeCache({ stdTTL: 240 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
-const CHUNK_SIZE = 1024 * 1024;
 
 // Logger
 const log = {
@@ -42,42 +44,45 @@ const log = {
   warn: (msg) => console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`)
 };
 
-/**
- * جلب الكوكيز من Firebase
- */
-async function getCookiesFromFirebase() {
-  return new Promise((resolve, reject) => {
-    // تحقق من الـ cache أولاً
-    const cached = cookiesCache.get('youtube_cookies');
-    if (cached) {
-      log.info('📦 Cookies from cache (5 min)');
-      resolve(cached);
-      return;
-    }
+// ==========================================================================
+// Concurrency limiter — بيمنع الـ Railway instance من إنه يتحمّل أكتر من طاقته
+// (كل عملية yt-dlp بتاخد وقت وذاكرة، فمينفعش نسيب عدد لا نهائي يشتغلوا مع بعض)
+// ==========================================================================
+class Semaphore {
+  constructor(max) { this.max = max; this.current = 0; this.queue = []; }
+  acquire() {
+    if (this.current < this.max) { this.current++; return Promise.resolve(); }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  release() {
+    this.current--;
+    const next = this.queue.shift();
+    if (next) { this.current++; next(); }
+  }
+}
+const YTDLP_CONCURRENCY = parseInt(process.env.YTDLP_CONCURRENCY, 10) || 4;
+const ytdlpLimiter = new Semaphore(YTDLP_CONCURRENCY);
 
-    const url = FIREBASE_SECRET 
+// ==========================================================================
+// كوكيز يوتيوب — بيتحدّثوا في الخلفية كل 5 دقايق بدل ما كل request يعمل طلب
+// لـ Firebase لوحده (كان بيسبب race condition وبطء ومكالمات مكررة كتير)
+// ==========================================================================
+const COOKIES_PATH = '/tmp/.cookies.txt';
+let cookiesReady = false;
+
+function fetchCookiesFromFirebase() {
+  return new Promise((resolve) => {
+    const url = FIREBASE_SECRET
       ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
       : `${FIREBASE_URL}/youtube_cookies.json`;
 
-    log.info('🌐 Fetching cookies from Firebase...');
-
     https.get(url, { timeout: 5000 }, (res) => {
       let data = '';
-      
       res.on('data', chunk => data += chunk);
-      
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          
-          if (parsed && parsed.value && parsed.value.trim()) {
-            cookiesCache.set('youtube_cookies', parsed.value);
-            log.success(`✅ Loaded ${parsed.value.length} bytes from Firebase`);
-            resolve(parsed.value);
-          } else {
-            log.warn('⚠️  Cookies empty or not found in Firebase');
-            resolve('');
-          }
+          resolve(parsed && parsed.value ? parsed.value : '');
         } catch (e) {
           log.error(`Firebase JSON parse error: ${e.message}`);
           resolve('');
@@ -86,29 +91,33 @@ async function getCookiesFromFirebase() {
     }).on('error', (err) => {
       log.error(`🔥 Firebase connection error: ${err.message}`);
       resolve('');
-    });
+    }).on('timeout', function () { this.destroy(); resolve(''); });
   });
 }
 
-/**
- * كتابة الكوكيز في ملف مؤقت
- */
-async function writeCookiesToFile(cookiesContent) {
+let lastCookiesContent = '';
+async function refreshCookies() {
   try {
-    if (cookiesContent && cookiesContent.trim()) {
-      fs.writeFileSync('/tmp/.cookies.txt', cookiesContent);
-      return true;
+    const content = await fetchCookiesFromFirebase();
+    if (content && content.trim() && content !== lastCookiesContent) {
+      fs.writeFileSync(COOKIES_PATH, content);
+      lastCookiesContent = content;
+      cookiesReady = true;
+      log.success(`🍪 Cookies refreshed (${content.length} bytes)`);
+    } else if (!content) {
+      log.warn('⚠️  No cookies available in Firebase yet');
     }
-  } catch (error) {
-    log.error(`Failed to write cookies: ${error.message}`);
+  } catch (e) {
+    log.error(`Cookie refresh failed: ${e.message}`);
   }
-  return false;
 }
+refreshCookies();
+setInterval(refreshCookies, 5 * 60 * 1000);
 
 // Check if yt-dlp is installed
 function checkYtDlp() {
   try {
-    execSync('yt-dlp --version', { stdio: 'ignore' });
+    require('child_process').execSync('yt-dlp --version', { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -125,122 +134,75 @@ function sanitizeFilename(name) {
 }
 
 /**
- * الحصول على معلومات الفيديو باستخدام yt-dlp
+ * تشغيل yt-dlp بشكل غير متزامن (async) بدون shell — بيستقبل الـ args كمصفوفة
+ * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
+ * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
+ */
+async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
+  await ytdlpLimiter.acquire();
+  try {
+    const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
+    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...finalArgs], {
+      timeout,
+      maxBuffer,
+      encoding: 'utf-8'
+    });
+    return stdout;
+  } finally {
+    ytdlpLimiter.release();
+  }
+}
+
+/** بيحوّل ناتج --dump-json (سطر لكل فيديو) لمصفوفة عناصر موحّدة الشكل */
+function parseFlatItems(raw, excludeId) {
+  return raw
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => {
+      let item;
+      try { item = JSON.parse(line); } catch (e) { return null; }
+      if (!item || !item.id) return null;
+      return {
+        id: item.id,
+        title: item.title || 'بدون عنوان',
+        author: item.uploader || item.channel || 'Unknown',
+        channelId: item.channel_id || '',
+        duration: item.duration || 0,
+        thumbnail: item.thumbnails?.length
+          ? item.thumbnails[item.thumbnails.length - 1].url
+          : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
+        viewCount: item.view_count || 0
+      };
+    })
+    .filter(v => v && v.id !== excludeId);
+}
+
+/**
+ * الحصول على معلومات الفيديو الكاملة
  */
 async function getVideoInfo(videoId) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // جلب الكوكيز من Firebase
-      const cookies = await getCookiesFromFirebase();
-      
-      // اكتب الكوكيز في ملف مؤقت
-      if (cookies && cookies.trim()) {
-        await writeCookiesToFile(cookies);
-        log.info(`📝 Using cookies (${cookies.length} bytes)`);
-      } else {
-        log.warn('⚠️  No cookies available - trying without');
-      }
-      
-      // بناء الأمر
-      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
-      const cmd = `yt-dlp --dump-json --no-warnings ${cookiesFlag} "https://www.youtube.com/watch?v=${videoId}"`;
-      
-      log.info(`🔍 Fetching info: ${videoId} ${cookiesFlag ? '(with cookies)' : '(no cookies)'}`);
-      
-      const result = execSync(cmd, { 
-        timeout: TIMEOUT,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 10
-      });
-      resolve(JSON.parse(result));
-    } catch (error) {
-      reject(error);
-    }
-  });
+  const stdout = await runYtDlp(['--dump-json', `https://www.youtube.com/watch?v=${videoId}`]);
+  return JSON.parse(stdout);
 }
 
 /**
  * جلب رابط الفيديو المباشر
  */
 async function getVideoStreamUrl(videoId, format = 'best') {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // جلب الكوكيز من Firebase
-      const cookies = await getCookiesFromFirebase();
-      
-      // اكتب الكوكيز في ملف مؤقت
-      if (cookies && cookies.trim()) {
-        await writeCookiesToFile(cookies);
-      }
-      
-      // بناء الأمر
-      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
-      const cmd = `yt-dlp --get-url --no-warnings ${cookiesFlag} -f "${format}" "https://www.youtube.com/watch?v=${videoId}"`;
-      
-      log.info(`⬇️  Fetching stream URL: ${format} ${cookiesFlag ? '(with cookies)' : '(no cookies)'}`);
-      
-      const result = execSync(cmd, { 
-        timeout: TIMEOUT,
-        encoding: 'utf-8'
-      });
-      
-      const streamUrl = result.trim().split('\n')[0];
-      log.success(`🎬 Got stream URL (${streamUrl.length} chars)`);
-      
-      resolve(streamUrl);
-    } catch (error) {
-      reject(error);
-    }
-  });
+  const stdout = await runYtDlp(['--get-url', '-f', format, `https://www.youtube.com/watch?v=${videoId}`]);
+  const streamUrl = stdout.trim().split('\n')[0];
+  log.success(`🎬 Got stream URL (${streamUrl.length} chars)`);
+  return streamUrl;
 }
 
 /**
- * البحث عن فيديوهات على يوتيوب باستخدام yt-dlp
+ * البحث عن فيديوهات على يوتيوب باستخدام yt-dlp (بدون أي اعتماد على YouTube Data API)
  */
 async function searchVideos(query, limit = 10) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const cookies = await getCookiesFromFirebase();
-      if (cookies && cookies.trim()) {
-        await writeCookiesToFile(cookies);
-      }
-
-      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
-      const safeQuery = query.replace(/"/g, '\\"');
-      const cmd = `yt-dlp "ytsearch${limit}:${safeQuery}" --dump-json --no-warnings --flat-playlist ${cookiesFlag}`;
-
-      log.info(`🔎 Searching: "${query}" (limit ${limit})`);
-
-      const result = execSync(cmd, {
-        timeout: TIMEOUT,
-        encoding: 'utf-8',
-        maxBuffer: 1024 * 1024 * 10
-      });
-
-      const items = result
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map(line => {
-          const item = JSON.parse(line);
-          return {
-            id: item.id,
-            title: item.title,
-            author: item.uploader || item.channel || 'Unknown',
-            channelId: item.channel_id || '',
-            duration: item.duration || 0,
-            thumbnail: item.thumbnails?.length
-              ? item.thumbnails[item.thumbnails.length - 1].url
-              : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-            viewCount: item.view_count || 0
-          };
-        });
-
-      resolve(items);
-    } catch (error) {
-      reject(error);
-    }
-  });
+  log.info(`🔎 Searching: "${query}" (limit ${limit})`);
+  const stdout = await runYtDlp([`ytsearch${limit}:${query}`, '--dump-json', '--flat-playlist']);
+  return parseFlatItems(stdout);
 }
 
 /**
@@ -248,73 +210,96 @@ async function searchVideos(query, limit = 10) {
  * بيستخدم playlist المكسات التلقائية اللي يوتيوب بيولدها (RD + videoId)
  */
 async function getRelatedVideos(videoId, limit = 10) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const cookies = await getCookiesFromFirebase();
-      if (cookies && cookies.trim()) {
-        await writeCookiesToFile(cookies);
-      }
+  const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+  log.info(`🧭 Fetching related videos for: ${videoId}`);
 
-      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
-      const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+  let items = [];
+  try {
+    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--yes-playlist', '--playlist-end', String(limit + 1), url]);
+    items = parseFlatItems(stdout, videoId);
+  } catch (e) {
+    log.warn(`Flat related fetch failed: ${e.message}`);
+  }
 
-      const parseItems = (raw) => raw
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map(line => {
-          const item = JSON.parse(line);
-          return {
-            id: item.id,
-            title: item.title,
-            author: item.uploader || item.channel || 'Unknown',
-            channelId: item.channel_id || '',
-            duration: item.duration || 0,
-            thumbnail: item.thumbnails?.length
-              ? item.thumbnails[item.thumbnails.length - 1].url
-              : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-            viewCount: item.view_count || 0
-          };
-        })
-        // شيل نفس الفيديو الأصلي من النتائج لو ظهر
-        .filter(item => item.id !== videoId)
-        .slice(0, limit);
+  if (items.length === 0) {
+    log.warn('⚠️  Flat related empty, retrying with full extraction...');
+    const stdout = await runYtDlp(['--dump-json', '--yes-playlist', '--playlist-end', String(limit + 1), '--skip-download', url]);
+    items = parseFlatItems(stdout, videoId);
+  }
 
-      log.info(`🧭 Fetching related videos for: ${videoId}`);
-
-      // المحاولة الأولى: flat-playlist (أسرع)
-      const flatCmd = `yt-dlp "${url}" --dump-json --no-warnings --flat-playlist --yes-playlist --playlist-end ${limit + 1} ${cookiesFlag}`;
-      let items = [];
-
-      try {
-        const result = execSync(flatCmd, {
-          timeout: TIMEOUT,
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024 * 10
-        });
-        items = parseItems(result);
-      } catch (e) {
-        log.warn(`Flat related fetch failed: ${e.message}`);
-      }
-
-      // لو ملقاش نتائج، جرب استخراج كامل (من غير flat-playlist)
-      if (items.length === 0) {
-        log.warn('⚠️  Flat related empty, retrying with full extraction...');
-        const fullCmd = `yt-dlp "${url}" --dump-json --no-warnings --yes-playlist --playlist-end ${limit + 1} --skip-download ${cookiesFlag}`;
-        const result = execSync(fullCmd, {
-          timeout: TIMEOUT,
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024 * 10
-        });
-        items = parseItems(result);
-      }
-
-      resolve(items);
-    } catch (error) {
-      reject(error);
-    }
-  });
+  return items.slice(0, limit);
 }
+
+/**
+ * جلب الفيديوهات الرائجة (Trending) — بدل اعتماد على chart=mostPopular بتاع
+ * YouTube Data API، بنجيب تبويب "الرائج" مباشرة من يوتيوب عن طريق yt-dlp.
+ * لو ده فشل لأي سبب (يوتيوب بيغيّر شكل الصفحة أحيانًا)، بنعمل fallback:
+ * بحث في عدة موضوعات مصرية شائعة وترتيب النتائج حسب المشاهدات.
+ */
+async function getTrendingVideos(region = 'EG', limit = 20) {
+  let items = [];
+
+  try {
+    const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
+    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
+    items = parseFlatItems(stdout);
+  } catch (e) {
+    log.warn(`Trending feed failed (${e.message}), falling back to search-based trending`);
+  }
+
+  if (items.length < 5) {
+    const fallbackQueries = ['أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف', 'بودكاست مصري'];
+    const pool = [];
+    for (const q of fallbackQueries) {
+      try {
+        const stdout = await runYtDlp([`ytsearch10:${q}`, '--dump-json', '--flat-playlist']);
+        pool.push(...parseFlatItems(stdout));
+      } catch (e) {
+        log.warn(`Trending fallback query failed "${q}": ${e.message}`);
+      }
+    }
+    // شيل التكرار، ورتّب حسب المشاهدات تنازليًا
+    const seen = new Set();
+    items = pool
+      .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
+      .sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
+  }
+
+  return items.slice(0, limit);
+}
+
+// ==========================================================================
+// Routes
+// ==========================================================================
+
+/**
+ * GET /trending?region=EG&limit=20
+ */
+app.get('/trending', async (req, res) => {
+  const region = (req.query.region || 'EG').toUpperCase();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 40);
+  const cacheKey = `trending_${region}_${limit}`;
+
+  const cached = trendingCache.get(cacheKey);
+  if (cached) {
+    log.info(`📦 Trending from cache: ${region}`);
+    return res.json(cached);
+  }
+
+  try {
+    const results = await getTrendingVideos(region, limit);
+    const response = { region, count: results.length, results };
+    trendingCache.set(cacheKey, response);
+    log.success(`✅ Trending done: ${region} (${results.length} نتيجة)`);
+    res.json(response);
+  } catch (error) {
+    log.error(`Error fetching trending: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الفيديوهات الرائجة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
 
 /**
  * GET /search?q=QUERY&limit=10
@@ -357,7 +342,6 @@ app.get('/search', async (req, res) => {
 
 /**
  * GET /related?v=VIDEO_ID&limit=10
- * فيديوهات مقترحة/ذات صلة بفيديو معين
  */
 app.get('/related', async (req, res) => {
   const { v: videoId, limit = 10 } = req.query;
@@ -403,18 +387,18 @@ app.get('/video', async (req, res) => {
 
   if (!videoId || !isValidVideoId(videoId)) {
     log.error(`Invalid video ID: ${videoId}`);
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'Video ID مطلوب وصحيح (11 حرف)',
       example: '/video?v=dQw4w9WgXcQ&format=best[height<=720]'
     });
   }
 
   const cacheKey = `stream_${videoId}_${format}`;
-  const cached = streamCache.get(cacheKey);
+  const cachedUrl = streamCache.get(cacheKey);
 
-  if (cached?.url && Date.now() - cached.timestamp < 300000) {
+  if (cachedUrl) {
     log.info(`📦 Stream from cache: ${videoId}`);
-    return res.redirect(cached.url);
+    return res.redirect(cachedUrl);
   }
 
   let attempts = 0;
@@ -433,13 +417,9 @@ app.get('/video', async (req, res) => {
         throw new Error('Failed to get stream URL');
       }
 
-      streamCache.set(cacheKey, {
-        url: streamUrl,
-        timestamp: Date.now()
-      });
+      streamCache.set(cacheKey, streamUrl);
 
       const title = sanitizeFilename(info.title || 'video');
-      
       log.success(`▶️  Playing: ${info.title}`);
 
       res.setHeader('Content-Disposition', `inline; filename="${title}.mp4"`);
@@ -450,7 +430,7 @@ app.get('/video', async (req, res) => {
       lastError = error;
       attempts++;
       log.warn(`Attempt ${attempts} failed: ${error.message}`);
-      
+
       if (attempts < MAX_RETRIES) {
         await new Promise(r => setTimeout(r, 1000 * attempts));
       }
@@ -467,7 +447,7 @@ app.get('/video', async (req, res) => {
     return res.status(403).json({ error: 'الفيديو يحتاج verification العمر' });
   }
 
-  res.status(500).json({ 
+  res.status(500).json({
     error: 'فشل في تشغيل الفيديو',
     details: NODE_ENV === 'development' ? lastError?.message : undefined
   });
@@ -501,7 +481,9 @@ app.get('/info', async (req, res) => {
       channelId: info.channel_id || '',
       description: info.description || '',
       thumbnail: info.thumbnail || '',
-      publishedAt: info.upload_date ? new Date(info.upload_date).toISOString() : null,
+      publishedAt: info.upload_date ? new Date(
+        `${info.upload_date.slice(0,4)}-${info.upload_date.slice(4,6)}-${info.upload_date.slice(6,8)}`
+      ).toISOString() : null,
       viewCount: info.view_count || 0,
       likeCount: info.like_count || 0,
       ageRestricted: info.age_limit ? info.age_limit > 0 : false,
@@ -516,7 +498,7 @@ app.get('/info', async (req, res) => {
 
   } catch (error) {
     log.error(`Error fetching info: ${error.message}`);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'تعذّر جلب معلومات الفيديو',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
@@ -567,11 +549,13 @@ app.get('/formats', async (req, res) => {
  * GET /health
  */
 app.get('/health', (req, res) => {
-  res.json({ 
+  res.json({
     status: 'operational',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    ytdlpReady: checkYtDlp()
+    ytdlpReady: checkYtDlp(),
+    cookiesReady,
+    concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
   });
 });
 
@@ -593,9 +577,9 @@ app.post('/api/update-cookies', async (req, res) => {
     const auth = FIREBASE_SECRET ? `?auth=${FIREBASE_SECRET}` : '';
     const fullUrl = url + auth;
 
-    const payloadData = JSON.stringify({ 
-      value: cookies, 
-      updated_at: new Date().toISOString() 
+    const payloadData = JSON.stringify({
+      value: cookies,
+      updated_at: new Date().toISOString()
     });
 
     const options = {
@@ -608,24 +592,24 @@ app.post('/api/update-cookies', async (req, res) => {
 
     const req_firebase = https.request(fullUrl, options, (res_fb) => {
       let response = '';
-      
+
       res_fb.on('data', chunk => response += chunk);
-      
-      res_fb.on('end', () => {
+
+      res_fb.on('end', async () => {
         if (res_fb.statusCode === 200) {
-          cookiesCache.del('youtube_cookies'); // Clear cache
+          await refreshCookies(); // حدّث الكوكيز فورًا بدل ما نستنى الـ interval
           log.success('✅ Cookies updated in Firebase');
-          res.json({ 
-            success: true, 
+          res.json({
+            success: true,
             message: 'تم تحديث الكوكيز ✅',
             timestamp: new Date().toISOString(),
             size: cookies.length
           });
         } else {
           log.error(`Firebase returned ${res_fb.statusCode}: ${response}`);
-          res.status(500).json({ 
+          res.status(500).json({
             error: 'فشل في تحديث الكوكيز',
-            details: response 
+            details: response
           });
         }
       });
@@ -633,9 +617,9 @@ app.post('/api/update-cookies', async (req, res) => {
 
     req_firebase.on('error', (err) => {
       log.error(`Firebase update error: ${err.message}`);
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'فشل الاتصال بـ Firebase',
-        details: err.message 
+        details: err.message
       });
     });
 
@@ -643,61 +627,23 @@ app.post('/api/update-cookies', async (req, res) => {
 
   } catch (error) {
     log.error(`Post error: ${error.message}`);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'خطأ في السيرفر',
-      details: error.message 
+      details: error.message
     });
   }
 });
 
 /**
  * GET /api/cookies-status
- * التحقق من حالة الكوكيز في Firebase
  */
 app.get('/api/cookies-status', async (req, res) => {
-  try {
-    log.info('📊 Checking cookies status...');
-    
-    const url = FIREBASE_SECRET 
-      ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
-      : `${FIREBASE_URL}/youtube_cookies.json`;
-
-    https.get(url, (res_fb) => {
-      let data = '';
-      res_fb.on('data', chunk => data += chunk);
-      res_fb.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          const hasCoockes = parsed && parsed.value && parsed.value.trim().length > 0;
-          
-          res.json({
-            hasCoockes: hasCoockes,
-            length: parsed && parsed.value ? parsed.value.length : 0,
-            preview: parsed && parsed.value ? parsed.value.substring(0, 50) + '...' : 'لا توجد كوكيز',
-            updated_at: parsed && parsed.updated_at ? parsed.updated_at : null,
-            status: hasCoockes ? '✅ موجودة' : '❌ فارغة أو غير موجودة'
-          });
-          
-          log.success(`✅ Cookies status: ${hasCoockes ? 'OK' : 'EMPTY'}`);
-        } catch (e) {
-          res.json({ 
-            hasCoockes: false, 
-            error: 'JSON parse error',
-            status: '❌ خطأ في قراءة البيانات'
-          });
-        }
-      });
-    }).on('error', (err) => {
-      log.error(`Firebase status check error: ${err.message}`);
-      res.status(500).json({ 
-        error: 'فشل الاتصال مع Firebase',
-        hasCoockes: false,
-        status: '❌ خطأ في الاتصال'
-      });
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  res.json({
+    hasCoockes: cookiesReady,
+    length: lastCookiesContent.length,
+    preview: lastCookiesContent ? lastCookiesContent.substring(0, 50) + '...' : 'لا توجد كوكيز',
+    status: cookiesReady ? '✅ موجودة' : '❌ فارغة أو غير موجودة'
+  });
 });
 
 /**
@@ -705,16 +651,18 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v2.2 - YouTube Proxy',
-    version: '2.2.0',
+    name: '🎬 srver v3.0 - YouTube Proxy (بدون اعتماد على YouTube Data API)',
+    version: '3.0.0',
     environment: NODE_ENV,
     cookies: {
       source: '🔥 Firebase Realtime Database',
       url: FIREBASE_URL,
-      cache: '5 دقائق',
-      auto_refresh: 'Yes ✅'
+      refresh: 'كل 5 دقايق في الخلفية',
+      ready: cookiesReady
     },
+    concurrency: { max: YTDLP_CONCURRENCY },
     endpoints: {
+      trending: '/trending?region=EG&limit=20',
       video: '/video?v=VIDEO_ID&format=best[height<=720]',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
@@ -724,6 +672,7 @@ app.get('/', (req, res) => {
       cookiesStatus: '/api/cookies-status'
     },
     examples: {
+      'Trending': '/trending?region=EG',
       'Play video': '/video?v=dQw4w9WgXcQ',
       'Search videos': '/search?q=funny+cats',
       'Related videos': '/related?v=dQw4w9WgXcQ',
@@ -740,7 +689,7 @@ app.use((req, res) => {
 // Error handler
 app.use((err, req, res, next) => {
   log.error(`Unhandled error: ${err.message}`);
-  res.status(500).json({ 
+  res.status(500).json({
     error: 'خطأ في السيرفر',
     details: NODE_ENV === 'development' ? err.message : undefined
   });
@@ -751,16 +700,15 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
-║  🎬 srver v2.2 - YouTube Proxy شغّال 🔥  ║
-║  ═════════════════════════════════════    ║
+║  🎬 srver v3.0 - YouTube Proxy شغّال 🔥    ║
+║  ═════════════════════════════════════     ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
-║  yt-dlp: ${ytdlpStatus}  Firebase Cookies ✅    ║
-║  Firebase: 🌐 Real-time Database          ║
-║  Cache: 5 دقائق                          ║
-║  http://0.0.0.0:${PORT}                     ║
+║  yt-dlp: ${ytdlpStatus}  Firebase Cookies (bg refresh)  ║
+║  Concurrency: ${String(YTDLP_CONCURRENCY).padEnd(24, ' ')}║
+║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
-  log.success(`✅ Server ready - Fetching cookies from Firebase`);
+  log.success(`✅ Server ready - no YouTube Data API dependency`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
 });
 
