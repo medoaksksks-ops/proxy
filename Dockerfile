@@ -1,32 +1,35 @@
 FROM node:18-slim
 
-# Install yt-dlp and required dependencies
+# Install system packages + yt-dlp
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     ffmpeg \
     wget \
-    && pip3 install yt-dlp \
+    ca-certificates \
+    && pip3 install --break-system-packages --no-cache-dir yt-dlp \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# App directory
 WORKDIR /app
 
-# Copy files
+# Copy package files
 COPY package*.json ./
-COPY server.js ./
-COPY .env* ./
 
-# Install npm dependencies
-RUN npm ci --only=production
+# Install dependencies
+RUN npm ci --omit=dev
 
-# Expose port
+# Copy application files
+COPY . .
+
+# Railway uses PORT environment variable
+ENV PORT=3000
 EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:3000/health', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"
+CMD node -e "require('http').get('http://127.0.0.1:'+(process.env.PORT||3000)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
 # Start server
 CMD ["npm", "start"]
