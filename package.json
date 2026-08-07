@@ -1,17 +1,15 @@
 {
-  "name": "smart-web-proxy",
-  "version": "5.1.0",
-  "main": "server-v5-fixed.js",
+  "name": "proxy-server",
+  "version": "1.0.0",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-v5-fixed.js",
-    "dev": "node server-v5-fixed.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "puppeteer": "^21.6.1",
-    "node-fetch": "^2.7.0",
-    "cookie-parser": "^1.4.6"
+    "node-fetch": "^2.7.0"
   },
   "engines": {
     "node": "20.x"
