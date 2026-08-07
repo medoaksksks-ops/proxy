@@ -6,6 +6,17 @@ const cors = require('cors');
 const NodeCache = require('node-cache');
 require('dotenv').config();
 
+// Handle cookies from environment variable
+if (process.env.COOKIES_BASE64) {
+  try {
+    const cookiesContent = Buffer.from(process.env.COOKIES_BASE64, 'base64').toString('utf-8');
+    fs.writeFileSync('/app/.cookies.txt', cookiesContent);
+    console.log('✅ Cookies loaded from environment');
+  } catch (error) {
+    console.error('❌ Failed to load cookies:', error.message);
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -60,7 +71,9 @@ function sanitizeFilename(name) {
 async function getVideoInfo(videoId) {
   return new Promise((resolve, reject) => {
     try {
-      const cmd = `yt-dlp --dump-json --no-warnings "https://www.youtube.com/watch?v=${videoId}"`;
+      // Build cookies flag if cookies file exists
+      const cookiesFlag = fs.existsSync('/app/.cookies.txt') ? '--cookies /app/.cookies.txt' : '';
+      const cmd = `yt-dlp --dump-json --no-warnings ${cookiesFlag} "https://www.youtube.com/watch?v=${videoId}"`;
       const result = execSync(cmd, { 
         timeout: TIMEOUT,
         encoding: 'utf-8',
@@ -79,7 +92,9 @@ async function getVideoInfo(videoId) {
 async function getVideoStreamUrl(videoId, format = 'best') {
   return new Promise((resolve, reject) => {
     try {
-      const cmd = `yt-dlp --get-url --no-warnings -f "${format}" "https://www.youtube.com/watch?v=${videoId}"`;
+      // Build cookies flag if cookies file exists
+      const cookiesFlag = fs.existsSync('/app/.cookies.txt') ? '--cookies /app/.cookies.txt' : '';
+      const cmd = `yt-dlp --get-url --no-warnings ${cookiesFlag} -f "${format}" "https://www.youtube.com/watch?v=${videoId}"`;
       const result = execSync(cmd, { 
         timeout: TIMEOUT,
         encoding: 'utf-8'
@@ -163,7 +178,7 @@ app.get('/video', async (req, res) => {
     return res.status(403).json({ error: 'الفيديو خاص (private)' });
   } else if (lastError?.message.includes('age')) {
     return res.status(403).json({ error: 'الفيديو يحتاج verification العمر' });
-  }
+
 
   res.status(500).json({ 
     error: 'فشل في تشغيل الفيديو',
