@@ -4,47 +4,106 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const NodeCache = require('node-cache');
+const https = require('https');
 require('dotenv').config();
-
-// Handle cookies from environment variable
-if (process.env.COOKIES_BASE64) {
-  try {
-    const cookiesContent = Buffer.from(process.env.COOKIES_BASE64, 'base64').toString('utf-8');
-    fs.writeFileSync('/app/.cookies.txt', cookiesContent);
-    console.log('✅ Cookies loaded from environment');
-  } catch (error) {
-    console.error('❌ Failed to load cookies:', error.message);
-  }
-}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// Firebase config
+const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
+
 // CORS config
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
-  methods: ['GET', 'OPTIONS'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   credentials: false
 }));
 
 app.use(express.json());
+app.use(express.text({ limit: '10mb' })); // ← اضيفنا الـ text parser
 
-// Cache (ساعتين للـ info، 30 دقيقة للـ streams)
+// Cache
 const infoCache = new NodeCache({ stdTTL: 7200 });
 const streamCache = new NodeCache({ stdTTL: 1800 });
+const cookiesCache = new NodeCache({ stdTTL: 300 }); // 5 دقائق
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+const CHUNK_SIZE = 1024 * 1024;
 
-// Logger بسيط وفعّال
+// Logger
 const log = {
   info: (msg) => console.log(`[${new Date().toISOString()}] ℹ️  ${msg}`),
   success: (msg) => console.log(`[${new Date().toISOString()}] ✅ ${msg}`),
   error: (msg) => console.error(`[${new Date().toISOString()}] ❌ ${msg}`),
   warn: (msg) => console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`)
 };
+
+/**
+ * جلب الكوكيز من Firebase
+ */
+async function getCookiesFromFirebase() {
+  return new Promise((resolve, reject) => {
+    // تحقق من الـ cache أولاً
+    const cached = cookiesCache.get('youtube_cookies');
+    if (cached) {
+      log.info('📦 Cookies from cache (5 min)');
+      resolve(cached);
+      return;
+    }
+
+    const url = FIREBASE_SECRET 
+      ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
+      : `${FIREBASE_URL}/youtube_cookies.json`;
+
+    log.info('🌐 Fetching cookies from Firebase...');
+
+    https.get(url, { timeout: 5000 }, (res) => {
+      let data = '';
+      
+      res.on('data', chunk => data += chunk);
+      
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          
+          if (parsed && parsed.value && parsed.value.trim()) {
+            cookiesCache.set('youtube_cookies', parsed.value);
+            log.success(`✅ Loaded ${parsed.value.length} bytes from Firebase`);
+            resolve(parsed.value);
+          } else {
+            log.warn('⚠️  Cookies empty or not found in Firebase');
+            resolve('');
+          }
+        } catch (e) {
+          log.error(`Firebase JSON parse error: ${e.message}`);
+          resolve('');
+        }
+      });
+    }).on('error', (err) => {
+      log.error(`🔥 Firebase connection error: ${err.message}`);
+      resolve('');
+    });
+  });
+}
+
+/**
+ * كتابة الكوكيز في ملف مؤقت
+ */
+async function writeCookiesToFile(cookiesContent) {
+  try {
+    if (cookiesContent && cookiesContent.trim()) {
+      fs.writeFileSync('/tmp/.cookies.txt', cookiesContent);
+      return true;
+    }
+  } catch (error) {
+    log.error(`Failed to write cookies: ${error.message}`);
+  }
+  return false;
+}
 
 // Check if yt-dlp is installed
 function checkYtDlp() {
@@ -69,11 +128,25 @@ function sanitizeFilename(name) {
  * الحصول على معلومات الفيديو باستخدام yt-dlp
  */
 async function getVideoInfo(videoId) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
-      // Build cookies flag if cookies file exists
-      const cookiesFlag = fs.existsSync('/app/.cookies.txt') ? '--cookies /app/.cookies.txt' : '';
+      // جلب الكوكيز من Firebase
+      const cookies = await getCookiesFromFirebase();
+      
+      // اكتب الكوكيز في ملف مؤقت
+      if (cookies && cookies.trim()) {
+        await writeCookiesToFile(cookies);
+        log.info(`📝 Using cookies (${cookies.length} bytes)`);
+      } else {
+        log.warn('⚠️  No cookies available - trying without');
+      }
+      
+      // بناء الأمر
+      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
       const cmd = `yt-dlp --dump-json --no-warnings ${cookiesFlag} "https://www.youtube.com/watch?v=${videoId}"`;
+      
+      log.info(`🔍 Fetching info: ${videoId} ${cookiesFlag ? '(with cookies)' : '(no cookies)'}`);
+      
       const result = execSync(cmd, { 
         timeout: TIMEOUT,
         encoding: 'utf-8',
@@ -90,16 +163,31 @@ async function getVideoInfo(videoId) {
  * جلب رابط الفيديو المباشر
  */
 async function getVideoStreamUrl(videoId, format = 'best') {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     try {
-      // Build cookies flag if cookies file exists
-      const cookiesFlag = fs.existsSync('/app/.cookies.txt') ? '--cookies /app/.cookies.txt' : '';
+      // جلب الكوكيز من Firebase
+      const cookies = await getCookiesFromFirebase();
+      
+      // اكتب الكوكيز في ملف مؤقت
+      if (cookies && cookies.trim()) {
+        await writeCookiesToFile(cookies);
+      }
+      
+      // بناء الأمر
+      const cookiesFlag = fs.existsSync('/tmp/.cookies.txt') ? '--cookies /tmp/.cookies.txt' : '';
       const cmd = `yt-dlp --get-url --no-warnings ${cookiesFlag} -f "${format}" "https://www.youtube.com/watch?v=${videoId}"`;
+      
+      log.info(`⬇️  Fetching stream URL: ${format} ${cookiesFlag ? '(with cookies)' : '(no cookies)'}`);
+      
       const result = execSync(cmd, { 
         timeout: TIMEOUT,
         encoding: 'utf-8'
       });
-      resolve(result.trim().split('\n')[0]); // أول URL في الـ output
+      
+      const streamUrl = result.trim().split('\n')[0];
+      log.success(`🎬 Got stream URL (${streamUrl.length} chars)`);
+      
+      resolve(streamUrl);
     } catch (error) {
       reject(error);
     }
@@ -123,7 +211,7 @@ app.get('/video', async (req, res) => {
   const cacheKey = `stream_${videoId}_${format}`;
   const cached = streamCache.get(cacheKey);
 
-  if (cached?.url && Date.now() - cached.timestamp < 300000) { // 5 دقائق
+  if (cached?.url && Date.now() - cached.timestamp < 300000) {
     log.info(`📦 Stream from cache: ${videoId}`);
     return res.redirect(cached.url);
   }
@@ -144,7 +232,6 @@ app.get('/video', async (req, res) => {
         throw new Error('Failed to get stream URL');
       }
 
-      // Cache الـ URL (قصير الأجل)
       streamCache.set(cacheKey, {
         url: streamUrl,
         timestamp: Date.now()
@@ -154,7 +241,6 @@ app.get('/video', async (req, res) => {
       
       log.success(`▶️  Playing: ${info.title}`);
 
-      // Redirect للـ URL المباشر (أسرع وأكفأ)
       res.setHeader('Content-Disposition', `inline; filename="${title}.mp4"`);
       res.redirect(streamUrl);
       return;
@@ -165,7 +251,7 @@ app.get('/video', async (req, res) => {
       log.warn(`Attempt ${attempts} failed: ${error.message}`);
       
       if (attempts < MAX_RETRIES) {
-        await new Promise(r => setTimeout(r, 1000 * attempts)); // exponential backoff
+        await new Promise(r => setTimeout(r, 1000 * attempts));
       }
     }
   }
@@ -174,11 +260,11 @@ app.get('/video', async (req, res) => {
 
   if (lastError?.message.includes('unavailable') || lastError?.message.includes('not available')) {
     return res.status(404).json({ error: 'الفيديو غير متاح أو محذوف' });
-  } else if (lastError?.message.includes('private') || lastError?.message.includes('private')) {
+  } else if (lastError?.message.includes('private')) {
     return res.status(403).json({ error: 'الفيديو خاص (private)' });
   } else if (lastError?.message.includes('age')) {
     return res.status(403).json({ error: 'الفيديو يحتاج verification العمر' });
-
+  }
 
   res.status(500).json({ 
     error: 'فشل في تشغيل الفيديو',
@@ -238,7 +324,6 @@ app.get('/info', async (req, res) => {
 
 /**
  * GET /formats?v=VIDEO_ID
- * قائمة الـ formats المتاحة
  */
 app.get('/formats', async (req, res) => {
   const videoId = req.query.v;
@@ -252,7 +337,7 @@ app.get('/formats', async (req, res) => {
     const info = await getVideoInfo(videoId);
 
     const formats = (info.formats || [])
-      .filter(f => f.vcodec !== 'none' || f.acodec !== 'none') // skip audio-only
+      .filter(f => f.vcodec !== 'none' || f.acodec !== 'none')
       .map(f => ({
         formatId: f.format_id,
         format: f.format,
@@ -268,7 +353,7 @@ app.get('/formats', async (req, res) => {
     res.json({
       id: videoId,
       title: info.title,
-      formats: formats.slice(0, 20) // أول 20 format فقط
+      formats: formats.slice(0, 20)
     });
 
   } catch (error) {
@@ -290,24 +375,154 @@ app.get('/health', (req, res) => {
 });
 
 /**
+ * POST /api/update-cookies
+ */
+app.post('/api/update-cookies', async (req, res) => {
+  try {
+    const cookies = req.body;
+
+    if (!cookies || !cookies.trim()) {
+      log.error('Empty cookies received');
+      return res.status(400).json({ error: 'الكوكيز فارغة' });
+    }
+
+    log.info(`📝 Updating cookies (${cookies.length} bytes)...`);
+
+    const url = `${FIREBASE_URL}/youtube_cookies.json`;
+    const auth = FIREBASE_SECRET ? `?auth=${FIREBASE_SECRET}` : '';
+    const fullUrl = url + auth;
+
+    const payloadData = JSON.stringify({ 
+      value: cookies, 
+      updated_at: new Date().toISOString() 
+    });
+
+    const options = {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payloadData)
+      }
+    };
+
+    const req_firebase = https.request(fullUrl, options, (res_fb) => {
+      let response = '';
+      
+      res_fb.on('data', chunk => response += chunk);
+      
+      res_fb.on('end', () => {
+        if (res_fb.statusCode === 200) {
+          cookiesCache.del('youtube_cookies'); // Clear cache
+          log.success('✅ Cookies updated in Firebase');
+          res.json({ 
+            success: true, 
+            message: 'تم تحديث الكوكيز ✅',
+            timestamp: new Date().toISOString(),
+            size: cookies.length
+          });
+        } else {
+          log.error(`Firebase returned ${res_fb.statusCode}: ${response}`);
+          res.status(500).json({ 
+            error: 'فشل في تحديث الكوكيز',
+            details: response 
+          });
+        }
+      });
+    });
+
+    req_firebase.on('error', (err) => {
+      log.error(`Firebase update error: ${err.message}`);
+      res.status(500).json({ 
+        error: 'فشل الاتصال بـ Firebase',
+        details: err.message 
+      });
+    });
+
+    req_firebase.end(payloadData);
+
+  } catch (error) {
+    log.error(`Post error: ${error.message}`);
+    res.status(500).json({ 
+      error: 'خطأ في السيرفر',
+      details: error.message 
+    });
+  }
+});
+
+/**
+ * GET /api/cookies-status
+ * التحقق من حالة الكوكيز في Firebase
+ */
+app.get('/api/cookies-status', async (req, res) => {
+  try {
+    log.info('📊 Checking cookies status...');
+    
+    const url = FIREBASE_SECRET 
+      ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
+      : `${FIREBASE_URL}/youtube_cookies.json`;
+
+    https.get(url, (res_fb) => {
+      let data = '';
+      res_fb.on('data', chunk => data += chunk);
+      res_fb.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const hasCoockes = parsed && parsed.value && parsed.value.trim().length > 0;
+          
+          res.json({
+            hasCoockes: hasCoockes,
+            length: parsed && parsed.value ? parsed.value.length : 0,
+            preview: parsed && parsed.value ? parsed.value.substring(0, 50) + '...' : 'لا توجد كوكيز',
+            updated_at: parsed && parsed.updated_at ? parsed.updated_at : null,
+            status: hasCoockes ? '✅ موجودة' : '❌ فارغة أو غير موجودة'
+          });
+          
+          log.success(`✅ Cookies status: ${hasCoockes ? 'OK' : 'EMPTY'}`);
+        } catch (e) {
+          res.json({ 
+            hasCoockes: false, 
+            error: 'JSON parse error',
+            status: '❌ خطأ في قراءة البيانات'
+          });
+        }
+      });
+    }).on('error', (err) => {
+      log.error(`Firebase status check error: ${err.message}`);
+      res.status(500).json({ 
+        error: 'فشل الاتصال مع Firebase',
+        hasCoockes: false,
+        status: '❌ خطأ في الاتصال'
+      });
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * GET /
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v2 - YouTube Proxy',
-    version: '2.0.0',
+    name: '🎬 srver v2.2 - YouTube Proxy',
+    version: '2.2.0',
     environment: NODE_ENV,
+    cookies: {
+      source: '🔥 Firebase Realtime Database',
+      url: FIREBASE_URL,
+      cache: '5 دقائق',
+      auto_refresh: 'Yes ✅'
+    },
     endpoints: {
       video: '/video?v=VIDEO_ID&format=best[height<=720]',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
-      health: '/health'
+      health: '/health',
+      cookiesStatus: '/api/cookies-status'
     },
     examples: {
       'Play video': '/video?v=dQw4w9WgXcQ',
-      'Get info': '/info?v=dQw4w9WgXcQ',
-      'List formats': '/formats?v=dQw4w9WgXcQ',
-      'Low quality': '/video?v=dQw4w9WgXcQ&format=worst'
+      'Check cookies': '/api/cookies-status'
     }
   });
 });
@@ -330,14 +545,18 @@ app.use((err, req, res, next) => {
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
-╔════════════════════════════════════════╗
-║  🎬 srver v2 - YouTube Proxy شغّال 🔥 ║
+╔═══════════════════════════════════════════╗
+║  🎬 srver v2.2 - YouTube Proxy شغّال 🔥  ║
+║  ═════════════════════════════════════    ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
-║  yt-dlp status: ${ytdlpStatus}                      ║
-║  http://0.0.0.0:${PORT}                        ║
-╚════════════════════════════════════════╝
+║  yt-dlp: ${ytdlpStatus}  Firebase Cookies ✅    ║
+║  Firebase: 🌐 Real-time Database          ║
+║  Cache: 5 دقائق                          ║
+║  http://0.0.0.0:${PORT}                     ║
+╚═══════════════════════════════════════════╝
   `);
-  log.success(`Server running on port ${PORT}`);
+  log.success(`✅ Server ready - Fetching cookies from Firebase`);
+  log.info(`📍 Firebase: ${FIREBASE_URL}`);
 });
 
 // Graceful shutdown
