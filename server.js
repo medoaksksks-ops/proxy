@@ -119,10 +119,22 @@ function fetchCookiesFromFirebase() {
 }
 
 let lastCookiesContent = '';
+function looksLikeValidCookieFile(content) {
+  // ملف كوكيز Netscape لازم يبدأ بالتعليق المعروف ده أو فيه سطور Tab-separated
+  // 7 أعمدة. لو الشكل غلط (مثلاً JSON أو HTML صفحة تسجيل دخول) هنعرف فورًا
+  // بدل ما نكتشف بعد ساعات إن كل الطلبات بتفشل من غير سبب واضح.
+  const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  return content.includes('Netscape') || lines.some(l => l.split('\t').length >= 6);
+}
+
 async function refreshCookies() {
   try {
     const content = await fetchCookiesFromFirebase();
     if (content && content.trim() && content !== lastCookiesContent) {
+      if (!looksLikeValidCookieFile(content)) {
+        log.error('❌ الكوكيز اللي جايه من Firebase شكله غلط (مش Netscape cookie format) — هتفضل الكوكيز القديمة (لو موجودة) شغالة لحد ما تتحدّث كوكيز صحيحة');
+        return;
+      }
       fs.writeFileSync(COOKIES_PATH, content);
       lastCookiesContent = content;
       cookiesReady = true;
@@ -136,6 +148,8 @@ async function refreshCookies() {
 }
 refreshCookies();
 setInterval(refreshCookies, 5 * 60 * 1000);
+selfUpdateYtDlp();
+setInterval(selfUpdateYtDlp, 6 * 60 * 60 * 1000); // كل 6 ساعات، عشان لو يوتيوب غيّر حاجة تاني في نفس اليوم
 
 // Check if yt-dlp is installed
 function checkYtDlp() {
@@ -145,6 +159,34 @@ function checkYtDlp() {
   } catch {
     return false;
   }
+}
+
+function getYtDlpVersion() {
+  try {
+    return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// ==========================================================================
+// يوتيوب بيغيّر آلية الحماية بتاعته باستمرار، وأي نسخة yt-dlp أقدم من كام
+// يوم بتوقف فجأة عن العمل بالكامل (فيديو + معلومات + تعليقات مع بعض) —
+// ده أشهر سبب لمشكلة "كان شغال وبقى مش راضي يشتغل خالص من غير أي تعديل
+// في الكود". بنحاول نحدّثه تلقائيًا عند تشغيل السيرفر.
+// ==========================================================================
+function selfUpdateYtDlp() {
+  const before = getYtDlpVersion();
+  require('child_process').exec('yt-dlp -U', { timeout: 30000 }, (err, stdout, stderr) => {
+    const after = getYtDlpVersion();
+    if (after && after !== before) {
+      log.success(`🔄 yt-dlp اتحدّث: ${before || '?'} → ${after}`);
+    } else if (err) {
+      log.warn(`⚠️  فشل تحديث yt-dlp تلقائيًا (${err.message}). لو الفيديوهات مش شغالة، حدّثه يدوي: pip install -U yt-dlp`);
+    } else {
+      log.info(`ℹ️  yt-dlp أحدث نسخة بالفعل (${after})`);
+    }
+  });
 }
 
 // Validation
@@ -171,6 +213,21 @@ async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 
       encoding: 'utf-8'
     });
     return stdout;
+  } catch (error) {
+    // execFile بيحط ناتج stderr الحقيقي جوه error.stderr — ده اللي فيه سبب
+    // الفشل الفعلي من يوتيوب (bot check, private, cookies invalid...) وكان
+    // مش بيتسجل في اللوج قبل كده، فكنا شغالين "أعمى" لما حاجة تفشل.
+    const stderr = (error.stderr || '').toString().trim();
+    log.error(`yt-dlp failed: ${error.message}${stderr ? ` | stderr: ${stderr.slice(0, 500)}` : ''}`);
+
+    if (/sign in to confirm|not a bot|confirm you're not a bot/i.test(stderr)) {
+      log.warn('🤖 يوتيوب رافض الطلب لأن الكوكيز غير صالحة/منتهية أو ناقصة — لازم كوكيز جديدة من حساب حقيقي مسجّل دخول');
+      cookiesReady = false; // نمنع استخدام كوكيز بايظة في المحاولات الجاية لحد ما تتحدّث
+    }
+
+    const enriched = new Error(stderr ? `${error.message} — ${stderr.slice(0, 300)}` : error.message);
+    enriched.stderr = stderr;
+    throw enriched;
   } finally {
     ytdlpLimiter.release();
   }
@@ -1004,8 +1061,10 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
+    ytdlpVersion: getYtDlpVersion(),
     ffmpegReady: (() => { try { require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' }); return true; } catch { return false; } })(),
     cookiesReady,
+    cookiesLength: lastCookiesContent.length,
     concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
   });
 });
