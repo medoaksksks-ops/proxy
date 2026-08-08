@@ -1,5 +1,5 @@
 const express = require('express');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
@@ -7,20 +7,6 @@ const path = require('path');
 const NodeCache = require('node-cache');
 const https = require('https');
 require('dotenv').config();
-
-// ==========================================================================
-// 🔖 srver v5.0.0 "جبارة" — نسخة موسّعة فوق v4.0 الأصلية بدون حذف أي حاجة:
-//   • كل جودات الفيديو (144p → 4K) + دمج فيديو/صوت لحظي بـ ffmpeg للجودات
-//     العالية اللي معندهاش progressive stream جاهز.
-//   • هوم فيد بأقسام (Sections) زي صفحة يوتيوب الرئيسية الحقيقية.
-//   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
-//   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
-// ==========================================================================
-const SERVER_VERSION = '5.0.0';
-
-// Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
-// طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +23,6 @@ const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 // يوصل دايمًا في كل رد، من غير ما يعتمد على أي متغيّر بيئة ممكن يبوّظ الموضوع.
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Timing-Allow-Origin', '*'); // عشان الموقع يقدر يقيس حجم البيانات المُستهلكة فعليًا (Resource Timing API)
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Vary', 'Origin');
@@ -54,7 +39,6 @@ app.use(express.text({ limit: '10mb' }));
 const infoCache = new NodeCache({ stdTTL: 7200 });          // معلومات فيديو/بحث/related: ساعتين
 const trendingCache = new NodeCache({ stdTTL: 1200 });      // الرائج: 20 دقيقة
 const streamCache = new NodeCache({ stdTTL: 240 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
-const channelCache = new NodeCache({ stdTTL: 3600 });       // بيانات وفيديوهات القنوات: ساعة
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
@@ -99,7 +83,7 @@ function fetchCookiesFromFirebase() {
       ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
       : `${FIREBASE_URL}/youtube_cookies.json`;
 
-    https.get(url, { timeout: 5000, agent: keepAliveAgent }, (res) => {
+    https.get(url, { timeout: 5000 }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -119,22 +103,10 @@ function fetchCookiesFromFirebase() {
 }
 
 let lastCookiesContent = '';
-function looksLikeValidCookieFile(content) {
-  // ملف كوكيز Netscape لازم يبدأ بالتعليق المعروف ده أو فيه سطور Tab-separated
-  // 7 أعمدة. لو الشكل غلط (مثلاً JSON أو HTML صفحة تسجيل دخول) هنعرف فورًا
-  // بدل ما نكتشف بعد ساعات إن كل الطلبات بتفشل من غير سبب واضح.
-  const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
-  return content.includes('Netscape') || lines.some(l => l.split('\t').length >= 6);
-}
-
 async function refreshCookies() {
   try {
     const content = await fetchCookiesFromFirebase();
     if (content && content.trim() && content !== lastCookiesContent) {
-      if (!looksLikeValidCookieFile(content)) {
-        log.error('❌ الكوكيز اللي جايه من Firebase شكله غلط (مش Netscape cookie format) — هتفضل الكوكيز القديمة (لو موجودة) شغالة لحد ما تتحدّث كوكيز صحيحة');
-        return;
-      }
       fs.writeFileSync(COOKIES_PATH, content);
       lastCookiesContent = content;
       cookiesReady = true;
@@ -148,8 +120,6 @@ async function refreshCookies() {
 }
 refreshCookies();
 setInterval(refreshCookies, 5 * 60 * 1000);
-selfUpdateYtDlp();
-setInterval(selfUpdateYtDlp, 6 * 60 * 60 * 1000); // كل 6 ساعات، عشان لو يوتيوب غيّر حاجة تاني في نفس اليوم
 
 // Check if yt-dlp is installed
 function checkYtDlp() {
@@ -159,34 +129,6 @@ function checkYtDlp() {
   } catch {
     return false;
   }
-}
-
-function getYtDlpVersion() {
-  try {
-    return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim();
-  } catch {
-    return null;
-  }
-}
-
-// ==========================================================================
-// يوتيوب بيغيّر آلية الحماية بتاعته باستمرار، وأي نسخة yt-dlp أقدم من كام
-// يوم بتوقف فجأة عن العمل بالكامل (فيديو + معلومات + تعليقات مع بعض) —
-// ده أشهر سبب لمشكلة "كان شغال وبقى مش راضي يشتغل خالص من غير أي تعديل
-// في الكود". بنحاول نحدّثه تلقائيًا عند تشغيل السيرفر.
-// ==========================================================================
-function selfUpdateYtDlp() {
-  const before = getYtDlpVersion();
-  require('child_process').exec('yt-dlp -U', { timeout: 30000 }, (err, stdout, stderr) => {
-    const after = getYtDlpVersion();
-    if (after && after !== before) {
-      log.success(`🔄 yt-dlp اتحدّث: ${before || '?'} → ${after}`);
-    } else if (err) {
-      log.warn(`⚠️  فشل تحديث yt-dlp تلقائيًا (${err.message}). لو الفيديوهات مش شغالة، حدّثه يدوي: pip install -U yt-dlp`);
-    } else {
-      log.info(`ℹ️  yt-dlp أحدث نسخة بالفعل (${after})`);
-    }
-  });
 }
 
 // Validation
@@ -213,43 +155,12 @@ async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 
       encoding: 'utf-8'
     });
     return stdout;
-  } catch (error) {
-    // execFile بيحط ناتج stderr الحقيقي جوه error.stderr — ده اللي فيه سبب
-    // الفشل الفعلي من يوتيوب (bot check, private, cookies invalid...) وكان
-    // مش بيتسجل في اللوج قبل كده، فكنا شغالين "أعمى" لما حاجة تفشل.
-    const stderr = (error.stderr || '').toString().trim();
-    log.error(`yt-dlp failed: ${error.message}${stderr ? ` | stderr: ${stderr.slice(0, 500)}` : ''}`);
-
-    if (/sign in to confirm|not a bot|confirm you're not a bot/i.test(stderr)) {
-      log.warn('🤖 يوتيوب رافض الطلب لأن الكوكيز غير صالحة/منتهية أو ناقصة — لازم كوكيز جديدة من حساب حقيقي مسجّل دخول');
-      cookiesReady = false; // نمنع استخدام كوكيز بايظة في المحاولات الجاية لحد ما تتحدّث
-    }
-
-    const enriched = new Error(stderr ? `${error.message} — ${stderr.slice(0, 300)}` : error.message);
-    enriched.stderr = stderr;
-    throw enriched;
   } finally {
     ytdlpLimiter.release();
   }
 }
 
 /** بيحوّل ناتج --dump-json (سطر لكل فيديو) لمصفوفة عناصر موحّدة الشكل */
-function mapFlatEntry(item, excludeId) {
-  if (!item || !item.id) return null;
-  if (excludeId && item.id === excludeId) return null;
-  return {
-    id: item.id,
-    title: item.title || 'بدون عنوان',
-    author: item.uploader || item.channel || 'Unknown',
-    channelId: item.channel_id || '',
-    duration: item.duration || 0,
-    thumbnail: item.thumbnails?.length
-      ? item.thumbnails[item.thumbnails.length - 1].url
-      : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-    viewCount: item.view_count || 0
-  };
-}
-
 function parseFlatItems(raw, excludeId) {
   return raw
     .trim()
@@ -258,34 +169,20 @@ function parseFlatItems(raw, excludeId) {
     .map(line => {
       let item;
       try { item = JSON.parse(line); } catch (e) { return null; }
-      return mapFlatEntry(item, excludeId);
+      if (!item || !item.id) return null;
+      return {
+        id: item.id,
+        title: item.title || 'بدون عنوان',
+        author: item.uploader || item.channel || 'Unknown',
+        channelId: item.channel_id || '',
+        duration: item.duration || 0,
+        thumbnail: item.thumbnails?.length
+          ? item.thumbnails[item.thumbnails.length - 1].url
+          : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
+        viewCount: item.view_count || 0
+      };
     })
-    .filter(Boolean);
-}
-
-/**
- * جلب صفحة من نتايج بأي حجم مطلوب، مع كاش لكل "بركة" (pool) بحجمها —
- * عشان السكرول اللانهائي (infinite scroll) يقدر يكمّل يجيب صفحات جديدة
- * من غير ما يعيد طلب yt-dlp لنفس البيانات القديمة تاني.
- */
-async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, maxPool = 150) {
-  const pageNum = Math.max(1, parseInt(page, 10) || 1);
-  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 30);
-  const needed = pageNum * pageSize;
-  const poolSize = Math.min(Math.max(needed, pageSize * 2), maxPool);
-
-  const cacheKey = `${cacheKeyBase}_${poolSize}`;
-  let pool = cache.get(cacheKey);
-  if (!pool) {
-    pool = await fetchPoolFn(poolSize);
-    cache.set(cacheKey, pool);
-  }
-
-  const start = (pageNum - 1) * pageSize;
-  const results = pool.slice(start, start + pageSize);
-  const hasMore = pool.length > start + pageSize;
-
-  return { page: pageNum, limit: pageSize, results, hasMore };
+    .filter(v => v && v.id !== excludeId);
 }
 
 /**
@@ -321,7 +218,7 @@ async function searchVideos(query, limit = 10) {
  */
 async function getRelatedVideos(videoId, limit = 10) {
   const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-  log.info(`🧭 Fetching related videos for: ${videoId} (limit ${limit})`);
+  log.info(`🧭 Fetching related videos for: ${videoId}`);
 
   let items = [];
   try {
@@ -341,14 +238,12 @@ async function getRelatedVideos(videoId, limit = 10) {
 }
 
 /**
- * جلب محتوى عام متنوع للاستخدام كـ fallback لما مفيش تاريخ مشاهدة كفاية
- * عند المستخدم بعد (مستخدم جديد مثلًا). الشخصنة الحقيقية بتحصل في المتصفح
- * نفسه (client-side) عن طريق جلب "فيديوهات متشابهة" لآخر حاجات المستخدم
- * اتفرج عليها فعليًا — مش هنا في السيرفر، لأن صفحة يوتيوب الرئيسية
- * الشخصية (Home feed) مش endpoint مدعوم بشكل موثوق في yt-dlp، وتبويب
- * "الرائج" (Trending) نفسه ثابت وواحد لكل الناس بغض النظر عن الكوكيز.
+ * جلب الفيديوهات الرائجة (Trending) — بدل اعتماد على chart=mostPopular بتاع
+ * YouTube Data API، بنجيب تبويب "الرائج" مباشرة من يوتيوب عن طريق yt-dlp.
+ * لو ده فشل لأي سبب (يوتيوب بيغيّر شكل الصفحة أحيانًا)، بنعمل fallback:
+ * بحث في عدة موضوعات مصرية شائعة وترتيب النتائج حسب المشاهدات.
  */
-async function getRecommendedVideos(region = 'EG', limit = 20) {
+async function getTrendingVideos(region = 'EG', limit = 20) {
   let items = [];
 
   try {
@@ -356,145 +251,28 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
     const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
     items = parseFlatItems(stdout);
   } catch (e) {
-    log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
+    log.warn(`Trending feed failed (${e.message}), falling back to search-based trending`);
   }
 
   if (items.length < 5) {
-    const topicPool = [
-      'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
-      'بودكاست عربي', 'أفلام كوميدي مصرية', 'مسلسلات رمضان', 'تكنولوجيا وتقنية',
-      'وصفات طبخ سريعة', 'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة',
-      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس'
-    ];
-    const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
-    const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
-    // بنجيب كل الـ queries مع بعض بالتوازي (مش واحد ورا التاني) — بيقلل زمن
-    // الانتظار من مجموع كل الطلبات لأطول طلب واحد بس
-    const settled = await Promise.allSettled(
-      shuffled.map(q => runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']))
-    );
+    const fallbackQueries = ['أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف', 'بودكاست مصري'];
     const pool = [];
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') pool.push(...parseFlatItems(r.value));
-      else log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`);
-    });
+    for (const q of fallbackQueries) {
+      try {
+        const stdout = await runYtDlp([`ytsearch10:${q}`, '--dump-json', '--flat-playlist']);
+        pool.push(...parseFlatItems(stdout));
+      } catch (e) {
+        log.warn(`Trending fallback query failed "${q}": ${e.message}`);
+      }
+    }
+    // شيل التكرار، ورتّب حسب المشاهدات تنازليًا
     const seen = new Set();
     items = pool
       .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
-      .sort(() => Math.random() - 0.5);
+      .sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
   }
 
-  return { items: items.slice(0, limit), personalized: false };
-}
-
-/**
- * ==========================================================================
- * الهوم فيد الكامل — بيحاول يقلّد شكل صفحة يوتيوب الرئيسية الحقيقية:
- * مش قايمة واحدة، لكن "أقسام" (Sections) زي: الرائج، موسيقى، رياضة، ألعاب،
- * أخبار، تكنولوجيا، أفلام/مسلسلات، بودكاست... كل قسم بيتجاب بالتوازي مع
- * الباقي (مش واحد ورا التاني) عشان الاستجابة تكون سريعة حتى مع عدد أقسام كبير.
- * فيه كمان "mixed" وهي خلطة من كل الأقسام مبعثرة زي ما يوتيوب بيعمل بالظبط
- * في أول تحميل للصفحة الرئيسية.
- * ==========================================================================
- */
-const HOME_SECTIONS = [
-  { key: 'trending', title: '🔥 الرائج الآن', query: null }, // بيتجاب من فيد الترند الحقيقي
-  { key: 'music', title: '🎵 موسيقى', query: 'أغاني عربي جديد 2026' },
-  { key: 'sports', title: '⚽ رياضة', query: 'أهداف وملخصات مباريات' },
-  { key: 'gaming', title: '🎮 ألعاب', query: 'ألعاب فيديو جيمنج' },
-  { key: 'news', title: '📰 أخبار', query: 'أخبار عاجلة اليوم' },
-  { key: 'tech', title: '💻 تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية' },
-  { key: 'entertainment', title: '🎬 ترفيه وأفلام', query: 'أفلام ومسلسلات تريلر' },
-  { key: 'podcasts', title: '🎙️ بودكاست', query: 'بودكاست عربي حوار' },
-  { key: 'comedy', title: '😂 كوميدي', query: 'فيديوهات كوميدي مضحكة' },
-  { key: 'live', title: '🔴 مباشر الآن', query: 'بث مباشر live' }
-];
-
-async function getHomeFeed(region = 'EG', perSection = 12) {
-  log.info(`🏠 Building home feed (region ${region}, ${perSection}/section)`);
-
-  const fetchers = HOME_SECTIONS.map(async (section) => {
-    try {
-      let items;
-      if (section.key === 'trending') {
-        const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-        const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection), url]);
-        items = parseFlatItems(stdout);
-      } else {
-        const stdout = await runYtDlp([`ytsearch${perSection}:${section.query}`, '--dump-json', '--flat-playlist']);
-        items = parseFlatItems(stdout);
-      }
-      return { key: section.key, title: section.title, items };
-    } catch (e) {
-      log.warn(`Home section "${section.key}" failed: ${e.message}`);
-      return { key: section.key, title: section.title, items: [] };
-    }
-  });
-
-  // كل الأقسام بتتجاب مع بعض في نفس الوقت
-  const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
-
-  // خلطة "mixed" شبه اللي يوتيوب بيعرضها فعلاً في أول سكرول للهوم —
-  // شوية من كل قسم متبعثرين مش مجمّعين ورا بعض
-  const seen = new Set();
-  const mixed = [];
-  const maxLen = Math.max(...sections.map(s => s.items.length), 0);
-  for (let i = 0; i < maxLen; i++) {
-    for (const s of sections) {
-      const v = s.items[i];
-      if (v && !seen.has(v.id)) {
-        seen.add(v.id);
-        mixed.push({ ...v, section: s.key });
-      }
-    }
-  }
-
-  return { region, sections, mixed };
-}
-
-/**
- * جلب فيديوهات قناة معيّنة + بيانات القناة نفسها (الاسم، عدد المشتركين، الصورة، الوصف)
- */
-async function getChannelVideos(channelId, limit = 20) {
-  const url = `https://www.youtube.com/channel/${channelId}/videos`;
-  log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
-  const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
-  const data = JSON.parse(stdout);
-  const videos = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
-  return {
-    channel: {
-      id: data.channel_id || channelId,
-      title: data.channel || data.uploader || 'قناة',
-      followers: data.channel_follower_count || null,
-      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
-      description: data.description || ''
-    },
-    videos
-  };
-}
-
-/**
- * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن
- */
-async function getVideoComments(videoId, limit = 50) {
-  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
-  const args = [
-    '--skip-download', '--dump-json', '--write-comments',
-    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},all,all,${limit}`,
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
-  const stdout = await runYtDlp(args, { timeout: 45000 });
-  const lines = stdout.trim().split('\n').filter(Boolean);
-  const data = JSON.parse(lines[lines.length - 1]);
-  return (data.comments || []).slice(0, limit).map(c => ({
-    id: c.id,
-    author: c.author || 'مستخدم يوتيوب',
-    authorThumbnail: c.author_thumbnail || '',
-    text: c.text || '',
-    likeCount: c.like_count || 0,
-    isReply: !!(c.parent && c.parent !== 'root'),
-    timestamp: c.timestamp ? new Date(c.timestamp * 1000).toISOString() : null
-  }));
+  return items.slice(0, limit);
 }
 
 // ==========================================================================
@@ -502,90 +280,64 @@ async function getVideoComments(videoId, limit = 50) {
 // ==========================================================================
 
 /**
- * GET /trending?region=EG&limit=20&page=1
- */
-/**
- * GET /trending?region=EG&limit=20&page=1
- * (بيرجّع محتوى شخصي بناءً على الكوكيز لو متاحة، وإلا محتوى عام متنوّع)
+ * GET /trending?region=EG&limit=20
  */
 app.get('/trending', async (req, res) => {
   const region = (req.query.region || 'EG').toUpperCase();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 40);
+  const cacheKey = `trending_${region}_${limit}`;
+
+  const cached = trendingCache.get(cacheKey);
+  if (cached) {
+    log.info(`📦 Trending from cache: ${region}`);
+    return res.json(cached);
+  }
+
   try {
-    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
-    const needed = pageNum * pageSize;
-    const poolSize = Math.min(Math.max(needed, pageSize * 2), 150);
-
-    const cacheKey = `recommended_${region}_${poolSize}`;
-    let cached = trendingCache.get(cacheKey);
-    if (!cached) {
-      cached = await getRecommendedVideos(region, poolSize);
-      trendingCache.set(cacheKey, cached);
-    }
-
-    const start = (pageNum - 1) * pageSize;
-    const results = cached.items.slice(start, start + pageSize);
-    const hasMore = cached.items.length > start + pageSize;
-
-    log.success(`✅ Recommended done: ${region} page ${pageNum} (${results.length} نتيجة, personalized=${cached.personalized})`);
-    res.json({ region, page: pageNum, limit: pageSize, count: results.length, hasMore, personalized: cached.personalized, results });
+    const results = await getTrendingVideos(region, limit);
+    const response = { region, count: results.length, results };
+    trendingCache.set(cacheKey, response);
+    log.success(`✅ Trending done: ${region} (${results.length} نتيجة)`);
+    res.json(response);
   } catch (error) {
-    log.error(`Error fetching recommended: ${error.message}`);
+    log.error(`Error fetching trending: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر جلب المحتوى المقترح',
+      error: 'تعذّر جلب الفيديوهات الرائجة',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
 /**
- * GET /home?region=EG&perSection=12
- * فيد الصفحة الرئيسية الكامل بأقسام (trending, music, sports, gaming...)
- * + خلطة "mixed" جاهزة للعرض المباشر — زي شكل هوم يوتيوب الحقيقي
- */
-app.get('/home', async (req, res) => {
-  const region = (req.query.region || 'EG').toUpperCase();
-  const perSection = Math.min(Math.max(parseInt(req.query.perSection, 10) || 12, 4), 25);
-
-  const cacheKey = `home_${region}_${perSection}`;
-  try {
-    let data = trendingCache.get(cacheKey);
-    if (!data) {
-      data = await getHomeFeed(region, perSection);
-      trendingCache.set(cacheKey, data);
-    }
-    log.success(`✅ Home feed done: ${region} (${data.sections.length} قسم, ${data.mixed.length} فيديو)`);
-    res.json(data);
-  } catch (error) {
-    log.error(`Error building home feed: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر بناء الصفحة الرئيسية',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /search?q=QUERY&limit=20&page=1
+ * GET /search?q=QUERY&limit=10
  */
 app.get('/search', async (req, res) => {
-  const { q: query } = req.query;
+  const { q: query, limit = 10 } = req.query;
 
   if (!query || !query.trim()) {
     return res.status(400).json({
       error: 'كلمة البحث مطلوبة',
-      example: '/search?q=funny+cats&limit=20&page=1'
+      example: '/search?q=funny+cats&limit=10'
     });
   }
 
+  const searchLimit = Math.min(parseInt(limit, 10) || 10, 30);
+  const cacheKey = `search_${query}_${searchLimit}`;
+  const cached = infoCache.get(cacheKey);
+
+  if (cached) {
+    log.info(`📦 Search from cache: "${query}"`);
+    return res.json(cached);
+  }
+
   try {
-    const { page, limit, results, hasMore } = await getPaginatedPool(
-      infoCache, `search_${query}`,
-      (poolSize) => searchVideos(query, poolSize),
-      req.query.page, req.query.limit
-    );
-    log.success(`✅ Search done: "${query}" page ${page} (${results.length} نتيجة)`);
-    res.json({ query, page, limit, count: results.length, hasMore, results });
+    const results = await searchVideos(query, searchLimit);
+    const response = { query, count: results.length, results };
+
+    infoCache.set(cacheKey, response);
+    log.success(`✅ Search done: "${query}" (${results.length} نتيجة)`);
+
+    res.json(response);
   } catch (error) {
     log.error(`Error searching: ${error.message}`);
     res.status(500).json({
@@ -596,26 +348,35 @@ app.get('/search', async (req, res) => {
 });
 
 /**
- * GET /related?v=VIDEO_ID&limit=10&page=1
+ * GET /related?v=VIDEO_ID&limit=10
  */
 app.get('/related', async (req, res) => {
-  const { v: videoId } = req.query;
+  const { v: videoId, limit = 10 } = req.query;
 
   if (!videoId || !isValidVideoId(videoId)) {
     return res.status(400).json({
       error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/related?v=dQw4w9WgXcQ&limit=10&page=1'
+      example: '/related?v=dQw4w9WgXcQ&limit=10'
     });
   }
 
+  const relatedLimit = Math.min(parseInt(limit, 10) || 10, 30);
+  const cacheKey = `related_${videoId}_${relatedLimit}`;
+  const cached = infoCache.get(cacheKey);
+
+  if (cached) {
+    log.info(`📦 Related from cache: ${videoId}`);
+    return res.json(cached);
+  }
+
   try {
-    const { page, limit, results, hasMore } = await getPaginatedPool(
-      infoCache, `related_${videoId}`,
-      (poolSize) => getRelatedVideos(videoId, poolSize),
-      req.query.page, req.query.limit, 60
-    );
-    log.success(`✅ Related done: ${videoId} page ${page} (${results.length} نتيجة)`);
-    res.json({ id: videoId, page, limit, count: results.length, hasMore, results });
+    const results = await getRelatedVideos(videoId, relatedLimit);
+    const response = { id: videoId, count: results.length, results };
+
+    infoCache.set(cacheKey, response);
+    log.success(`✅ Related done: ${videoId} (${results.length} نتيجة)`);
+
+    res.json(response);
   } catch (error) {
     log.error(`Error fetching related: ${error.message}`);
     res.status(500).json({
@@ -626,238 +387,17 @@ app.get('/related', async (req, res) => {
 });
 
 /**
- * GET /channel?id=CHANNEL_ID&limit=20&page=1
- */
-app.get('/channel', async (req, res) => {
-  const channelId = req.query.id;
-
-  if (!channelId) {
-    return res.status(400).json({
-      error: 'channel id مطلوب',
-      example: '/channel?id=UCxxxxxxxx&limit=20&page=1'
-    });
-  }
-
-  try {
-    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
-    const needed = pageNum * pageSize;
-    const poolSize = Math.min(Math.max(needed, pageSize * 2), 100);
-
-    const dataCacheKey = `channel_${channelId}_${poolSize}`;
-    let data = channelCache.get(dataCacheKey);
-    if (!data) {
-      data = await getChannelVideos(channelId, poolSize);
-      channelCache.set(dataCacheKey, data);
-    }
-
-    const start = (pageNum - 1) * pageSize;
-    const videos = data.videos.slice(start, start + pageSize);
-    const hasMore = data.videos.length > start + pageSize;
-
-    log.success(`✅ Channel done: ${channelId} page ${pageNum} (${videos.length} نتيجة)`);
-    res.json({ channel: data.channel, page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
-  } catch (error) {
-    log.error(`Error fetching channel: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب بيانات القناة',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /comments?v=VIDEO_ID&limit=50
- */
-app.get('/comments', async (req, res) => {
-  const videoId = req.query.v;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `comments_${videoId}_${limit}`;
-  const cached = infoCache.get(cacheKey);
-  if (cached) {
-    log.info(`📦 Comments from cache: ${videoId}`);
-    return res.json(cached);
-  }
-
-  try {
-    const comments = await getVideoComments(videoId, limit);
-    const response = { id: videoId, count: comments.length, results: comments };
-    infoCache.set(cacheKey, response, 1800);
-    log.success(`✅ Comments done: ${videoId} (${comments.length} تعليق)`);
-    res.json(response);
-  } catch (error) {
-    log.error(`Error fetching comments: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب التعليقات (ممكن تكون التعليقات مقفولة على الفيديو ده)',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
  * GET /video?v=VIDEO_ID
  */
-/**
- * بيسحب الفيديو من الرابط المباشر (googlevideo) ويبعته للمتصفح بايت بايت،
- * بدل عمل redirect. ده بيحل مشكلة إن رابط يوتيوب مقفول على IP السيرفر:
- * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
- * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
- */
-function streamFromUpstream(req, res, url, redirectCount = 0) {
-  if (redirectCount > 5) {
-    if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
-    return;
-  }
-
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  };
-  if (req.headers.range) headers['Range'] = req.headers.range;
-
-  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
-    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
-    if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
-      upstreamRes.resume();
-      return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
-    }
-
-    if (upstreamRes.statusCode >= 400) {
-      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
-      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
-      upstreamRes.resume();
-      return;
-    }
-
-    res.status(upstreamRes.statusCode);
-    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']
-      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
-
-    upstreamRes.pipe(res);
-  });
-
-  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
-  upstreamReq.on('error', (err) => {
-    log.error(`Stream proxy error: ${err.message}`);
-    if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
-  });
-
-  req.on('close', () => upstreamReq.destroy());
-}
-
-// ==========================================================================
-// نظام "كل الجودات" — 144p لحد 4K + صوت لوحده
-// - الجودات لحد 720p غالبًا بتكون progressive (فيديو+صوت في رابط واحد)
-//   فبنستخدم نفس مسار البروكسي المباشر (streamFromUpstream) وده الأسرع.
-// - الجودات الأعلى (1080p, 1440p, 4K) عادةً مفيش ليها progressive على
-//   يوتيوب، فبنجيب رابط الفيديو ورابط الصوت لوحدهم وندمجهم لحظيًا بـ ffmpeg
-//   (-c copy يعني نسخ بدون إعادة ترميز، سريع وموفّر معالج) ونبعتهم كـ stream
-//   واحد للمتصفح من غير ما نخزّن أي ملف على القرص.
-// ==========================================================================
-const QUALITY_HEIGHTS = { '2160': 2160, '4k': 2160, '1440': 1440, '2k': 1440, '1080': 1080, '720': 720, '480': 480, '360': 360, '240': 240, '144': 144 };
-const PROGRESSIVE_MAX_HEIGHT = 720; // فوق كده يوتيوب مبيدّيش progressive عادةً
-
-function resolveQuality(quality) {
-  if (!quality) return null;
-  const q = String(quality).toLowerCase().replace('p', '');
-  if (q === 'audio') return { type: 'audio' };
-  const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
-  if (!height || Number.isNaN(height)) return null;
-  return { type: height <= PROGRESSIVE_MAX_HEIGHT ? 'progressive' : 'merge', height };
-}
-
-/** بيرجع رابط أو رابطين (فيديو + صوت) حسب الفورمات المطلوب */
-async function getFormatUrls(videoId, formatSelector) {
-  const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
-  const urls = stdout.trim().split('\n').filter(Boolean);
-  return urls;
-}
-
-/** بث فيديو+صوت مدموجين لحظيًا عن طريق ffmpeg (بدون تخزين على القرص) */
-function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  const inputArgs = ['-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', videoUrl];
-  if (audioUrl) inputArgs.push('-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', audioUrl);
-
-  const args = [
-    '-loglevel', 'error', '-hide_banner',
-    ...inputArgs,
-    '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
-    '-c', 'copy',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-f', 'mp4', 'pipe:1'
-  ];
-
-  res.status(200);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-cache');
-
-  const ff = spawn('ffmpeg', args);
-  let stderrBuf = '';
-  ff.stderr.on('data', d => { stderrBuf += d.toString(); });
-  ff.stdout.pipe(res);
-  ff.on('error', (e) => {
-    log.error(`ffmpeg spawn error (ffmpeg متثبّت؟): ${e.message}`);
-    if (!res.headersSent) res.status(500).json({ error: 'ffmpeg غير متاح على السيرفر' });
-  });
-  ff.on('close', (code) => {
-    if (code !== 0 && code !== null && !res.writableEnded) {
-      log.warn(`ffmpeg exited with code ${code}: ${stderrBuf.slice(-300)}`);
-    }
-  });
-  req.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
-}
-
 app.get('/video', async (req, res) => {
-  const { v: videoId, format = 'best[height<=720]', quality } = req.query;
+  const { v: videoId, format = 'best[height<=720]' } = req.query;
 
   if (!videoId || !isValidVideoId(videoId)) {
     log.error(`Invalid video ID: ${videoId}`);
     return res.status(400).json({
       error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/video?v=dQw4w9WgXcQ&quality=1080 أو /video?v=dQw4w9WgXcQ&format=best[height<=720]'
+      example: '/video?v=dQw4w9WgXcQ&format=best[height<=720]'
     });
-  }
-
-  // ---- مسار الجودات الجديد (quality=144|240|360|480|720|1080|1440|2160|audio) ----
-  // لو مفيش quality، بيشتغل بالضبط زي القديم بمتغيّر format (مفيش أي تغيير في السلوك الأصلي)
-  const resolved = resolveQuality(quality);
-  if (resolved) {
-    const qCacheKey = `stream_q_${videoId}_${quality}`;
-    try {
-      if (resolved.type === 'progressive') {
-        const cachedUrl = streamCache.get(qCacheKey);
-        if (cachedUrl) { log.info(`📦 Stream from cache: ${videoId} (${quality})`); return streamFromUpstream(req, res, cachedUrl); }
-        const streamUrl = await getVideoStreamUrl(videoId, `best[height<=${resolved.height}]/best`);
-        if (!streamUrl) throw new Error('Failed to get stream URL');
-        streamCache.set(qCacheKey, streamUrl);
-        log.success(`▶️  Streaming (progressive ${quality}): ${videoId}`);
-        return streamFromUpstream(req, res, streamUrl);
-      }
-
-      // جودة عالية أو صوت لوحده → دمج/بث لحظي بـ ffmpeg
-      const selector = resolved.type === 'audio'
-        ? 'bestaudio/best'
-        : `bestvideo[height<=${resolved.height}]+bestaudio/best[height<=${resolved.height}]`;
-      const urls = await getFormatUrls(videoId, selector);
-      if (!urls.length) throw new Error('Failed to get stream URLs');
-      log.success(`▶️  Streaming (merged/ffmpeg ${quality}): ${videoId}`);
-      if (resolved.type === 'audio') return streamFromUpstream(req, res, urls[0]);
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1] || null);
-    } catch (error) {
-      log.error(`Error fetching quality ${quality}: ${error.message}`);
-      if (!res.headersSent) {
-        return res.status(500).json({
-          error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة',
-          details: NODE_ENV === 'development' ? error.message : undefined
-        });
-      }
-      return;
-    }
   }
 
   const cacheKey = `stream_${videoId}_${format}`;
@@ -865,7 +405,7 @@ app.get('/video', async (req, res) => {
 
   if (cachedUrl) {
     log.info(`📦 Stream from cache: ${videoId}`);
-    return streamFromUpstream(req, res, cachedUrl);
+    return res.redirect(cachedUrl);
   }
 
   let attempts = 0;
@@ -875,16 +415,22 @@ app.get('/video', async (req, res) => {
     try {
       log.info(`🎬 Fetching video: ${videoId} (attempt ${attempts + 1}/${MAX_RETRIES})`);
 
-      const streamUrl = await getVideoStreamUrl(videoId, format);
+      const [info, streamUrl] = await Promise.all([
+        getVideoInfo(videoId),
+        getVideoStreamUrl(videoId, format)
+      ]);
 
       if (!streamUrl) {
         throw new Error('Failed to get stream URL');
       }
 
       streamCache.set(cacheKey, streamUrl);
-      log.success(`▶️  Streaming: ${videoId}`);
 
-      streamFromUpstream(req, res, streamUrl);
+      const title = sanitizeFilename(info.title || 'video');
+      log.success(`▶️  Playing: ${info.title}`);
+
+      res.setHeader('Content-Disposition', `inline; filename="${title}.mp4"`);
+      res.redirect(streamUrl);
       return;
 
     } catch (error) {
@@ -1007,64 +553,15 @@ app.get('/formats', async (req, res) => {
 });
 
 /**
- * GET /video/qualities?v=VIDEO_ID
- * بيرجّع كل الجودات المتاحة *فعليًا* لهذا الفيديو بالتحديد (مش قايمة ثابتة)
- * كل جودة معاها رابط تشغيل جاهز من نفس السيرفر (/video?v=..&quality=..)
- */
-app.get('/video/qualities', async (req, res) => {
-  const videoId = req.query.v;
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `qualities_${videoId}`;
-  const cached = infoCache.get(cacheKey);
-  if (cached) return res.json(cached);
-
-  try {
-    const info = await getVideoInfo(videoId);
-    const heights = new Set();
-    (info.formats || []).forEach(f => { if (f.height && f.vcodec !== 'none') heights.add(f.height); });
-
-    const standard = [2160, 1440, 1080, 720, 480, 360, 240, 144];
-    const available = standard.filter(h => [...heights].some(fh => Math.abs(fh - h) <= 20) || h <= Math.max(...heights, 0));
-    const uniqueAvailable = [...new Set(available)].filter(h => h <= Math.max(...heights, 0)).sort((a, b) => b - a);
-
-    const qualities = uniqueAvailable.map(h => ({
-      label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
-      quality: String(h),
-      type: h <= PROGRESSIVE_MAX_HEIGHT ? 'progressive' : 'merged (ffmpeg)',
-      url: `/video?v=${videoId}&quality=${h}`
-    }));
-    qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
-
-    const result = { id: videoId, title: info.title, qualities };
-    infoCache.set(cacheKey, result);
-    log.success(`✅ Qualities done: ${videoId} (${qualities.length} جودة)`);
-    res.json(result);
-  } catch (error) {
-    log.error(`Error fetching qualities: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب الجودات المتاحة',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
  * GET /health
  */
 app.get('/health', (req, res) => {
   res.json({
     status: 'operational',
-    version: SERVER_VERSION,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
-    ytdlpVersion: getYtDlpVersion(),
-    ffmpegReady: (() => { try { require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' }); return true; } catch { return false; } })(),
     cookiesReady,
-    cookiesLength: lastCookiesContent.length,
     concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
   });
 });
@@ -1161,8 +658,8 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v5.0.0 "جبارة" - YouTube Proxy (بدون اعتماد على YouTube Data API)',
-    version: SERVER_VERSION,
+    name: '🎬 srver v3.0 - YouTube Proxy (بدون اعتماد على YouTube Data API)',
+    version: '3.0.0',
     environment: NODE_ENV,
     cookies: {
       source: '🔥 Firebase Realtime Database',
@@ -1172,34 +669,20 @@ app.get('/', (req, res) => {
     },
     concurrency: { max: YTDLP_CONCURRENCY },
     endpoints: {
-      home: '/home?region=EG&perSection=12',
-      trending: '/trending?region=EG&limit=20&page=1',
-      video: '/video?v=VIDEO_ID&quality=1080 (أو &format=best[height<=720] القديم لسه شغال)',
-      videoQualities: '/video/qualities?v=VIDEO_ID',
+      trending: '/trending?region=EG&limit=20',
+      video: '/video?v=VIDEO_ID&format=best[height<=720]',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
-      search: '/search?q=QUERY&limit=20&page=1',
-      related: '/related?v=VIDEO_ID&limit=10&page=1',
-      channel: '/channel?id=CHANNEL_ID&limit=20&page=1',
-      comments: '/comments?v=VIDEO_ID&limit=50',
+      search: '/search?q=QUERY&limit=10',
+      related: '/related?v=VIDEO_ID&limit=10',
       health: '/health',
       cookiesStatus: '/api/cookies-status'
     },
-    videoQualityValues: ['144', '240', '360', '480', '720', '1080', '1440', '2160', 'audio'],
-    pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
     examples: {
-      'Home feed (أقسام زي يوتيوب)': '/home?region=EG',
-      'Trending page 1': '/trending?region=EG&page=1',
-      'Trending page 2 (سكرول لاحق)': '/trending?region=EG&page=2',
-      'Play video (جودة تلقائية)': '/video?v=dQw4w9WgXcQ',
-      'Play video 1080p (دمج ffmpeg)': '/video?v=dQw4w9WgXcQ&quality=1080',
-      'Play video 4K': '/video?v=dQw4w9WgXcQ&quality=2160',
-      'Audio only': '/video?v=dQw4w9WgXcQ&quality=audio',
-      'كل الجودات المتاحة للفيديو ده': '/video/qualities?v=dQw4w9WgXcQ',
-      'Search videos': '/search?q=funny+cats&page=1',
+      'Trending': '/trending?region=EG',
+      'Play video': '/video?v=dQw4w9WgXcQ',
+      'Search videos': '/search?q=funny+cats',
       'Related videos': '/related?v=dQw4w9WgXcQ',
-      'Channel videos': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
-      'Video comments': '/comments?v=dQw4w9WgXcQ',
       'Check cookies': '/api/cookies-status'
     }
   });
@@ -1224,7 +707,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
-║  🎬 srver v${SERVER_VERSION} "جبارة" شغّال 🔥        ║
+║  🎬 srver v3.0 - YouTube Proxy شغّال 🔥    ║
 ║  ═════════════════════════════════════     ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
 ║  yt-dlp: ${ytdlpStatus}  Firebase Cookies (bg refresh)  ║
@@ -1233,7 +716,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 ╚═══════════════════════════════════════════╝
   `);
   log.success(`✅ Server ready - no YouTube Data API dependency`);
-  log.info(`🆕 جديد: /home (فيد بأقسام) + /video?quality=1080/1440/2160/audio + /video/qualities`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
 });
 
