@@ -270,41 +270,68 @@ async function getRelatedVideos(videoId, limit = 10) {
 }
 
 /**
- * جلب الفيديوهات الرائجة (Trending) — بدل اعتماد على chart=mostPopular بتاع
- * YouTube Data API، بنجيب تبويب "الرائج" مباشرة من يوتيوب عن طريق yt-dlp.
- * لو ده فشل لأي سبب (يوتيوب بيغيّر شكل الصفحة أحيانًا)، بنعمل fallback:
- * بحث في عدة موضوعات مصرية شائعة وترتيب النتائج حسب المشاهدات.
+ * جلب فيديوهات "مقترح ليك" — الأولوية دايمًا للصفحة الرئيسية الشخصية بتاعة
+ * يوتيوب (Home feed) لو الكوكيز شغالة، لأنها هي بس اللي بتتبني فعليًا على
+ * حساب المستخدم. تبويب "الرائج" (Trending) في يوتيوب نفسه ثابت وواحد لكل
+ * الناس في نفس الدولة، مش شخصي حتى لو بعتّله كوكيز — عشان كده منعتمدش
+ * عليه إلا لو الصفحة الشخصية فشلت. لو الاتنين فشلوا، fallback أخير:
+ * بحث في مواضيع متنوعة (مش نفس الخمس كلمات ثابتة كل مرة).
  */
-async function getTrendingVideos(region = 'EG', limit = 20) {
+async function getRecommendedVideos(region = 'EG', limit = 20) {
   let items = [];
+  let personalized = false;
 
-  try {
-    const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
-    items = parseFlatItems(stdout);
-  } catch (e) {
-    log.warn(`Trending feed failed (${e.message}), falling back to search-based trending`);
+  // 1) الصفحة الرئيسية الشخصية (بتحتاج كوكيز حساب حقيقي شغال)
+  if (cookiesReady) {
+    try {
+      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), 'https://www.youtube.com/']);
+      const homeItems = parseFlatItems(stdout);
+      if (homeItems.length >= 5) {
+        items = homeItems;
+        personalized = true;
+      }
+    } catch (e) {
+      log.warn(`Home feed failed (${e.message}), falling back to trending`);
+    }
   }
 
+  // 2) تبويب الرائج العام (لو مفيش كوكيز أو الصفحة الشخصية فشلت)
   if (items.length < 5) {
-    const fallbackQueries = ['أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف', 'بودكاست مصري'];
-    const perQuery = Math.max(10, Math.ceil(limit / fallbackQueries.length) + 5);
+    try {
+      const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
+      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
+      items = parseFlatItems(stdout);
+    } catch (e) {
+      log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
+    }
+  }
+
+  // 3) آخر حل: بحث في مواضيع متنوعة (بتتغيّر عشوائيًا كل مرة، مش ثابتة)
+  if (items.length < 5) {
+    const topicPool = [
+      'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
+      'بودكاست عربي', 'أفلام كوميدي مصرية', 'مسلسلات رمضان', 'تكنولوجيا وتقنية',
+      'وصفات طبخ سريعة', 'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة',
+      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس'
+    ];
+    const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
+    const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
     const pool = [];
-    for (const q of fallbackQueries) {
+    for (const q of shuffled) {
       try {
         const stdout = await runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']);
         pool.push(...parseFlatItems(stdout));
       } catch (e) {
-        log.warn(`Trending fallback query failed "${q}": ${e.message}`);
+        log.warn(`Recommended fallback query failed "${q}": ${e.message}`);
       }
     }
     const seen = new Set();
     items = pool
       .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
-      .sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
+      .sort(() => Math.random() - 0.5);
   }
 
-  return items.slice(0, limit);
+  return { items: items.slice(0, limit), personalized };
 }
 
 /**
@@ -359,20 +386,35 @@ async function getVideoComments(videoId, limit = 50) {
 /**
  * GET /trending?region=EG&limit=20&page=1
  */
+/**
+ * GET /trending?region=EG&limit=20&page=1
+ * (بيرجّع محتوى شخصي بناءً على الكوكيز لو متاحة، وإلا محتوى عام متنوّع)
+ */
 app.get('/trending', async (req, res) => {
   const region = (req.query.region || 'EG').toUpperCase();
   try {
-    const { page, limit, results, hasMore } = await getPaginatedPool(
-      trendingCache, `trending_${region}`,
-      (poolSize) => getTrendingVideos(region, poolSize),
-      req.query.page, req.query.limit
-    );
-    log.success(`✅ Trending done: ${region} page ${page} (${results.length} نتيجة)`);
-    res.json({ region, page, limit, count: results.length, hasMore, results });
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+    const needed = pageNum * pageSize;
+    const poolSize = Math.min(Math.max(needed, pageSize * 2), 150);
+
+    const cacheKey = `recommended_${region}_${poolSize}`;
+    let cached = trendingCache.get(cacheKey);
+    if (!cached) {
+      cached = await getRecommendedVideos(region, poolSize);
+      trendingCache.set(cacheKey, cached);
+    }
+
+    const start = (pageNum - 1) * pageSize;
+    const results = cached.items.slice(start, start + pageSize);
+    const hasMore = cached.items.length > start + pageSize;
+
+    log.success(`✅ Recommended done: ${region} page ${pageNum} (${results.length} نتيجة, personalized=${cached.personalized})`);
+    res.json({ region, page: pageNum, limit: pageSize, count: results.length, hasMore, personalized: cached.personalized, results });
   } catch (error) {
-    log.error(`Error fetching trending: ${error.message}`);
+    log.error(`Error fetching recommended: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر جلب الفيديوهات الرائجة',
+      error: 'تعذّر جلب المحتوى المقترح',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
