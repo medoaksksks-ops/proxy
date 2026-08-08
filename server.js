@@ -389,6 +389,53 @@ app.get('/related', async (req, res) => {
 /**
  * GET /video?v=VIDEO_ID
  */
+/**
+ * بيسحب الفيديو من الرابط المباشر (googlevideo) ويبعته للمتصفح بايت بايت،
+ * بدل عمل redirect. ده بيحل مشكلة إن رابط يوتيوب مقفول على IP السيرفر:
+ * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
+ * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
+ */
+function streamFromUpstream(req, res, url, redirectCount = 0) {
+  if (redirectCount > 5) {
+    if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
+    return;
+  }
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  };
+  if (req.headers.range) headers['Range'] = req.headers.range;
+
+  const upstreamReq = https.get(url, { headers, timeout: 20000 }, (upstreamRes) => {
+    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
+    if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+      upstreamRes.resume();
+      return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
+    }
+
+    if (upstreamRes.statusCode >= 400) {
+      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
+      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
+      upstreamRes.resume();
+      return;
+    }
+
+    res.status(upstreamRes.statusCode);
+    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']
+      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
+
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
+  upstreamReq.on('error', (err) => {
+    log.error(`Stream proxy error: ${err.message}`);
+    if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
+  });
+
+  req.on('close', () => upstreamReq.destroy());
+}
+
 app.get('/video', async (req, res) => {
   const { v: videoId, format = 'best[height<=720]' } = req.query;
 
@@ -405,7 +452,7 @@ app.get('/video', async (req, res) => {
 
   if (cachedUrl) {
     log.info(`📦 Stream from cache: ${videoId}`);
-    return res.redirect(cachedUrl);
+    return streamFromUpstream(req, res, cachedUrl);
   }
 
   let attempts = 0;
@@ -415,22 +462,16 @@ app.get('/video', async (req, res) => {
     try {
       log.info(`🎬 Fetching video: ${videoId} (attempt ${attempts + 1}/${MAX_RETRIES})`);
 
-      const [info, streamUrl] = await Promise.all([
-        getVideoInfo(videoId),
-        getVideoStreamUrl(videoId, format)
-      ]);
+      const streamUrl = await getVideoStreamUrl(videoId, format);
 
       if (!streamUrl) {
         throw new Error('Failed to get stream URL');
       }
 
       streamCache.set(cacheKey, streamUrl);
+      log.success(`▶️  Streaming: ${videoId}`);
 
-      const title = sanitizeFilename(info.title || 'video');
-      log.success(`▶️  Playing: ${info.title}`);
-
-      res.setHeader('Content-Disposition', `inline; filename="${title}.mp4"`);
-      res.redirect(streamUrl);
+      streamFromUpstream(req, res, streamUrl);
       return;
 
     } catch (error) {
