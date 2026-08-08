@@ -3,7 +3,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
-const cors = require('cors');
+// (مش محتاجين مكتبة cors تاني، الهيدرز بقت بتتحط يدوي فوق)
 const NodeCache = require('node-cache');
 const https = require('https');
 require('dotenv').config();
@@ -18,18 +18,19 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 
-// CORS config — API عام (بحث/ترند/فيديو) من غير كوكيز أو تسجيل دخول، فمفيش خطورة
-// من السماح لأي دومين يوصله. لو حابب تقفله على دومين معيّن، حط ALLOWED_ORIGINS
-// في متغيرات البيئة على Railway، وإلا هيفضل مفتوح للكل زي ما هو متوقع لبروكسي عام.
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-  : null;
-
-app.use(cors({
-  origin: allowedOrigins && allowedOrigins.length ? allowedOrigins : true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: false
-}));
+// CORS — بروكسي عام (بحث/ترند/فيديو) من غير كوكيز أو تسجيل دخول، فمفيش أي خطورة
+// من السماح لأي دومين. بنحطه يدوي هنا (مش عبر مكتبة cors) عشان نضمن إن الـ header
+// يوصل دايمًا في كل رد، من غير ما يعتمد على أي متغيّر بيئة ممكن يبوّظ الموضوع.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Vary', 'Origin');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(express.json());
 app.use(express.text({ limit: '10mb' }));
