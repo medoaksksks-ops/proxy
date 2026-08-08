@@ -18,9 +18,15 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 
-// CORS config
+// CORS config — API عام (بحث/ترند/فيديو) من غير كوكيز أو تسجيل دخول، فمفيش خطورة
+// من السماح لأي دومين يوصله. لو حابب تقفله على دومين معيّن، حط ALLOWED_ORIGINS
+// في متغيرات البيئة على Railway، وإلا هيفضل مفتوح للكل زي ما هو متوقع لبروكسي عام.
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+  : null;
+
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+  origin: allowedOrigins && allowedOrigins.length ? allowedOrigins : true,
   methods: ['GET', 'POST', 'OPTIONS'],
   credentials: false
 }));
