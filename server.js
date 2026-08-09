@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '5.4.0';
+const SERVER_VERSION = '5.4.1';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -209,12 +209,22 @@ async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...YTDLP_EXTRA_ARGS, ...finalArgs], {
+    // ملحوظة: شلنا --no-warnings عمدًا — رسائل الـ WARNING من yt-dlp هي اللي
+    // بتوضح السبب الحقيقي (PO Token ناقص، JS solver فشل، إلخ)، وكانت مختفية
+    // تمامًا وده كان بيصعّب التشخيص. أي WARNING هتظهر دلوقتي في اللوج.
+    const { stdout, stderr } = await execFileAsync('yt-dlp', [...YTDLP_EXTRA_ARGS, ...finalArgs], {
       timeout,
       maxBuffer,
       encoding: 'utf-8'
     });
+    if (stderr && stderr.trim()) log.warn(`yt-dlp stderr: ${stderr.trim().slice(0, 500)}`);
     return stdout;
+  } catch (e) {
+    // بنضمن إن أي رسالة خطأ فيها تفاصيل الـ stderr كاملة، مش بس "Command failed"
+    if (e.stderr && !e.message.includes(e.stderr.trim().slice(0, 30))) {
+      e.message = `${e.message}\n${e.stderr}`;
+    }
+    throw e;
   } finally {
     ytdlpLimiter.release();
   }
