@@ -1,5 +1,5 @@
 const express = require('express');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
@@ -7,20 +7,6 @@ const path = require('path');
 const NodeCache = require('node-cache');
 const https = require('https');
 require('dotenv').config();
-
-// ==========================================================================
-// 🔖 srver v5.1.0 "جبارة+" — نسخة محسنة فوق v5.0.0 مع دعم الفيديوهات الشخصية:
-//   • كل جودات الفيديو (144p → 4K) + دمج فيديو/صوت لحظي بـ ffmpeg للجودات
-//     العالية اللي معندهاش progressive stream جاهز.
-//   • هوم فيد محسّن يجيب فيديوهات من حسابك الشخصي بدل البحث العام
-//   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
-//   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
-// ==========================================================================
-const SERVER_VERSION = '5.1.0';
-
-// Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
-// طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 const execFileAsync = promisify(execFile);
 
@@ -31,10 +17,6 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 // Firebase config
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
-
-// 🆕 USER ACCOUNT CONFIG — لجلب فيديوهات من حسابك الشخصي
-const USER_CHANNEL_ID = process.env.USER_CHANNEL_ID || null;  // قنوات المستخدم (قائمة مفصولة بفاصلة)
-const USER_PLAYLIST_ID = process.env.USER_PLAYLIST_ID || null; // playlist واحدة إذا كنت عاوز مثلاً
 
 // CORS — بروكسي عام (بحث/ترند/فيديو) من غير كوكيز أو تسجيل دخول، فمفيش أي خطورة
 // من السماح لأي دومين. بنحطه يدوي هنا (مش عبر مكتبة cors) عشان نضمن إن الـ header
@@ -59,7 +41,6 @@ const infoCache = new NodeCache({ stdTTL: 7200 });          // معلومات ف
 const trendingCache = new NodeCache({ stdTTL: 1200 });      // الرائج: 20 دقيقة
 const streamCache = new NodeCache({ stdTTL: 240 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
 const channelCache = new NodeCache({ stdTTL: 3600 });       // بيانات وفيديوهات القنوات: ساعة
-const homeCache = new NodeCache({ stdTTL: 600 });           // 🆕 كاش خاص بالهوم فيد: 10 دقايق
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
@@ -104,7 +85,7 @@ function fetchCookiesFromFirebase() {
       ? `${FIREBASE_URL}/youtube_cookies.json?auth=${FIREBASE_SECRET}`
       : `${FIREBASE_URL}/youtube_cookies.json`;
 
-    https.get(url, { timeout: 5000, agent: keepAliveAgent }, (res) => {
+    https.get(url, { timeout: 5000 }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -289,45 +270,6 @@ async function getRelatedVideos(videoId, limit = 10) {
 }
 
 /**
- * 🆕 جلب فيديوهات من قناة المستخدم الشخصية
- * ده بديل أفضل من البحث العام — يجيب الفيديوهات اللي انت صادره فعلاً
- */
-async function getUserChannelVideos(channelId, limit = 20) {
-  if (!channelId) return [];
-
-  try {
-    log.info(`👤 Fetching videos from user channel: ${channelId} (limit ${limit})`);
-    const url = `https://www.youtube.com/channel/${channelId}/videos`;
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
-    const items = parseFlatItems(stdout);
-    log.success(`✅ Got ${items.length} videos from user channel`);
-    return items;
-  } catch (e) {
-    log.warn(`Failed to fetch user channel videos: ${e.message}`);
-    return [];
-  }
-}
-
-/**
- * 🆕 جلب فيديوهات من playlist معين (مثل "المفضلة" أو أي playlist شخصية)
- */
-async function getUserPlaylistVideos(playlistId, limit = 20) {
-  if (!playlistId) return [];
-
-  try {
-    log.info(`📋 Fetching videos from user playlist: ${playlistId} (limit ${limit})`);
-    const url = `https://www.youtube.com/playlist?list=${playlistId}`;
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
-    const items = parseFlatItems(stdout);
-    log.success(`✅ Got ${items.length} videos from user playlist`);
-    return items;
-  } catch (e) {
-    log.warn(`Failed to fetch user playlist videos: ${e.message}`);
-    return [];
-  }
-}
-
-/**
  * جلب محتوى عام متنوع للاستخدام كـ fallback لما مفيش تاريخ مشاهدة كفاية
  * عند المستخدم بعد (مستخدم جديد مثلًا). الشخصنة الحقيقية بتحصل في المتصفح
  * نفسه (client-side) عن طريق جلب "فيديوهات متشابهة" لآخر حاجات المستخدم
@@ -355,16 +297,15 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
     ];
     const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
     const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
-    // بنجيب كل الـ queries مع بعض بالتوازي (مش واحد ورا التاني) — بيقلل زمن
-    // الانتظار من مجموع كل الطلبات لأطول طلب واحد بس
-    const settled = await Promise.allSettled(
-      shuffled.map(q => runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']))
-    );
     const pool = [];
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') pool.push(...parseFlatItems(r.value));
-      else log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`);
-    });
+    for (const q of shuffled) {
+      try {
+        const stdout = await runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']);
+        pool.push(...parseFlatItems(stdout));
+      } catch (e) {
+        log.warn(`Recommended fallback query failed "${q}": ${e.message}`);
+      }
+    }
     const seen = new Set();
     items = pool
       .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
@@ -375,181 +316,86 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
 }
 
 /**
- * ==========================================================================
- * الهوم فيد المحسّن (v5.1.0) — بيحاول أولا جلب فيديوهات من حسابك الشخصي
- * ثم يختلطها مع أقسام مختارة من البحث العام (ترند، موسيقى، رياضة، إلخ)
- * للحصول على تجربة أفضل وأكثر تنوعا.
- * ==========================================================================
- */
-const HOME_SECTIONS = [
-  { key: 'personal', title: '👤 فيديوهاتي الشخصية', type: 'channel' },  // 🆕 من القناة الشخصية
-  { key: 'trending', title: '🔥 الرائج الآن', query: null },
-  { key: 'music', title: '🎵 موسيقى', query: 'أغاني عربي جديد 2026' },
-  { key: 'sports', title: '⚽ رياضة', query: 'أهداف وملخصات مباريات' },
-  { key: 'gaming', title: '🎮 ألعاب', query: 'ألعاب فيديو جيمنج' },
-  { key: 'news', title: '📰 أخبار', query: 'أخبار عاجلة اليوم' },
-  { key: 'tech', title: '💻 تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية' },
-  { key: 'entertainment', title: '🎬 ترفيه وأفلام', query: 'أفلام ومسلسلات تريلر' },
-  { key: 'podcasts', title: '🎙️ بودكاست', query: 'بودكاست عربي حوار' },
-  { key: 'comedy', title: '😂 كوميدي', query: 'فيديوهات كوميدي مضحكة' },
-  { key: 'live', title: '🔴 مباشر الآن', query: 'بث مباشر live' }
-];
-
-async function getHomeFeed(region = 'EG', perSection = 12) {
-  log.info(`🏠 Building home feed (region ${region}, ${perSection}/section)`);
-
-  // 🆕 كاش منفصل للهوم فيد مع إمكانية override من query params
-  const cacheKey = `home_${region}_${perSection}`;
-  const cachedHome = homeCache.get(cacheKey);
-  if (cachedHome) {
-    log.info(`📦 Using cached home feed`);
-    return cachedHome;
-  }
-
-  const fetchers = HOME_SECTIONS.map(async (section) => {
-    try {
-      let items;
-      // 🆕 إذا كانت القسم "personal" وفيه channel ID، استخدمه
-      if (section.key === 'personal' && USER_CHANNEL_ID) {
-        log.info(`🎯 Attempting to fetch personal channel content...`);
-        items = await getUserChannelVideos(USER_CHANNEL_ID, perSection);
-      } else if (section.key === 'personal' && USER_PLAYLIST_ID) {
-        log.info(`🎯 Attempting to fetch personal playlist content...`);
-        items = await getUserPlaylistVideos(USER_PLAYLIST_ID, perSection);
-      } else if (section.key === 'trending') {
-        const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-        const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection), url]);
-        items = parseFlatItems(stdout);
-      } else if (section.query) {
-        const stdout = await runYtDlp([`ytsearch${perSection}:${section.query}`, '--dump-json', '--flat-playlist']);
-        items = parseFlatItems(stdout);
-      } else {
-        items = [];
-      }
-      return { key: section.key, title: section.title, items };
-    } catch (e) {
-      log.warn(`Home section "${section.key}" failed: ${e.message}`);
-      return { key: section.key, title: section.title, items: [] };
-    }
-  });
-
-  // كل الأقسام بتتجاب مع بعض في نفس الوقت
-  const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
-
-  // خلطة "mixed" شبه اللي يوتيوب بيعرضها فعلاً في أول سكرول للهوم —
-  // شوية من كل قسم متبعثرين مش مجمّعين ورا بعض
-  const seen = new Set();
-  const mixed = [];
-  const maxLen = Math.max(...sections.map(s => s.items.length), 0);
-  for (let i = 0; i < maxLen; i++) {
-    for (const s of sections) {
-      const v = s.items[i];
-      if (v && !seen.has(v.id)) {
-        seen.add(v.id);
-        mixed.push({ ...v, section: s.key });
-      }
-    }
-  }
-
-  const result = { region, sections, mixed };
-  homeCache.set(cacheKey, result);
-  return result;
-}
-
-/**
  * جلب فيديوهات قناة معيّنة + بيانات القناة نفسها (الاسم، عدد المشتركين، الصورة، الوصف)
  */
-async function getChannelInfo(channelId) {
-  const cacheKey = `channel_info_${channelId}`;
-  const cached = channelCache.get(cacheKey);
-  if (cached) return cached;
-
-  const url = `https://www.youtube.com/channel/${channelId}`;
-  const stdout = await runYtDlp(['--dump-json', url]);
-  const info = JSON.parse(stdout);
-
-  const result = {
-    id: info.id,
-    name: info.uploader || 'Unknown Channel',
-    description: info.description || '',
-    subscriberCount: info.channel_follower_count || 0,
-    thumbnail: info.thumbnails?.length ? info.thumbnails[info.thumbnails.length - 1].url : '',
-  };
-
-  channelCache.set(cacheKey, result);
-  return result;
-}
-
-async function getChannelVideos(channelId, limit = 20, page = 1) {
-  return getPaginatedPool(
-    channelCache,
-    `channel_videos_${channelId}`,
-    async (poolSize) => {
-      const url = `https://www.youtube.com/channel/${channelId}/videos`;
-      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(poolSize), url]);
-      return parseFlatItems(stdout);
+async function getChannelVideos(channelId, limit = 20) {
+  const url = `https://www.youtube.com/channel/${channelId}/videos`;
+  log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
+  const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
+  const data = JSON.parse(stdout);
+  const videos = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
+  return {
+    channel: {
+      id: data.channel_id || channelId,
+      title: data.channel || data.uploader || 'قناة',
+      followers: data.channel_follower_count || null,
+      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
+      description: data.description || ''
     },
-    page,
-    limit
-  );
+    videos
+  };
 }
-
-// ==========================================================================
-// ROUTES
-// ==========================================================================
 
 /**
- * GET /home?region=EG&perSection=12
- * 🆕 محسّن لجلب فيديوهات شخصية أولاً ثم أقسام البحث العام
+ * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن
  */
-app.get('/home', async (req, res) => {
-  try {
-    const region = req.query.region || 'EG';
-    const perSection = parseInt(req.query.perSection, 10) || 12;
+async function getVideoComments(videoId, limit = 50) {
+  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
+  const args = [
+    '--skip-download', '--dump-json', '--write-comments',
+    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},all,all,${limit}`,
+    `https://www.youtube.com/watch?v=${videoId}`
+  ];
+  const stdout = await runYtDlp(args, { timeout: 45000 });
+  const lines = stdout.trim().split('\n').filter(Boolean);
+  const data = JSON.parse(lines[lines.length - 1]);
+  return (data.comments || []).slice(0, limit).map(c => ({
+    id: c.id,
+    author: c.author || 'مستخدم يوتيوب',
+    authorThumbnail: c.author_thumbnail || '',
+    text: c.text || '',
+    likeCount: c.like_count || 0,
+    isReply: !!(c.parent && c.parent !== 'root'),
+    timestamp: c.timestamp ? new Date(c.timestamp * 1000).toISOString() : null
+  }));
+}
 
-    const home = await getHomeFeed(region, perSection);
-    log.success(`✅ Home feed delivered (${home.sections.length} sections, ${home.mixed.length} mixed)`);
-    res.json(home);
-  } catch (error) {
-    log.error(`Error building home feed: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر بناء صفحة الهوم',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
+// ==========================================================================
+// Routes
+// ==========================================================================
 
 /**
  * GET /trending?region=EG&limit=20&page=1
  */
+/**
+ * GET /trending?region=EG&limit=20&page=1
+ * (بيرجّع محتوى شخصي بناءً على الكوكيز لو متاحة، وإلا محتوى عام متنوّع)
+ */
 app.get('/trending', async (req, res) => {
+  const region = (req.query.region || 'EG').toUpperCase();
   try {
-    const region = req.query.region || 'EG';
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const page = parseInt(req.query.page, 10) || 1;
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+    const needed = pageNum * pageSize;
+    const poolSize = Math.min(Math.max(needed, pageSize * 2), 150);
 
-    const cacheKey = `trending_${region}`;
-    let trendingVideos = trendingCache.get(cacheKey);
-
-    if (!trendingVideos) {
-      const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', '100', url]);
-      trendingVideos = parseFlatItems(stdout);
-      trendingCache.set(cacheKey, trendingVideos);
-      log.success(`✅ Trending feed fetched (${trendingVideos.length} videos)`);
-    } else {
-      log.info(`📦 Using cached trending feed`);
+    const cacheKey = `recommended_${region}_${poolSize}`;
+    let cached = trendingCache.get(cacheKey);
+    if (!cached) {
+      cached = await getRecommendedVideos(region, poolSize);
+      trendingCache.set(cacheKey, cached);
     }
 
-    const start = (page - 1) * limit;
-    const results = trendingVideos.slice(start, start + limit);
-    const hasMore = trendingVideos.length > start + limit;
+    const start = (pageNum - 1) * pageSize;
+    const results = cached.items.slice(start, start + pageSize);
+    const hasMore = cached.items.length > start + pageSize;
 
-    res.json({ region, page, limit, results, hasMore });
+    log.success(`✅ Recommended done: ${region} page ${pageNum} (${results.length} نتيجة, personalized=${cached.personalized})`);
+    res.json({ region, page: pageNum, limit: pageSize, count: results.length, hasMore, personalized: cached.personalized, results });
   } catch (error) {
-    log.error(`Error fetching trending: ${error.message}`);
+    log.error(`Error fetching recommended: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر جلب الفيديوهات الرائجة',
+      error: 'تعذّر جلب المحتوى المقترح',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -559,30 +405,27 @@ app.get('/trending', async (req, res) => {
  * GET /search?q=QUERY&limit=20&page=1
  */
 app.get('/search', async (req, res) => {
+  const { q: query } = req.query;
+
+  if (!query || !query.trim()) {
+    return res.status(400).json({
+      error: 'كلمة البحث مطلوبة',
+      example: '/search?q=funny+cats&limit=20&page=1'
+    });
+  }
+
   try {
-    const query = req.query.q || '';
-    if (!query.trim()) {
-      return res.status(400).json({ error: 'query parameter required' });
-    }
-
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const page = parseInt(req.query.page, 10) || 1;
-
-    const pool = await getPaginatedPool(
-      infoCache,
-      `search_${query}`,
+    const { page, limit, results, hasMore } = await getPaginatedPool(
+      infoCache, `search_${query}`,
       (poolSize) => searchVideos(query, poolSize),
-      page,
-      limit,
-      100
+      req.query.page, req.query.limit
     );
-
-    log.success(`✅ Search for "${query}" returned ${pool.results.length} results (page ${page})`);
-    res.json({ query, ...pool });
+    log.success(`✅ Search done: "${query}" page ${page} (${results.length} نتيجة)`);
+    res.json({ query, page, limit, count: results.length, hasMore, results });
   } catch (error) {
     log.error(`Error searching: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر إجراء البحث',
+      error: 'تعذّر تنفيذ البحث',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -592,30 +435,27 @@ app.get('/search', async (req, res) => {
  * GET /related?v=VIDEO_ID&limit=10&page=1
  */
 app.get('/related', async (req, res) => {
+  const { v: videoId } = req.query;
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({
+      error: 'Video ID مطلوب وصحيح (11 حرف)',
+      example: '/related?v=dQw4w9WgXcQ&limit=10&page=1'
+    });
+  }
+
   try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
-
-    const limit = parseInt(req.query.limit, 10) || 10;
-    const page = parseInt(req.query.page, 10) || 1;
-
-    const pool = await getPaginatedPool(
-      infoCache,
-      `related_${videoId}`,
+    const { page, limit, results, hasMore } = await getPaginatedPool(
+      infoCache, `related_${videoId}`,
       (poolSize) => getRelatedVideos(videoId, poolSize),
-      page,
-      limit,
-      50
+      req.query.page, req.query.limit, 60
     );
-
-    log.success(`✅ Related videos for ${videoId} returned ${pool.results.length} results`);
-    res.json({ videoId, ...pool });
+    log.success(`✅ Related done: ${videoId} page ${page} (${results.length} نتيجة)`);
+    res.json({ id: videoId, page, limit, count: results.length, hasMore, results });
   } catch (error) {
-    log.error(`Error fetching related videos: ${error.message}`);
+    log.error(`Error fetching related: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر جلب فيديوهات ذات صلة',
+      error: 'تعذّر جلب الفيديوهات المقترحة',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -625,22 +465,34 @@ app.get('/related', async (req, res) => {
  * GET /channel?id=CHANNEL_ID&limit=20&page=1
  */
 app.get('/channel', async (req, res) => {
+  const channelId = req.query.id;
+
+  if (!channelId) {
+    return res.status(400).json({
+      error: 'channel id مطلوب',
+      example: '/channel?id=UCxxxxxxxx&limit=20&page=1'
+    });
+  }
+
   try {
-    const channelId = req.query.id || '';
-    if (!channelId.trim()) {
-      return res.status(400).json({ error: 'channel id required' });
+    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+    const needed = pageNum * pageSize;
+    const poolSize = Math.min(Math.max(needed, pageSize * 2), 100);
+
+    const dataCacheKey = `channel_${channelId}_${poolSize}`;
+    let data = channelCache.get(dataCacheKey);
+    if (!data) {
+      data = await getChannelVideos(channelId, poolSize);
+      channelCache.set(dataCacheKey, data);
     }
 
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const page = parseInt(req.query.page, 10) || 1;
+    const start = (pageNum - 1) * pageSize;
+    const videos = data.videos.slice(start, start + pageSize);
+    const hasMore = data.videos.length > start + pageSize;
 
-    const [info, videos] = await Promise.all([
-      getChannelInfo(channelId),
-      getChannelVideos(channelId, limit, page)
-    ]);
-
-    log.success(`✅ Channel ${channelId} returned ${videos.results.length} videos`);
-    res.json({ channel: info, videos: videos.results, pagination: { page: videos.page, limit: videos.limit, hasMore: videos.hasMore } });
+    log.success(`✅ Channel done: ${channelId} page ${pageNum} (${videos.length} نتيجة)`);
+    res.json({ channel: data.channel, page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
   } catch (error) {
     log.error(`Error fetching channel: ${error.message}`);
     res.status(500).json({
@@ -651,29 +503,198 @@ app.get('/channel', async (req, res) => {
 });
 
 /**
+ * GET /comments?v=VIDEO_ID&limit=50
+ */
+app.get('/comments', async (req, res) => {
+  const videoId = req.query.v;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+
+  const cacheKey = `comments_${videoId}_${limit}`;
+  const cached = infoCache.get(cacheKey);
+  if (cached) {
+    log.info(`📦 Comments from cache: ${videoId}`);
+    return res.json(cached);
+  }
+
+  try {
+    const comments = await getVideoComments(videoId, limit);
+    const response = { id: videoId, count: comments.length, results: comments };
+    infoCache.set(cacheKey, response, 1800);
+    log.success(`✅ Comments done: ${videoId} (${comments.length} تعليق)`);
+    res.json(response);
+  } catch (error) {
+    log.error(`Error fetching comments: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب التعليقات (ممكن تكون التعليقات مقفولة على الفيديو ده)',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /video?v=VIDEO_ID
+ */
+/**
+ * بيسحب الفيديو من الرابط المباشر (googlevideo) ويبعته للمتصفح بايت بايت،
+ * بدل عمل redirect. ده بيحل مشكلة إن رابط يوتيوب مقفول على IP السيرفر:
+ * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
+ * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
+ */
+function streamFromUpstream(req, res, url, redirectCount = 0) {
+  if (redirectCount > 5) {
+    if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
+    return;
+  }
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  };
+  if (req.headers.range) headers['Range'] = req.headers.range;
+
+  const upstreamReq = https.get(url, { headers, timeout: 20000 }, (upstreamRes) => {
+    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
+    if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+      upstreamRes.resume();
+      return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
+    }
+
+    if (upstreamRes.statusCode >= 400) {
+      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
+      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
+      upstreamRes.resume();
+      return;
+    }
+
+    res.status(upstreamRes.statusCode);
+    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']
+      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
+
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
+  upstreamReq.on('error', (err) => {
+    log.error(`Stream proxy error: ${err.message}`);
+    if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
+  });
+
+  req.on('close', () => upstreamReq.destroy());
+}
+
+app.get('/video', async (req, res) => {
+  const { v: videoId, format = 'best[height<=720]' } = req.query;
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    log.error(`Invalid video ID: ${videoId}`);
+    return res.status(400).json({
+      error: 'Video ID مطلوب وصحيح (11 حرف)',
+      example: '/video?v=dQw4w9WgXcQ&format=best[height<=720]'
+    });
+  }
+
+  const cacheKey = `stream_${videoId}_${format}`;
+  const cachedUrl = streamCache.get(cacheKey);
+
+  if (cachedUrl) {
+    log.info(`📦 Stream from cache: ${videoId}`);
+    return streamFromUpstream(req, res, cachedUrl);
+  }
+
+  let attempts = 0;
+  let lastError = null;
+
+  while (attempts < MAX_RETRIES) {
+    try {
+      log.info(`🎬 Fetching video: ${videoId} (attempt ${attempts + 1}/${MAX_RETRIES})`);
+
+      const streamUrl = await getVideoStreamUrl(videoId, format);
+
+      if (!streamUrl) {
+        throw new Error('Failed to get stream URL');
+      }
+
+      streamCache.set(cacheKey, streamUrl);
+      log.success(`▶️  Streaming: ${videoId}`);
+
+      streamFromUpstream(req, res, streamUrl);
+      return;
+
+    } catch (error) {
+      lastError = error;
+      attempts++;
+      log.warn(`Attempt ${attempts} failed: ${error.message}`);
+
+      if (attempts < MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 1000 * attempts));
+      }
+    }
+  }
+
+  log.error(`Failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+
+  if (lastError?.message.includes('unavailable') || lastError?.message.includes('not available')) {
+    return res.status(404).json({ error: 'الفيديو غير متاح أو محذوف' });
+  } else if (lastError?.message.includes('private')) {
+    return res.status(403).json({ error: 'الفيديو خاص (private)' });
+  } else if (lastError?.message.includes('age')) {
+    return res.status(403).json({ error: 'الفيديو يحتاج verification العمر' });
+  }
+
+  res.status(500).json({
+    error: 'فشل في تشغيل الفيديو',
+    details: NODE_ENV === 'development' ? lastError?.message : undefined
+  });
+});
+
+/**
  * GET /info?v=VIDEO_ID
  */
 app.get('/info', async (req, res) => {
+  const videoId = req.query.v;
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+
+  const cached = infoCache.get(`info_${videoId}`);
+  if (cached) {
+    log.info(`📋 Info from cache: ${videoId}`);
+    return res.json(cached);
+  }
+
   try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
+    log.info(`📥 Fetching info: ${videoId}`);
+    const info = await getVideoInfo(videoId);
 
-    const cacheKey = `info_${videoId}`;
-    let info = infoCache.get(cacheKey);
+    const result = {
+      id: videoId,
+      title: info.title,
+      duration: info.duration || 0,
+      author: info.uploader || info.channel || 'Unknown',
+      channelId: info.channel_id || '',
+      description: info.description || '',
+      thumbnail: info.thumbnail || '',
+      publishedAt: info.upload_date ? new Date(
+        `${info.upload_date.slice(0,4)}-${info.upload_date.slice(4,6)}-${info.upload_date.slice(6,8)}`
+      ).toISOString() : null,
+      viewCount: info.view_count || 0,
+      likeCount: info.like_count || 0,
+      ageRestricted: info.age_limit ? info.age_limit > 0 : false,
+      isLive: info.is_live || false,
+      formats: info.formats?.length || 0
+    };
 
-    if (!info) {
-      info = await getVideoInfo(videoId);
-      infoCache.set(cacheKey, info);
-      log.success(`✅ Video info: ${videoId} (${info.title})`);
-    } else {
-      log.info(`📦 Using cached video info for ${videoId}`);
-    }
+    infoCache.set(`info_${videoId}`, result);
+    log.success(`✅ Got info: ${info.title}`);
 
-    res.json(info);
+    res.json(result);
+
   } catch (error) {
-    log.error(`Error fetching video info: ${error.message}`);
+    log.error(`Error fetching info: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب معلومات الفيديو',
       details: NODE_ENV === 'development' ? error.message : undefined
@@ -685,174 +706,39 @@ app.get('/info', async (req, res) => {
  * GET /formats?v=VIDEO_ID
  */
 app.get('/formats', async (req, res) => {
+  const videoId = req.query.v;
+
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+
   try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
+    log.info(`📊 Fetching formats: ${videoId}`);
+    const info = await getVideoInfo(videoId);
 
-    const cacheKey = `formats_${videoId}`;
-    let info = infoCache.get(cacheKey);
+    const formats = (info.formats || [])
+      .filter(f => f.vcodec !== 'none' || f.acodec !== 'none')
+      .map(f => ({
+        formatId: f.format_id,
+        format: f.format,
+        videoCodec: f.vcodec,
+        audioCodec: f.acodec,
+        height: f.height,
+        width: f.width,
+        fps: f.fps,
+        fileSize: f.filesize || 'unknown'
+      }))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
 
-    if (!info) {
-      info = await getVideoInfo(videoId);
-      infoCache.set(cacheKey, info);
-    }
+    res.json({
+      id: videoId,
+      title: info.title,
+      formats: formats.slice(0, 20)
+    });
 
-    const formats = (info.formats || []).map(f => ({
-      format_id: f.format_id,
-      ext: f.ext,
-      height: f.height,
-      width: f.width,
-      fps: f.fps,
-      filesize: f.filesize,
-    }));
-
-    log.success(`✅ Formats for ${videoId}: ${formats.length} formats`);
-    res.json({ videoId, formats });
   } catch (error) {
     log.error(`Error fetching formats: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب صيغ الفيديو',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /comments?v=VIDEO_ID&limit=50
- */
-app.get('/comments', async (req, res) => {
-  try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
-
-    const limit = parseInt(req.query.limit, 10) || 50;
-
-    const cacheKey = `comments_${videoId}`;
-    let comments = infoCache.get(cacheKey);
-
-    if (!comments) {
-      const info = await getVideoInfo(videoId);
-      comments = (info.comments || []).slice(0, limit).map(c => ({
-        author: c.author,
-        text: c.text,
-        timestamp: c.timestamp,
-      }));
-      infoCache.set(cacheKey, comments);
-      log.success(`✅ Comments for ${videoId}: ${comments.length} comments`);
-    }
-
-    res.json({ videoId, limit, comments });
-  } catch (error) {
-    log.error(`Error fetching comments: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب التعليقات',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /video?v=VIDEO_ID&quality=1080&format=...
- * 🆕 محسّن مع دعم جودات عالية وصوت فقط
- */
-app.get('/video', async (req, res) => {
-  try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
-
-    const quality = req.query.quality || 'best';
-    const format = req.query.format || null;
-
-    // تحديد صيغة ffmpeg المناسبة حسب الجودة المطلوبة
-    let selectedFormat = format;
-    if (!selectedFormat) {
-      if (quality === 'audio') {
-        selectedFormat = 'bestaudio';
-      } else if (quality.match(/^\d+$/)) {
-        const height = parseInt(quality, 10);
-        selectedFormat = `best[height<=${height}]`;
-      } else {
-        selectedFormat = quality;
-      }
-    }
-
-    log.info(`🎬 Streaming ${videoId} with quality=${quality}, format=${selectedFormat}`);
-
-    const cacheKey = `stream_${videoId}_${selectedFormat}`;
-    let streamUrl = streamCache.get(cacheKey);
-
-    if (!streamUrl) {
-      streamUrl = await getVideoStreamUrl(videoId, selectedFormat);
-      streamCache.set(cacheKey, streamUrl);
-    } else {
-      log.info(`📦 Using cached stream URL`);
-    }
-
-    res.json({ videoId, quality, streamUrl });
-  } catch (error) {
-    log.error(`Error fetching stream: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر الحصول على رابط البث',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /video/qualities?v=VIDEO_ID
- * 🆕 جديد: تحديد كل الجودات المتاحة للفيديو
- */
-const PROGRESSIVE_MAX_HEIGHT = 720;
-const STANDARD_HEIGHTS = [144, 240, 360, 480, 720, 1080, 1440, 2160];
-
-app.get('/video/qualities', async (req, res) => {
-  try {
-    const videoId = req.query.v || '';
-    if (!isValidVideoId(videoId)) {
-      return res.status(400).json({ error: 'invalid video ID' });
-    }
-
-    const cacheKey = `qualities_${videoId}`;
-    const cached = infoCache.get(cacheKey);
-    if (cached) {
-      return res.json(cached);
-    }
-
-    const info = await getVideoInfo(videoId);
-    const formats = info.formats || [];
-    const heights = [...new Set(
-      formats
-        .map(f => f.height)
-        .filter(h => h && h > 0)
-    )].sort((a, b) => b - a);
-
-    const available = STANDARD_HEIGHTS.filter(h => [...heights].some(fh => Math.abs(fh - h) <= 20) || h <= Math.max(...heights, 0));
-    const uniqueAvailable = [...new Set(available)].filter(h => h <= Math.max(...heights, 0)).sort((a, b) => b - a);
-
-    const qualities = uniqueAvailable.map(h => ({
-      label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
-      quality: String(h),
-      type: h <= PROGRESSIVE_MAX_HEIGHT ? 'progressive' : 'merged (ffmpeg)',
-      url: `/video?v=${videoId}&quality=${h}`
-    }));
-    qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
-
-    const result = { id: videoId, title: info.title, qualities };
-    infoCache.set(cacheKey, result);
-    log.success(`✅ Qualities done: ${videoId} (${qualities.length} جودة)`);
-    res.json(result);
-  } catch (error) {
-    log.error(`Error fetching qualities: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب الجودات المتاحة',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
+    res.status(500).json({ error: 'تعذّر جلب الـ formats' });
   }
 });
 
@@ -862,14 +748,10 @@ app.get('/video/qualities', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'operational',
-    version: SERVER_VERSION,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
-    ffmpegReady: (() => { try { require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' }); return true; } catch { return false; } })(),
     cookiesReady,
-    userChannelConfigured: !!USER_CHANNEL_ID,
-    userPlaylistConfigured: !!USER_PLAYLIST_ID,
     concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
   });
 });
@@ -966,8 +848,8 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v5.1.0 "جبارة+" - YouTube Proxy (بدون اعتماد على YouTube Data API)',
-    version: SERVER_VERSION,
+    name: '🎬 srver v4.0 - YouTube Proxy (بدون اعتماد على YouTube Data API)',
+    version: '4.0.0',
     environment: NODE_ENV,
     cookies: {
       source: '🔥 Firebase Realtime Database',
@@ -975,17 +857,10 @@ app.get('/', (req, res) => {
       refresh: 'كل 5 دقايق في الخلفية',
       ready: cookiesReady
     },
-    personalContent: {
-      userChannelId: USER_CHANNEL_ID || '❌ غير مضبوط',
-      userPlaylistId: USER_PLAYLIST_ID || '❌ غير مضبوط',
-      note: '🆕 عيّن USER_CHANNEL_ID أو USER_PLAYLIST_ID في .env عشان الفيديوهات الشخصية تظهر في /home'
-    },
     concurrency: { max: YTDLP_CONCURRENCY },
     endpoints: {
-      home: '/home?region=EG&perSection=12',
       trending: '/trending?region=EG&limit=20&page=1',
-      video: '/video?v=VIDEO_ID&quality=1080 (أو &format=best[height<=720] القديم لسه شغال)',
-      videoQualities: '/video/qualities?v=VIDEO_ID',
+      video: '/video?v=VIDEO_ID&format=best[height<=720]',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
       search: '/search?q=QUERY&limit=20&page=1',
@@ -995,17 +870,15 @@ app.get('/', (req, res) => {
       health: '/health',
       cookiesStatus: '/api/cookies-status'
     },
-    videoQualityValues: ['144', '240', '360', '480', '720', '1080', '1440', '2160', 'audio'],
     pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
     examples: {
-      'Home feed (أقسام زي يوتيوب + فيديوهاتك)': '/home?region=EG',
       'Trending page 1': '/trending?region=EG&page=1',
-      'Play video (جودة تلقائية)': '/video?v=dQw4w9WgXcQ',
-      'Play video 1080p': '/video?v=dQw4w9WgXcQ&quality=1080',
-      'Audio only': '/video?v=dQw4w9WgXcQ&quality=audio',
+      'Trending page 2 (سكرول لاحق)': '/trending?region=EG&page=2',
+      'Play video': '/video?v=dQw4w9WgXcQ',
       'Search videos': '/search?q=funny+cats&page=1',
       'Related videos': '/related?v=dQw4w9WgXcQ',
-      'Channel videos': '/channel?id=YOUR_CHANNEL_ID',
+      'Channel videos': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
+      'Video comments': '/comments?v=dQw4w9WgXcQ',
       'Check cookies': '/api/cookies-status'
     }
   });
@@ -1030,20 +903,16 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
-║  🎬 srver v${SERVER_VERSION} "جبارة+" شغّال 🔥      ║
+║  🎬 srver v3.0 - YouTube Proxy شغّال 🔥    ║
 ║  ═════════════════════════════════════     ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
 ║  yt-dlp: ${ytdlpStatus}  Firebase Cookies (bg refresh)  ║
 ║  Concurrency: ${String(YTDLP_CONCURRENCY).padEnd(24, ' ')}║
-║  User Channel: ${(USER_CHANNEL_ID ? '✅' : '❌').padEnd(27, ' ')}║
 ║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
   log.success(`✅ Server ready - no YouTube Data API dependency`);
-  log.info(`🆕 v5.1.0: تحسينات في /home (فيديوهاتك الشخصية) + cache محسّن`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
-  if (USER_CHANNEL_ID) log.success(`👤 User Channel ID: ${USER_CHANNEL_ID}`);
-  if (USER_PLAYLIST_ID) log.success(`📋 User Playlist ID: ${USER_PLAYLIST_ID}`);
 });
 
 // Graceful shutdown
