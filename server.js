@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '5.2.0';
+const SERVER_VERSION = '5.3.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -136,6 +136,34 @@ async function refreshCookies() {
 }
 refreshCookies();
 setInterval(refreshCookies, 5 * 60 * 1000);
+
+/**
+ * ==========================================================================
+ * تحديث yt-dlp تلقائيًا — يوتيوب بيغيّر طريقة تشفير الفيديوهات باستمرار،
+ * ولو نسخة yt-dlp قديمة بتوقف تقرأ الفورمات فجأة ("Requested format is
+ * not available") لحد ما حد يحدّثها. بدل ما نستنى deploy جديد (اللي ممكن
+ * برضو يستخدم نسخة قديمة متخزّنة في كاش الداكر)، بنحدّثها من جوّه السيرفر
+ * نفسه أول ما يشتغل، وبعدين كل 12 ساعة تلقائيًا.
+ * ==========================================================================
+ */
+async function updateYtDlp() {
+  try {
+    log.info('🔄 جاري التأكد من تحديث yt-dlp...');
+    const { stdout } = await execFileAsync('pip3', [
+      'install', '--break-system-packages', '--no-cache-dir', '--upgrade', 'yt-dlp'
+    ], { timeout: 120000 });
+    const alreadyLatest = /already up-to-date|already satisfied/i.test(stdout);
+    if (alreadyLatest) {
+      log.info('✅ yt-dlp أصلًا أحدث نسخة');
+    } else {
+      log.success('✅ تم تحديث yt-dlp لأحدث نسخة');
+    }
+  } catch (e) {
+    log.error(`فشل تحديث yt-dlp: ${e.message}`);
+  }
+}
+updateYtDlp();
+setInterval(updateYtDlp, 12 * 60 * 60 * 1000);
 
 // Check if yt-dlp is installed
 function checkYtDlp() {
@@ -1079,6 +1107,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'operational',
     version: SERVER_VERSION,
+    ytdlpVersion: (() => { try { return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim(); } catch { return 'unknown'; } })(),
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
