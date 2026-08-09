@@ -42,6 +42,89 @@ const trendingCache = new NodeCache({ stdTTL: 1200 });      // الرائج: 20 
 const streamCache = new NodeCache({ stdTTL: 240 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
 const channelCache = new NodeCache({ stdTTL: 3600 });       // بيانات وفيديوهات القنوات: ساعة
 
+// ==========================================================================
+// تحميل + دمج الجودات العالية — يوتيوب بيفصل الفيديو عن الصوت في ملفين
+// منفصلين (DASH) لأي جودة فوق 720p تقريبًا. مفيش رابط واحد يعبّر عنهم مع
+// بعض، فلازم نحمّلهم فعليًا وندمجهم بـ ffmpeg (يوتيوب-دي‌إل‌بي بيعمل ده لوحده
+// وقت التحميل، بس مش وقت --get-url). الملفات بتتخزّن مؤقتًا في /tmp وبتتنضف
+// كل شوية عشان مساحة القرص المحدودة على Railway.
+// ==========================================================================
+const TEMP_DIR = '/tmp/ytvideos';
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+const TEMP_MAX_AGE_MS = 40 * 60 * 1000; // 40 دقيقة
+
+function cleanupTempFiles() {
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(TEMP_DIR)) {
+      const fp = path.join(TEMP_DIR, name);
+      try {
+        const stat = fs.statSync(fp);
+        if (now - stat.mtimeMs > TEMP_MAX_AGE_MS) fs.unlinkSync(fp);
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+setInterval(cleanupTempFiles, 10 * 60 * 1000);
+
+function safeTempName(videoId, format) {
+  const hash = require('crypto').createHash('md5').update(format).digest('hex').slice(0, 10);
+  return `${videoId}_${hash}.mp4`;
+}
+
+const downloadLocks = new Map(); // بيمنع تحميل نفس الفيديو/الجودة أكتر من مرة في نفس الوقت
+async function ensureMergedDownload(videoId, format) {
+  const filename = safeTempName(videoId, format);
+  const filepath = path.join(TEMP_DIR, filename);
+  if (fs.existsSync(filepath)) return filepath;
+
+  if (downloadLocks.has(filename)) return downloadLocks.get(filename);
+
+  const job = (async () => {
+    const tmpPath = filepath + '.part';
+    await ytdlpLimiter.acquire();
+    try {
+      const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH] : [];
+      finalArgs.push('--no-warnings', '-f', format, '--merge-output-format', 'mp4', '-o', tmpPath, `https://www.youtube.com/watch?v=${videoId}`);
+      await execFileAsync('yt-dlp', finalArgs, { timeout: 240000, maxBuffer: 1024 * 1024 * 20 });
+      fs.renameSync(tmpPath, filepath);
+      return filepath;
+    } finally {
+      ytdlpLimiter.release();
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    }
+  })();
+
+  downloadLocks.set(filename, job);
+  try {
+    return await job;
+  } finally {
+    downloadLocks.delete(filename);
+  }
+}
+
+function serveLocalFile(req, res, filepath) {
+  const stat = fs.statSync(filepath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  if (range) {
+    const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+    const chunkSize = (end - start) + 1;
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Content-Length': chunkSize
+    });
+    fs.createReadStream(filepath, { start, end }).pipe(res);
+  } else {
+    res.setHeader('Content-Length', fileSize);
+    fs.createReadStream(filepath).pipe(res);
+  }
+}
+
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
 
@@ -226,6 +309,84 @@ async function getVideoInfo(videoId) {
 }
 
 /**
+ * جلب كل الجودات الحقيقية المتاحة لفيديو معيّن، وتحديد لكل واحدة منها
+ * "طريقة تشغيل" مناسبة:
+ * - لو فيه فورمات "progressive" (فيديو+صوت في ملف واحد) عند الطول ده، بنستخدمه
+ *   لأنه بيدّي رابط تشغيل مباشر وسريع من غير أي تحميل من عندنا.
+ * - لو الطول ده متاح بس كـ DASH (فيديو لوحده + صوت لوحده، وده حال أغلب
+ *   الجودات فوق 720p)، بنطلب دمج (video+audio) وده هيحتاج تحميل ودمج فعلي
+ *   من سيرفرنا (أبطأ شوية في أول تشغيل، لكن بيدّي الجودة الحقيقية بصوت).
+ */
+async function getVideoQualities(videoId) {
+  const info = await getVideoInfo(videoId);
+  const formats = info.formats || [];
+
+  // أفضل تراك صوت منفصل متاح (audio-only)، هنستخدمه مع أي فيديو DASH منفصل
+  let bestAudio = null;
+  formats.forEach(f => {
+    if (f.vcodec === 'none' && f.acodec && f.acodec !== 'none') {
+      if (!bestAudio || (f.abr || 0) > bestAudio.abr) {
+        bestAudio = { format_id: f.format_id, abr: f.abr || 0 };
+      }
+    }
+  });
+
+  /* لكل طول (height) بنحدد format_id صريح ومحدد — مش وصف مرن زي
+     bestvideo[height<=H] لأن ده كان بيفشل بصمت لو مفيش نسخة DASH عند
+     الطول ده بالظبط، ويرجع لنفس الفيديو لكل الجودات (وده سبب الباج
+     اللي كل الجودات كانت طالعة زي بعض). دلوقتي كل جودة بترتبط بملف
+     حقيقي محدد بالاسم، فمينفعش يحصل لبس. */
+  const heightMap = new Map();
+  formats.forEach(f => {
+    if (!f.height || !f.vcodec || f.vcodec === 'none') return;
+    const isProgressive = !!(f.acodec && f.acodec !== 'none');
+    const entry = heightMap.get(f.height) || {};
+    if (isProgressive) {
+      if (!entry.progressiveFormatId || (f.tbr || 0) > (entry.progTbr || 0)) {
+        entry.progressiveFormatId = f.format_id;
+        entry.progTbr = f.tbr || 0;
+      }
+    } else {
+      if (!entry.dashVideoFormatId || (f.tbr || 0) > (entry.dashTbr || 0)) {
+        entry.dashVideoFormatId = f.format_id;
+        entry.dashTbr = f.tbr || 0;
+      }
+    }
+    heightMap.set(f.height, entry);
+  });
+
+  const heights = [...heightMap.keys()].sort((a, b) => b - a);
+  let qualities = heights.map(h => {
+    const entry = heightMap.get(h);
+    if (entry.progressiveFormatId) {
+      return { height: h, label: `${h}p`, format: entry.progressiveFormatId, needsMerge: false };
+    }
+    if (entry.dashVideoFormatId && bestAudio) {
+      return { height: h, label: `${h}p`, format: `${entry.dashVideoFormatId}+${bestAudio.format_id}`, needsMerge: true };
+    }
+    if (entry.dashVideoFormatId) {
+      // احتياطي نادر: مفيش صوت منفصل خالص، هنعرض الفيديو من غير صوت بدل ما نلغي الجودة دي
+      return { height: h, label: `${h}p`, format: entry.dashVideoFormatId, needsMerge: false };
+    }
+    return null;
+  }).filter(Boolean);
+
+  // أمان إضافي: لو صدفة جودتين مختلفتين رجعوا بنفس رقم الفورمات بالظبط
+  // (يعني هيشغّلوا نفس الملف فعليًا)، بنسيب واحد بس عشان القايمة متوعدش
+  // بجودات مختلفة وهي في الحقيقة نفس الملف.
+  const seenFormats = new Set();
+  qualities = qualities.filter(q => {
+    if (seenFormats.has(q.format)) return false;
+    seenFormats.add(q.format);
+    return true;
+  });
+
+  qualities.unshift({ height: 0, label: 'تلقائي', format: 'best', needsMerge: false });
+
+  return { id: videoId, title: info.title, qualities };
+}
+
+/**
  * جلب رابط الفيديو المباشر
  */
 async function getVideoStreamUrl(videoId, format = 'best') {
@@ -236,7 +397,33 @@ async function getVideoStreamUrl(videoId, format = 'best') {
 }
 
 /**
+ * فلترة محتوى "المقترح" من السياسة/الأخبار الحساسة/المحتوى الرخيص — الموضوع
+ * ده مش بيتطبق على نتايج البحث الصريح (لو المستخدم دوّر بنفسه على حاجة
+ * سياسية مثلًا نديله ياها)، بس بيتطبق على أي حاجة بتترشّح تلقائيًا
+ * (المقترح + المتشابهة) عشان الفيد يفضل نضيف.
+ */
+const BLOCKED_KEYWORDS = [
+  // سياسة وأخبار
+  'سياس', 'الرئيس', 'الرئاسة', 'السيسي', 'الانتخابات', 'البرلمان', 'مجلس النواب',
+  'الحكومة', 'الوزراء', 'وزير', 'حزب', 'المعارضة', 'دبلوماس', 'قمة', 'اجتماع الأمن',
+  'الأمم المتحدة', 'حماس', 'إسرائيل', 'اسرائيل', 'غزة', 'الاحتلال', 'الصراع', 'حرب',
+  'قصف', 'عسكري', 'الجيش', 'انقلاب', 'مظاهر', 'احتجاج', 'اعتصام', 'إرهاب', 'ارهاب',
+  // محتوى صادم / منخفض الجودة
+  'صادم', 'فضيحة', 'مسربة', 'مسرب', 'جريمة', 'مقتل', 'قتل', 'اغتصاب', 'انتحار',
+  'حادث مروع', 'عنف', 'دماء', 'جثة', 'مخدرات', 'إعدام', 'تعذيب'
+];
+function isCleanTitle(title){
+  if(!title) return true;
+  const t = title.toLowerCase();
+  return !BLOCKED_KEYWORDS.some(k => t.includes(k));
+}
+function filterClean(items){
+  return items.filter(v => isCleanTitle(v.title));
+}
+
+/**
  * البحث عن فيديوهات على يوتيوب باستخدام yt-dlp (بدون أي اعتماد على YouTube Data API)
+
  */
 async function searchVideos(query, limit = 10) {
   log.info(`🔎 Searching: "${query}" (limit ${limit})`);
@@ -254,7 +441,7 @@ async function getRelatedVideos(videoId, limit = 10) {
 
   let items = [];
   try {
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--yes-playlist', '--playlist-end', String(limit + 1), url]);
+    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--yes-playlist', '--playlist-end', String((limit * 2) + 1), url]);
     items = parseFlatItems(stdout, videoId);
   } catch (e) {
     log.warn(`Flat related fetch failed: ${e.message}`);
@@ -262,11 +449,11 @@ async function getRelatedVideos(videoId, limit = 10) {
 
   if (items.length === 0) {
     log.warn('⚠️  Flat related empty, retrying with full extraction...');
-    const stdout = await runYtDlp(['--dump-json', '--yes-playlist', '--playlist-end', String(limit + 1), '--skip-download', url]);
+    const stdout = await runYtDlp(['--dump-json', '--yes-playlist', '--playlist-end', String((limit * 2) + 1), '--skip-download', url]);
     items = parseFlatItems(stdout, videoId);
   }
 
-  return items.slice(0, limit);
+  return filterClean(items).slice(0, limit);
 }
 
 /**
@@ -277,23 +464,66 @@ async function getRelatedVideos(videoId, limit = 10) {
  * الشخصية (Home feed) مش endpoint مدعوم بشكل موثوق في yt-dlp، وتبويب
  * "الرائج" (Trending) نفسه ثابت وواحد لكل الناس بغض النظر عن الكوكيز.
  */
+/**
+ * قنوات/صنّاع محتوى مفضّلين — بيتاخدوا بالأولوية في المقترح قبل أي حاجة
+ * عامة. ضيف/شيل أسماء زي ما تحب هنا.
+ */
+const FAVORITE_CHANNELS = [
+  'كامل العربي', 'اوشا', 'صلاح القصة وما فيها', 'سامح سند', 'بدر العلوي', 'ابو الصادق',
+  'محمد ايمن الجوهري', 'محمد صلاح مستر انجليزي', 'محمد عبدالمعبود', 'رضا الفاروق',
+  'انجلشاوي عبقري لغة', 'خالد صقر', 'توست كوتش الغلابة'
+];
+
+async function getFavoriteChannelsContent(limit = 20) {
+  const picks = [...FAVORITE_CHANNELS].sort(() => Math.random() - 0.5).slice(0, 7);
+  const perChannel = Math.max(3, Math.ceil(limit / picks.length));
+  const pool = [];
+  for (const name of picks) {
+    try {
+      const stdout = await runYtDlp([`ytsearch${perChannel}:${name}`, '--dump-json', '--flat-playlist']);
+      pool.push(...filterClean(parseFlatItems(stdout)));
+    } catch (e) {
+      log.warn(`Favorite channel query failed "${name}": ${e.message}`);
+    }
+  }
+  const seen = new Set();
+  return pool
+    .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
+    .sort(() => Math.random() - 0.5);
+}
+
 async function getRecommendedVideos(region = 'EG', limit = 20) {
-  let items = [];
+  // بنجيب من 3 مصادر مرة واحدة كل مرة (مش فولباك متسلسل) عشان يبقى فيه
+  // تنويع حقيقي دايمًا: القنوات المفضّلة + الرائج العام + مواضيع متنوعة.
+  const favCount = Math.max(3, Math.round(limit * 0.3)); // القنوات المفضّلة بحد أقصى ~30% بس
+
+  let favItems = [];
+  let trendItems = [];
+
+  try {
+    favItems = await getFavoriteChannelsContent(favCount);
+  } catch (e) {
+    log.warn(`Favorite channels fetch failed: ${e.message}`);
+  }
 
   try {
     const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
-    items = parseFlatItems(stdout);
+    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit * 2), url]);
+    trendItems = filterClean(parseFlatItems(stdout));
   } catch (e) {
     log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
   }
 
-  if (items.length < 5) {
+  let items = [...favItems, ...trendItems];
+
+  // لو المصدرين مجيبوش كفاية، نضيف مواضيع عامة متنوعة (آخر حل)
+  if (items.length < limit) {
+    // تعمّدنا نشيل مواضيع الأخبار والسياسة من هنا خالص
     const topicPool = [
-      'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
+      'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
       'بودكاست عربي', 'أفلام كوميدي مصرية', 'مسلسلات رمضان', 'تكنولوجيا وتقنية',
       'وصفات طبخ سريعة', 'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة',
-      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس'
+      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس', 'فنون وإبداع'
     ];
     const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
     const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
@@ -301,16 +531,18 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
     for (const q of shuffled) {
       try {
         const stdout = await runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']);
-        pool.push(...parseFlatItems(stdout));
+        pool.push(...filterClean(parseFlatItems(stdout)));
       } catch (e) {
         log.warn(`Recommended fallback query failed "${q}": ${e.message}`);
       }
     }
-    const seen = new Set();
-    items = pool
-      .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
-      .sort(() => Math.random() - 0.5);
+    items.push(...pool);
   }
+
+  const seen = new Set();
+  items = items
+    .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
+    .sort(() => Math.random() - 0.5);
 
   return { items: items.slice(0, limit), personalized: false };
 }
@@ -585,6 +817,34 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   req.on('close', () => upstreamReq.destroy());
 }
 
+/**
+ * GET /qualities?v=VIDEO_ID
+ */
+app.get('/qualities', async (req, res) => {
+  const videoId = req.query.v;
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+  const cacheKey = `qualities_${videoId}`;
+  const cached = infoCache.get(cacheKey);
+  if (cached) {
+    log.info(`📦 Qualities from cache: ${videoId}`);
+    return res.json(cached);
+  }
+  try {
+    const data = await getVideoQualities(videoId);
+    infoCache.set(cacheKey, data);
+    log.success(`✅ Qualities done: ${videoId} (${data.qualities.length} جودة)`);
+    res.json(data);
+  } catch (error) {
+    log.error(`Error fetching qualities: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الجودات المتاحة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 app.get('/video', async (req, res) => {
   const { v: videoId, format = 'best[height<=720]' } = req.query;
 
@@ -594,6 +854,25 @@ app.get('/video', async (req, res) => {
       error: 'Video ID مطلوب وصحيح (11 حرف)',
       example: '/video?v=dQw4w9WgXcQ&format=best[height<=720]'
     });
+  }
+
+  // فورمات فيها "+" معناها فيديو وصوت منفصلين (DASH) ولازم دمج فعلي —
+  // مش ممكن نعمل get-url ونعديها زي ما هي، لازم نحمّل وندمج بـ ffmpeg
+  const needsMerge = format.includes('+');
+
+  if (needsMerge) {
+    try {
+      log.info(`🎬 Merged download: ${videoId} (${format})`);
+      const filepath = await ensureMergedDownload(videoId, format);
+      log.success(`▶️  Serving merged file: ${videoId}`);
+      return serveLocalFile(req, res, filepath);
+    } catch (error) {
+      log.error(`Merge download failed: ${error.message}`);
+      return res.status(500).json({
+        error: 'تعذّر تحميل ودمج الجودة دي، جرب جودة تانية',
+        details: NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
   }
 
   const cacheKey = `stream_${videoId}_${format}`;
@@ -866,6 +1145,7 @@ app.get('/', (req, res) => {
       search: '/search?q=QUERY&limit=20&page=1',
       related: '/related?v=VIDEO_ID&limit=10&page=1',
       channel: '/channel?id=CHANNEL_ID&limit=20&page=1',
+      qualities: '/qualities?v=VIDEO_ID',
       comments: '/comments?v=VIDEO_ID&limit=50',
       health: '/health',
       cookiesStatus: '/api/cookies-status'
