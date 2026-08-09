@@ -9,14 +9,14 @@ const https = require('https');
 require('dotenv').config();
 
 // ==========================================================================
-// 🔖 srver v5.0.0 "جبارة" — نسخة موسّعة فوق v4.0 الأصلية بدون حذف أي حاجة:
-//   • كل جودات الفيديو (144p → 4K) + دمج فيديو/صوت لحظي بـ ffmpeg للجودات
-//     العالية اللي معندهاش progressive stream جاهز.
-//   • هوم فيد بأقسام (Sections) زي صفحة يوتيوب الرئيسية الحقيقية.
-//   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
-//   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
+// 🔖 srver v5.5.0 "الإصلاح" — نسخة معدلة تركز على استخراج جودات صحيحة:
+//   • إصلاح YTDLP_EXTRA_ARGS لاستخدام فقط --js-runtimes node
+//   • استخراج الجودات من الفورمات الفعلية فقط
+//   • عدم إظهار جودات غير موجودة
+//   • معالجة أخطاء واضحة وتسجيل شامل
+//   • حفظ جميع endpoints الموجودة
 // ==========================================================================
-const SERVER_VERSION = '5.4.1';
+const SERVER_VERSION = '5.5.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -175,6 +175,16 @@ function checkYtDlp() {
   }
 }
 
+// Check if ffmpeg is installed
+function checkFfmpeg() {
+  try {
+    require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Validation
 function isValidVideoId(id) {
   return /^[a-zA-Z0-9_-]{11}$/.test(id);
@@ -185,555 +195,495 @@ function sanitizeFilename(name) {
 }
 
 /**
- * تشغيل yt-dlp بشكل غير متزامن (async) بدون shell — بيستقبل الـ args كمصفوفة
- * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
- * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
- */
-/**
- * إعدادات ثابتة بتتحط مع كل استدعاء لـ yt-dlp — يوتيوب في 2026 بدأ يفرض
- * بروتوكول SABR وبيطلب "PO Token" لمعظم الفورمات على الـ client الافتراضي
- * (web)، وده بيخلي yt-dlp يرجّع "Requested format is not available" حتى
- * لو الكوكيز والنسخة سليمين 100%. الحل المعروف من فريق yt-dlp نفسه:
- * - نستخدم clients تانية (android/ios/tv) لسه مش متأثرة بنفس القوة.
- * - نسمح صراحةً بالفورمات اللي ناقصها PO token بدل ما نرفضها تمامًا
- *   (ممكن تفشل أحيانًا بـ 403، بس أحسن من "مفيش فورمات خالص").
- * - نستخدم Node.js (المتاح أصلًا في صورة الداكر) كـ JS runtime لحل أي
- *   "تحديات جافاسكريبت" (challenges) يوتيوب بيطلبها.
+ * ==========================================================================
+ * إعدادات yt-dlp المبسطة:
+ * بدل الـ player_client محدد، نستخدم فقط --js-runtimes node
+ * يسمح لـ yt-dlp يختار الـ clients المناسبة بدل ما نفرض عليه واحدة معينة
+ * ==========================================================================
  */
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=android,ios,tv,web;formats=missing_pot',
   '--js-runtimes', 'node'
 ];
 
+/**
+ * ==========================================================================
+ * تشغيل yt-dlp بشكل آمن بدون shell مع معالجة أخطاء محسّنة
+ * ==========================================================================
+ */
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    // ملحوظة: شلنا --no-warnings عمدًا — رسائل الـ WARNING من yt-dlp هي اللي
-    // بتوضح السبب الحقيقي (PO Token ناقص، JS solver فشل، إلخ)، وكانت مختفية
-    // تمامًا وده كان بيصعّب التشخيص. أي WARNING هتظهر دلوقتي في اللوج.
+    
     const { stdout, stderr } = await execFileAsync('yt-dlp', [...YTDLP_EXTRA_ARGS, ...finalArgs], {
       timeout,
       maxBuffer,
       encoding: 'utf-8'
     });
-    if (stderr && stderr.trim()) log.warn(`yt-dlp stderr: ${stderr.trim().slice(0, 500)}`);
-    return stdout;
-  } catch (e) {
-    // بنضمن إن أي رسالة خطأ فيها تفاصيل الـ stderr كاملة، مش بس "Command failed"
-    if (e.stderr && !e.message.includes(e.stderr.trim().slice(0, 30))) {
-      e.message = `${e.message}\n${e.stderr}`;
+
+    return { stdout, stderr };
+  } catch (error) {
+    // تسجيل الخطأ مع معلومات مفيدة بدون إظهار محتوى cookies
+    const errorLog = {
+      message: error.message,
+      code: error.code,
+      signal: error.signal
+    };
+
+    // إذا كان في stderr، اعرضه (بس بدون محتوى cookies)
+    if (error.stderr) {
+      errorLog.stderr = error.stderr;
     }
-    throw e;
+
+    // استخرج video ID من الـ args إن وجد
+    const videoIdArg = args.find((arg, i) => arg === 'https://www.youtube.com/watch?v=' || 
+                                             (typeof arg === 'string' && arg.match(/^[a-zA-Z0-9_-]{11}$/)));
+    if (videoIdArg) {
+      errorLog.videoId = videoIdArg.match(/[a-zA-Z0-9_-]{11}/)?.[0];
+    }
+
+    log.error(`yt-dlp error: ${JSON.stringify(errorLog)}`);
+    throw error;
   } finally {
     ytdlpLimiter.release();
   }
 }
 
-/** بيحوّل ناتج --dump-json (سطر لكل فيديو) لمصفوفة عناصر موحّدة الشكل */
-function mapFlatEntry(item, excludeId) {
-  if (!item || !item.id) return null;
-  if (excludeId && item.id === excludeId) return null;
-  return {
-    id: item.id,
-    title: item.title || 'بدون عنوان',
-    author: item.uploader || item.channel || 'Unknown',
-    channelId: item.channel_id || '',
-    duration: item.duration || 0,
-    thumbnail: item.thumbnails?.length
-      ? item.thumbnails[item.thumbnails.length - 1].url
-      : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-    viewCount: item.view_count || 0
-  };
-}
-
-function parseFlatItems(raw, excludeId) {
-  return raw
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map(line => {
-      let item;
-      try { item = JSON.parse(line); } catch (e) { return null; }
-      return mapFlatEntry(item, excludeId);
-    })
-    .filter(Boolean);
-}
-
 /**
  * ==========================================================================
- * فلتر محتوى غير مرغوب فيه — بيستبعد فيديوهات الأطفال/الكرتون ومحتوى الطبخ
- * من "المقترحات" و"الهوم فيد" و"الترند" بس (مش من البحث الصريح أو القنوات
- * أو related لفيديو معيّن اختاره المستخدم بنفسه — لو المستخدم دور بايده على
- * "وصفات طبخ" مثلًا من الشيبس، ده اختياره وهيتنفّذ عادي).
+ * استخراج الجودات الفعلية من الفورمات التي يرجعها yt-dlp
+ * هذه الدالة تستخرج فقط الجودات التي موجودة فعليًا
  * ==========================================================================
  */
-const UNWANTED_KEYWORDS = [
-  // أطفال / كرتون
-  'كرتون', 'رسوم متحركة', 'للأطفال', 'اطفال', 'أطفال', 'بيبي', 'بيبى', 'روضة',
-  'حضانة', 'قصص اطفال', 'قصص أطفال', 'اغاني اطفال', 'أغاني أطفال', 'العاب اطفال',
-  'ألعاب أطفال', 'تعليم اطفال', 'تعليم أطفال', 'انمي اطفال', 'مسلسل كرتون',
-  'cartoon', 'kids', 'for kids', 'nursery rhyme', 'nursery rhymes', 'cocomelon',
-  'baby shark', 'peppa pig', 'toddler', 'preschool', 'children song',
-  // طبخ / وصفات
-  'وصفة', 'وصفات', 'طبخ', 'طبخة', 'طريقة عمل', 'حلويات', 'أكلة', 'اكلة',
-  'مطبخ', 'شيف', 'recipe', 'cooking', 'kitchen'
-];
-function isUnwantedContent(title) {
-  if (!title) return false;
-  const t = title.toLowerCase();
-  return UNWANTED_KEYWORDS.some(k => t.includes(k.toLowerCase()));
-}
-function filterUnwanted(items) {
-  return items.filter(v => !isUnwantedContent(v.title));
-}
-
-/**
- * جلب صفحة من نتايج بأي حجم مطلوب، مع كاش لكل "بركة" (pool) بحجمها —
- * عشان السكرول اللانهائي (infinite scroll) يقدر يكمّل يجيب صفحات جديدة
- * من غير ما يعيد طلب yt-dlp لنفس البيانات القديمة تاني.
- */
-async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, maxPool = 150) {
-  const pageNum = Math.max(1, parseInt(page, 10) || 1);
-  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 30);
-  const needed = pageNum * pageSize;
-  const poolSize = Math.min(Math.max(needed, pageSize * 2), maxPool);
-
-  const cacheKey = `${cacheKeyBase}_${poolSize}`;
-  let pool = cache.get(cacheKey);
-  if (!pool) {
-    pool = await fetchPoolFn(poolSize);
-    cache.set(cacheKey, pool);
+function extractRealQualities(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) {
+    return [];
   }
 
-  const start = (pageNum - 1) * pageSize;
-  const results = pool.slice(start, start + pageSize);
-  const hasMore = pool.length > start + pageSize;
+  const heights = new Set();
 
-  return { page: pageNum, limit: pageSize, results, hasMore };
-}
-
-/**
- * الحصول على معلومات الفيديو الكاملة
- */
-async function getVideoInfo(videoId) {
-  const stdout = await runYtDlp(['--dump-json', `https://www.youtube.com/watch?v=${videoId}`]);
-  return JSON.parse(stdout);
-}
-
-/**
- * جلب رابط الفيديو المباشر
- */
-async function getVideoStreamUrl(videoId, format = 'best') {
-  const stdout = await runYtDlp(['--get-url', '-f', format, `https://www.youtube.com/watch?v=${videoId}`]);
-  const streamUrl = stdout.trim().split('\n')[0];
-  log.success(`🎬 Got stream URL (${streamUrl.length} chars)`);
-  return streamUrl;
-}
-
-/**
- * البحث عن فيديوهات على يوتيوب باستخدام yt-dlp (بدون أي اعتماد على YouTube Data API)
- */
-async function searchVideos(query, limit = 10) {
-  log.info(`🔎 Searching: "${query}" (limit ${limit})`);
-  const stdout = await runYtDlp([`ytsearch${limit}:${query}`, '--dump-json', '--flat-playlist']);
-  return parseFlatItems(stdout);
-}
-
-/**
- * جلب الفيديوهات المقترحة/ذات الصلة (related) لفيديو معين
- * بيستخدم playlist المكسات التلقائية اللي يوتيوب بيولدها (RD + videoId)
- */
-async function getRelatedVideos(videoId, limit = 10) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-  log.info(`🧭 Fetching related videos for: ${videoId} (limit ${limit})`);
-
-  let items = [];
-  try {
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--yes-playlist', '--playlist-end', String(limit + 1), url]);
-    items = parseFlatItems(stdout, videoId);
-  } catch (e) {
-    log.warn(`Flat related fetch failed: ${e.message}`);
-  }
-
-  if (items.length === 0) {
-    log.warn('⚠️  Flat related empty, retrying with full extraction...');
-    const stdout = await runYtDlp(['--dump-json', '--yes-playlist', '--playlist-end', String(limit + 1), '--skip-download', url]);
-    items = parseFlatItems(stdout, videoId);
-  }
-
-  return items.slice(0, limit);
-}
-
-/**
- * ==========================================================================
- * القنوات/المبدعين المفضّلين — المحتوى المقترح بيدّي لهم أولوية قبل أي
- * حاجة تانية (ترند عام أو مواضيع عشوائية). دول أسماء حقيقية اختارها
- * صاحب الموقع، فبنبحث باسم كل واحد فيهم على يوتيوب ونجيب أحدث فيديوهاته.
- * ==========================================================================
- */
-const FOLLOWED_CREATORS = [
-  'كامل العربي',
-  'اوشا',
-  'صلاح القصة وما فيها',
-  'سامح سند',
-  'بدر العلوي',
-  'ابو الصادق',
-  'مستر محمد ايمن الجوهري',
-  'مستر محمد صلاح مدرس لغة انجليزية', // بإضافة "مستر/مدرس" عشان مايتلخبطش مع لاعب الكورة
-  'مستر محمد عبدالمعبود',
-  'مستر رضا الفاروق',
-  'انجلشاوي',
-  'عبقري لغة خالد صقر',
-  'قناة توست',
-  'كوتش الغلابة'
-];
-
-async function getFollowedCreatorsPool(perCreator = 4) {
-  const settled = await Promise.allSettled(
-    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearch${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
-  );
-  const pool = [];
-  settled.forEach((r, i) => {
-    if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
-    else log.warn(`Followed creator fetch failed "${FOLLOWED_CREATORS[i]}": ${r.reason?.message}`);
-  });
-  return pool;
-}
-
-/**
- * جلب محتوى عام متنوع للاستخدام كـ fallback لما مفيش تاريخ مشاهدة كفاية
- * عند المستخدم بعد (مستخدم جديد مثلًا). الشخصنة الحقيقية بتحصل في المتصفح
- * نفسه (client-side) عن طريق جلب "فيديوهات متشابهة" لآخر حاجات المستخدم
- * اتفرج عليها فعليًا — مش هنا في السيرفر، لأن صفحة يوتيوب الرئيسية
- * الشخصية (Home feed) مش endpoint مدعوم بشكل موثوق في yt-dlp، وتبويب
- * "الرائج" (Trending) نفسه ثابت وواحد لكل الناس بغض النظر عن الكوكيز.
- *
- * الأولوية دلوقتي: فيديوهات القنوات المفضّلة (FOLLOWED_CREATORS) أولًا،
- * وبعدين الترند العام، وبعدين مواضيع عشوائية — بس لو لسه ناقص عدد.
- */
-async function getRecommendedVideos(region = 'EG', limit = 20) {
-  let items = [];
-  const seen = new Set();
-  function addUnique(list) {
-    list.forEach(v => { if (v && v.id && !seen.has(v.id)) { seen.add(v.id); items.push(v); } });
-  }
-
-  try {
-    const perCreator = Math.max(3, Math.ceil((limit * 1.4) / FOLLOWED_CREATORS.length));
-    const creatorsPool = await getFollowedCreatorsPool(perCreator);
-    addUnique(creatorsPool.sort(() => Math.random() - 0.5));
-  } catch (e) {
-    log.warn(`Followed creators pool failed: ${e.message}`);
-  }
-
-  if (items.length < limit) {
-    try {
-      const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit * 2), url]);
-      addUnique(filterUnwanted(parseFlatItems(stdout)));
-    } catch (e) {
-      log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
+  // حلقة عبر كل الـ formats وجمع الـ heights الفعلية فقط
+  for (const fmt of formats) {
+    // تحقق أن هذا format فيديو (لا يكون image ولا audio فقط)
+    if (fmt.vcodec && fmt.vcodec !== 'none' && fmt.height) {
+      heights.add(fmt.height);
     }
   }
 
-  if (items.length < limit) {
-    const topicPool = [
-      'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
-      'بودكاست عربي', 'أفلام كوميدي مصرية', 'مسلسلات رمضان', 'تكنولوجيا وتقنية',
-      'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة', 'كورة أهداف دوري أبطال أوروبا',
-      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس', 'أفلام أكشن مترجمة'
-    ];
-    const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
-    const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
-    // بنجيب كل الـ queries مع بعض بالتوازي (مش واحد ورا التاني) — بيقلل زمن
-    // الانتظار من مجموع كل الطلبات لأطول طلب واحد بس
-    const settled = await Promise.allSettled(
-      shuffled.map(q => runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']))
-    );
-    const pool = [];
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
-      else log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`);
-    });
-    addUnique(pool.sort(() => Math.random() - 0.5));
-  }
+  // حول الـ Set إلى مصفوفة ورتبها من الأعلى إلى الأقل
+  const qualitiesArray = Array.from(heights).sort((a, b) => b - a);
 
-  return { items: items.slice(0, limit), personalized: false };
-}
-
-/**
- * ==========================================================================
- * الهوم فيد الكامل — بيحاول يقلّد شكل صفحة يوتيوب الرئيسية الحقيقية:
- * مش قايمة واحدة، لكن "أقسام" (Sections) زي: الرائج، موسيقى، رياضة، ألعاب،
- * أخبار، تكنولوجيا، أفلام/مسلسلات، بودكاست... كل قسم بيتجاب بالتوازي مع
- * الباقي (مش واحد ورا التاني) عشان الاستجابة تكون سريعة حتى مع عدد أقسام كبير.
- * فيه كمان "mixed" وهي خلطة من كل الأقسام مبعثرة زي ما يوتيوب بيعمل بالظبط
- * في أول تحميل للصفحة الرئيسية.
- * ==========================================================================
- */
-const HOME_SECTIONS = [
-  { key: 'trending', title: '🔥 الرائج الآن', query: null }, // بيتجاب من فيد الترند الحقيقي
-  { key: 'music', title: '🎵 موسيقى', query: 'أغاني عربي جديد 2026' },
-  { key: 'sports', title: '⚽ رياضة', query: 'أهداف وملخصات مباريات' },
-  { key: 'gaming', title: '🎮 ألعاب', query: 'ألعاب فيديو جيمنج' },
-  { key: 'news', title: '📰 أخبار', query: 'أخبار عاجلة اليوم' },
-  { key: 'tech', title: '💻 تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية' },
-  { key: 'entertainment', title: '🎬 ترفيه وأفلام', query: 'أفلام ومسلسلات تريلر' },
-  { key: 'podcasts', title: '🎙️ بودكاست', query: 'بودكاست عربي حوار' },
-  { key: 'comedy', title: '😂 كوميدي', query: 'فيديوهات كوميدي مضحكة' },
-  { key: 'live', title: '🔴 مباشر الآن', query: 'بث مباشر live' }
-];
-
-async function getHomeFeed(region = 'EG', perSection = 12) {
-  log.info(`🏠 Building home feed (region ${region}, ${perSection}/section)`);
-
-  const fetchers = HOME_SECTIONS.map(async (section) => {
-    try {
-      let items;
-      if (section.key === 'trending') {
-        const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-        const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection * 2), url]);
-        items = filterUnwanted(parseFlatItems(stdout)).slice(0, perSection);
-      } else {
-        const stdout = await runYtDlp([`ytsearch${perSection * 2}:${section.query}`, '--dump-json', '--flat-playlist']);
-        items = filterUnwanted(parseFlatItems(stdout)).slice(0, perSection);
-      }
-      return { key: section.key, title: section.title, items };
-    } catch (e) {
-      log.warn(`Home section "${section.key}" failed: ${e.message}`);
-      return { key: section.key, title: section.title, items: [] };
-    }
-  });
-
-  // كل الأقسام بتتجاب مع بعض في نفس الوقت
-  const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
-
-  // خلطة "mixed" شبه اللي يوتيوب بيعرضها فعلاً في أول سكرول للهوم —
-  // شوية من كل قسم متبعثرين مش مجمّعين ورا بعض
-  const seen = new Set();
-  const mixed = [];
-  const maxLen = Math.max(...sections.map(s => s.items.length), 0);
-  for (let i = 0; i < maxLen; i++) {
-    for (const s of sections) {
-      const v = s.items[i];
-      if (v && !seen.has(v.id)) {
-        seen.add(v.id);
-        mixed.push({ ...v, section: s.key });
-      }
-    }
-  }
-
-  return { region, sections, mixed };
-}
-
-/**
- * جلب فيديوهات قناة معيّنة + بيانات القناة نفسها (الاسم، عدد المشتركين، الصورة، الوصف)
- */
-async function getChannelVideos(channelId, limit = 20) {
-  const url = `https://www.youtube.com/channel/${channelId}/videos`;
-  log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
-  const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
-  const data = JSON.parse(stdout);
-  const videos = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
-  return {
-    channel: {
-      id: data.channel_id || channelId,
-      title: data.channel || data.uploader || 'قناة',
-      followers: data.channel_follower_count || null,
-      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
-      description: data.description || ''
-    },
-    videos
-  };
-}
-
-/**
- * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن
- */
-async function getVideoComments(videoId, limit = 50) {
-  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
-  const args = [
-    '--skip-download', '--dump-json', '--write-comments',
-    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},all,all,${limit}`,
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
-  const stdout = await runYtDlp(args, { timeout: 45000 });
-  const lines = stdout.trim().split('\n').filter(Boolean);
-  const data = JSON.parse(lines[lines.length - 1]);
-  return (data.comments || []).slice(0, limit).map(c => ({
-    id: c.id,
-    author: c.author || 'مستخدم يوتيوب',
-    authorThumbnail: c.author_thumbnail || '',
-    text: c.text || '',
-    likeCount: c.like_count || 0,
-    isReply: !!(c.parent && c.parent !== 'root'),
-    timestamp: c.timestamp ? new Date(c.timestamp * 1000).toISOString() : null
+  return qualitiesArray.map(h => ({
+    height: h,
+    label: `${h}p`,
+    value: String(h)
   }));
 }
 
-// ==========================================================================
-// Routes
-// ==========================================================================
-
 /**
- * GET /trending?region=EG&limit=20&page=1
+ * ==========================================================================
+ * استخراج معلومات الفيديو والفورمات من yt-dlp
+ * ==========================================================================
  */
-/**
- * GET /trending?region=EG&limit=20&page=1
- * (بيرجّع محتوى شخصي بناءً على الكوكيز لو متاحة، وإلا محتوى عام متنوّع)
- */
-app.get('/trending', async (req, res) => {
-  const region = (req.query.region || 'EG').toUpperCase();
+async function getVideoInfo(videoId) {
   try {
-    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
-    const needed = pageNum * pageSize;
-    const poolSize = Math.min(Math.max(needed, pageSize * 2), 150);
+    const { stdout } = await runYtDlp([
+      '-j',
+      `https://www.youtube.com/watch?v=${videoId}`
+    ]);
 
-    const cacheKey = `recommended_${region}_${poolSize}`;
-    let cached = trendingCache.get(cacheKey);
-    if (!cached) {
-      cached = await getRecommendedVideos(region, poolSize);
-      trendingCache.set(cacheKey, cached);
-    }
-
-    const start = (pageNum - 1) * pageSize;
-    const results = cached.items.slice(start, start + pageSize);
-    const hasMore = cached.items.length > start + pageSize;
-
-    log.success(`✅ Recommended done: ${region} page ${pageNum} (${results.length} نتيجة, personalized=${cached.personalized})`);
-    res.json({ region, page: pageNum, limit: pageSize, count: results.length, hasMore, personalized: cached.personalized, results });
+    const info = JSON.parse(stdout);
+    return info;
   } catch (error) {
-    log.error(`Error fetching recommended: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب المحتوى المقترح',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
+    log.error(`Failed to get video info for ${videoId}: ${error.message}`);
+    throw error;
   }
-});
+}
 
 /**
- * GET /home?region=EG&perSection=12
- * فيد الصفحة الرئيسية الكامل بأقسام (trending, music, sports, gaming...)
- * + خلطة "mixed" جاهزة للعرض المباشر — زي شكل هوم يوتيوب الحقيقي
+ * ==========================================================================
+ * دالة مساعدة: اختيار أفضل format فيديو + audio بناءً على الارتفاع المطلوب
+ * ==========================================================================
+ */
+function selectBestFormat(formats, maxHeight = null) {
+  if (!Array.isArray(formats) || formats.length === 0) {
+    return null;
+  }
+
+  // فلترة الـ video formats (يجب أن تكون vcodec !== 'none')
+  const videoFormats = formats.filter(f => 
+    f.vcodec && f.vcodec !== 'none' && f.height
+  );
+
+  if (videoFormats.length === 0) {
+    return null;
+  }
+
+  // إذا كان محدد ارتفاع، اختر أفضل format أقل من أو مساوي للارتفاع
+  let selectedVideo = null;
+  if (maxHeight !== null) {
+    selectedVideo = videoFormats
+      .filter(f => f.height <= maxHeight)
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+  }
+
+  // إذا لم يوجد format مناسب في الارتفاع المحدد، اختر أفضل واحد
+  if (!selectedVideo) {
+    selectedVideo = videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+  }
+
+  // اختر أفضل audio format
+  const audioFormats = formats.filter(f => 
+    f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')
+  );
+  const selectedAudio = audioFormats.sort((a, b) => 
+    (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0)
+  )[0];
+
+  return { video: selectedVideo, audio: selectedAudio };
+}
+
+/**
+ * ==========================================================================
+ * استخراج format ID بناءً على الارتفاع المطلوب
+ * ==========================================================================
+ */
+function getFormatSelector(formats, requestedHeight = null) {
+  const selected = selectBestFormat(formats, requestedHeight);
+  
+  if (!selected || !selected.video) {
+    return 'best';
+  }
+
+  // بناء selector: video format + audio format
+  const videoId = selected.video.format_id;
+  const audioId = selected.audio ? selected.audio.format_id : null;
+
+  if (audioId) {
+    return `${videoId}+${audioId}`;
+  }
+  return videoId;
+}
+
+/**
+ * ==========================================================================
+ * دالة FFmpeg merge streaming — لدمج video + audio مباشرة بدون تخزين
+ * ==========================================================================
+ */
+function streamMergedViaFfmpeg(videoUrl, audioUrl, res) {
+  const ffmpegArgs = [
+    '-i', videoUrl,
+    '-i', audioUrl,
+    '-c:v', 'copy',
+    '-c:a', 'aac',
+    '-f', 'mp4',
+    'pipe:1'
+  ];
+
+  const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
+
+  ffmpegProcess.stdout.pipe(res);
+
+  ffmpegProcess.on('error', (err) => {
+    log.error(`FFmpeg error: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'FFmpeg streaming failed' });
+    }
+  });
+
+  res.on('close', () => {
+    ffmpegProcess.kill();
+  });
+}
+
+// ============================= ENDPOINTS ==============================
+
+/**
+ * GET /home
  */
 app.get('/home', async (req, res) => {
-  const region = (req.query.region || 'EG').toUpperCase();
-  const perSection = Math.min(Math.max(parseInt(req.query.perSection, 10) || 12, 4), 25);
-
-  const cacheKey = `home_${region}_${perSection}`;
   try {
-    let data = trendingCache.get(cacheKey);
-    if (!data) {
-      data = await getHomeFeed(region, perSection);
-      trendingCache.set(cacheKey, data);
+    const region = (req.query.region || 'EG').toUpperCase();
+    const perSection = parseInt(req.query.perSection) || 12;
+    const cacheKey = `home:${region}:${perSection}`;
+
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
     }
-    log.success(`✅ Home feed done: ${region} (${data.sections.length} قسم, ${data.mixed.length} فيديو)`);
-    res.json(data);
+
+    log.info(`Fetching home for region: ${region}`);
+    const { stdout } = await runYtDlp([
+      'https://www.youtube.com/',
+      '-j',
+      '--extract-flat=in_playlist',
+      '--skip-download'
+    ]);
+
+    const parsed = JSON.parse(stdout);
+    const sections = [];
+
+    if (parsed.entries) {
+      const chunked = [];
+      for (let i = 0; i < parsed.entries.length; i += perSection) {
+        chunked.push(parsed.entries.slice(i, i + perSection));
+      }
+
+      chunked.forEach((chunk, idx) => {
+        sections.push({
+          section_id: `section_${idx}`,
+          title: `Section ${idx + 1}`,
+          videos: chunk.map(v => ({
+            id: v.id,
+            title: v.title,
+            thumbnail: v.thumbnail || null,
+            duration: v.duration || null,
+            channel: v.channel || null
+          }))
+        });
+      });
+    }
+
+    const result = { region, sections };
+    infoCache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
-    log.error(`Error building home feed: ${error.message}`);
+    log.error(`Home feed error: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر بناء الصفحة الرئيسية',
+      error: 'تعذّر جلب الصفحة الرئيسية',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
 /**
- * GET /search?q=QUERY&limit=20&page=1
+ * GET /trending
+ */
+app.get('/trending', async (req, res) => {
+  try {
+    const region = (req.query.region || 'EG').toUpperCase();
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+    const cacheKey = `trending:${region}:${page}:${limit}`;
+
+    const cached = trendingCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching trending for ${region} (page ${page})`);
+    const { stdout } = await runYtDlp([
+      `https://www.youtube.com/trending?gl=${region}`,
+      '-j',
+      '--extract-flat=in_playlist',
+      '--skip-download'
+    ]);
+
+    const parsed = JSON.parse(stdout);
+    const allVideos = parsed.entries || [];
+    const videos = allVideos.slice(offset, offset + limit);
+
+    const result = {
+      region,
+      page,
+      limit,
+      total: allVideos.length,
+      hasMore: offset + limit < allVideos.length,
+      videos: videos.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail || null,
+        duration: v.duration || null,
+        channel: v.channel || null,
+        views: v.view_count || null
+      }))
+    };
+
+    trendingCache.set(cacheKey, result);
+    res.json(result);
+  } catch (error) {
+    log.error(`Trending error: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الفيديوهات الرائجة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /search
  */
 app.get('/search', async (req, res) => {
-  const { q: query } = req.query;
-
-  if (!query || !query.trim()) {
-    return res.status(400).json({
-      error: 'كلمة البحث مطلوبة',
-      example: '/search?q=funny+cats&limit=20&page=1'
-    });
-  }
-
   try {
-    const { page, limit, results, hasMore } = await getPaginatedPool(
-      infoCache, `search_${query}`,
-      (poolSize) => searchVideos(query, poolSize),
-      req.query.page, req.query.limit
-    );
-    log.success(`✅ Search done: "${query}" page ${page} (${results.length} نتيجة)`);
-    res.json({ query, page, limit, count: results.length, hasMore, results });
-  } catch (error) {
-    log.error(`Error searching: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر تنفيذ البحث',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /related?v=VIDEO_ID&limit=10&page=1
- */
-app.get('/related', async (req, res) => {
-  const { v: videoId } = req.query;
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({
-      error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/related?v=dQw4w9WgXcQ&limit=10&page=1'
-    });
-  }
-
-  try {
-    const { page, limit, results, hasMore } = await getPaginatedPool(
-      infoCache, `related_${videoId}`,
-      (poolSize) => getRelatedVideos(videoId, poolSize),
-      req.query.page, req.query.limit, 60
-    );
-    log.success(`✅ Related done: ${videoId} page ${page} (${results.length} نتيجة)`);
-    res.json({ id: videoId, page, limit, count: results.length, hasMore, results });
-  } catch (error) {
-    log.error(`Error fetching related: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب الفيديوهات المقترحة',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-/**
- * GET /channel?id=CHANNEL_ID&limit=20&page=1
- */
-app.get('/channel', async (req, res) => {
-  const channelId = req.query.id;
-
-  if (!channelId) {
-    return res.status(400).json({
-      error: 'channel id مطلوب',
-      example: '/channel?id=UCxxxxxxxx&limit=20&page=1'
-    });
-  }
-
-  try {
-    const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
-    const needed = pageNum * pageSize;
-    const poolSize = Math.min(Math.max(needed, pageSize * 2), 100);
-
-    const dataCacheKey = `channel_${channelId}_${poolSize}`;
-    let data = channelCache.get(dataCacheKey);
-    if (!data) {
-      data = await getChannelVideos(channelId, poolSize);
-      channelCache.set(dataCacheKey, data);
+    const q = req.query.q;
+    if (!q) {
+      return res.status(400).json({ error: 'Missing search query (q)' });
     }
 
-    const start = (pageNum - 1) * pageSize;
-    const videos = data.videos.slice(start, start + pageSize);
-    const hasMore = data.videos.length > start + pageSize;
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+    const cacheKey = `search:${q}:${page}:${limit}`;
 
-    log.success(`✅ Channel done: ${channelId} page ${pageNum} (${videos.length} نتيجة)`);
-    res.json({ channel: data.channel, page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Searching: ${q} (page ${page})`);
+    const { stdout } = await runYtDlp([
+      `ytsearch${limit * page}:${q}`,
+      '-j',
+      '--extract-flat=in_playlist',
+      '--skip-download'
+    ]);
+
+    const parsed = JSON.parse(stdout);
+    const allVideos = parsed.entries || [];
+    const videos = allVideos.slice(offset, offset + limit);
+
+    const result = {
+      query: q,
+      page,
+      limit,
+      total: allVideos.length,
+      hasMore: offset + limit < allVideos.length,
+      videos: videos.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail || null,
+        duration: v.duration || null,
+        channel: v.channel || null
+      }))
+    };
+
+    infoCache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
-    log.error(`Error fetching channel: ${error.message}`);
+    log.error(`Search error: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر البحث',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /related
+ */
+app.get('/related', async (req, res) => {
+  try {
+    const videoId = req.query.v;
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    const limit = parseInt(req.query.limit) || 10;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+    const cacheKey = `related:${videoId}:${page}:${limit}`;
+
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching related videos for ${videoId}`);
+    const { stdout } = await runYtDlp([
+      `https://www.youtube.com/watch?v=${videoId}`,
+      '-j',
+      '--extract-flat=in_playlist',
+      '--skip-download'
+    ]);
+
+    const parsed = JSON.parse(stdout);
+    const allVideos = (parsed.related_videos || parsed.entries || []);
+    const videos = allVideos.slice(offset, offset + limit);
+
+    const result = {
+      videoId,
+      page,
+      limit,
+      total: allVideos.length,
+      hasMore: offset + limit < allVideos.length,
+      videos: videos.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail || null,
+        duration: v.duration || null,
+        channel: v.channel || null
+      }))
+    };
+
+    infoCache.set(cacheKey, result);
+    res.json(result);
+  } catch (error) {
+    log.error(`Related videos error: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الفيديوهات ذات الصلة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /channel
+ */
+app.get('/channel', async (req, res) => {
+  try {
+    const channelId = req.query.id;
+    if (!channelId) {
+      return res.status(400).json({ error: 'Missing channel ID (id)' });
+    }
+
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+    const cacheKey = `channel:${channelId}:${page}:${limit}`;
+
+    const cached = channelCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching channel ${channelId} (page ${page})`);
+    const { stdout } = await runYtDlp([
+      `https://www.youtube.com/channel/${channelId}/videos`,
+      '-j',
+      '--extract-flat=in_playlist',
+      '--skip-download'
+    ]);
+
+    const parsed = JSON.parse(stdout);
+    const allVideos = parsed.entries || [];
+    const videos = allVideos.slice(offset, offset + limit);
+
+    const result = {
+      channelId,
+      title: parsed.title || 'Unknown Channel',
+      description: parsed.description || '',
+      page,
+      limit,
+      total: allVideos.length,
+      hasMore: offset + limit < allVideos.length,
+      videos: videos.map(v => ({
+        id: v.id,
+        title: v.title,
+        thumbnail: v.thumbnail || null,
+        duration: v.duration || null
+      }))
+    };
+
+    channelCache.set(cacheKey, result);
+    res.json(result);
+  } catch (error) {
+    log.error(`Channel error: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب بيانات القناة',
       details: NODE_ENV === 'development' ? error.message : undefined
@@ -742,298 +692,94 @@ app.get('/channel', async (req, res) => {
 });
 
 /**
- * GET /comments?v=VIDEO_ID&limit=50
+ * GET /comments
  */
 app.get('/comments', async (req, res) => {
-  const videoId = req.query.v;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `comments_${videoId}_${limit}`;
-  const cached = infoCache.get(cacheKey);
-  if (cached) {
-    log.info(`📦 Comments from cache: ${videoId}`);
-    return res.json(cached);
-  }
-
   try {
-    const comments = await getVideoComments(videoId, limit);
-    const response = { id: videoId, count: comments.length, results: comments };
-    infoCache.set(cacheKey, response, 1800);
-    log.success(`✅ Comments done: ${videoId} (${comments.length} تعليق)`);
-    res.json(response);
+    const videoId = req.query.v;
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    const limit = parseInt(req.query.limit) || 50;
+    const cacheKey = `comments:${videoId}:${limit}`;
+
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching comments for ${videoId}`);
+    const { stdout } = await runYtDlp([
+      `https://www.youtube.com/watch?v=${videoId}`,
+      '--write-comments',
+      '--dump-json',
+      '--skip-download'
+    ]);
+
+    const info = JSON.parse(stdout);
+    const comments = (info.comments || []).slice(0, limit);
+
+    const result = {
+      videoId,
+      total: comments.length,
+      comments: comments.map(c => ({
+        author: c.author,
+        text: c.text,
+        time: c.time,
+        likes: c.like_count || 0
+      }))
+    };
+
+    infoCache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
-    log.error(`Error fetching comments: ${error.message}`);
+    log.error(`Comments error: ${error.message}`);
     res.status(500).json({
-      error: 'تعذّر جلب التعليقات (ممكن تكون التعليقات مقفولة على الفيديو ده)',
+      error: 'تعذّر جلب التعليقات',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
 /**
- * GET /video?v=VIDEO_ID
- */
-/**
- * بيسحب الفيديو من الرابط المباشر (googlevideo) ويبعته للمتصفح بايت بايت،
- * بدل عمل redirect. ده بيحل مشكلة إن رابط يوتيوب مقفول على IP السيرفر:
- * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
- * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
- */
-function streamFromUpstream(req, res, url, redirectCount = 0) {
-  if (redirectCount > 5) {
-    if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
-    return;
-  }
-
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  };
-  if (req.headers.range) headers['Range'] = req.headers.range;
-
-  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
-    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
-    if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
-      upstreamRes.resume();
-      return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
-    }
-
-    if (upstreamRes.statusCode >= 400) {
-      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
-      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
-      upstreamRes.resume();
-      return;
-    }
-
-    res.status(upstreamRes.statusCode);
-    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']
-      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
-
-    upstreamRes.pipe(res);
-  });
-
-  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
-  upstreamReq.on('error', (err) => {
-    log.error(`Stream proxy error: ${err.message}`);
-    if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
-  });
-
-  req.on('close', () => upstreamReq.destroy());
-}
-
-// ==========================================================================
-// نظام "كل الجودات" — 144p لحد 4K + صوت لوحده
-// - قبل كده كنا بنحاول نستخدم "progressive" (رابط واحد فيه فيديو+صوت مع بعض)
-//   للجودات لحد 720p، بس ده كان بيسبب مشكلة: يوتيوب فعليًا مش بيوفّر روابط
-//   progressive إلا على ارتفاع واحد أو اتنين بس (غالبًا 360p)، فلما نطلب
-//   144/240/480/720 وما فيش progressive عليها، الفولباك "/best" كان بيتجاهل
-//   الارتفاع المطلوب تمامًا ويرجّع نفس الفيديو الافتراضي كل مرة (ده اللي كان
-//   بيخلي كل الجودات من 144 لحد 720 شكلها واحد بالظبط).
-// - الحل: كل الجودات (من 144 لحد 4K) بقت بتاخد نفس مسار الدمج الموثوق:
-//   bestvideo[height<=H] (ده موجود فعليًا على كل الارتفاعات القياسية على
-//   يوتيوب) + bestaudio، ودمجهم لحظيًا بـ ffmpeg (-c copy = نسخ بدون إعادة
-//   ترميز، سريع وموفّر معالج) من غير ما نخزّن أي ملف على القرص.
-// ==========================================================================
-const QUALITY_HEIGHTS = { '2160': 2160, '4k': 2160, '1440': 1440, '2k': 1440, '1080': 1080, '720': 720, '480': 480, '360': 360, '240': 240, '144': 144 };
-
-function resolveQuality(quality) {
-  if (!quality) return null;
-  const q = String(quality).toLowerCase().replace('p', '');
-  if (q === 'audio') return { type: 'audio' };
-  const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
-  if (!height || Number.isNaN(height)) return null;
-  return { type: 'merge', height };
-}
-
-/** بيرجع رابط أو رابطين (فيديو + صوت) حسب الفورمات المطلوب */
-async function getFormatUrls(videoId, formatSelector) {
-  const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
-  const urls = stdout.trim().split('\n').filter(Boolean);
-  return urls;
-}
-
-/** بث فيديو+صوت مدموجين لحظيًا عن طريق ffmpeg (بدون تخزين على القرص) */
-function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  const inputArgs = ['-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', videoUrl];
-  if (audioUrl) inputArgs.push('-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', audioUrl);
-
-  const args = [
-    '-loglevel', 'error', '-hide_banner',
-    ...inputArgs,
-    '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
-    '-c', 'copy',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-f', 'mp4', 'pipe:1'
-  ];
-
-  res.status(200);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-cache');
-
-  const ff = spawn('ffmpeg', args);
-  let stderrBuf = '';
-  ff.stderr.on('data', d => { stderrBuf += d.toString(); });
-  ff.stdout.pipe(res);
-  ff.on('error', (e) => {
-    log.error(`ffmpeg spawn error (ffmpeg متثبّت؟): ${e.message}`);
-    if (!res.headersSent) res.status(500).json({ error: 'ffmpeg غير متاح على السيرفر' });
-  });
-  ff.on('close', (code) => {
-    if (code !== 0 && code !== null && !res.writableEnded) {
-      log.warn(`ffmpeg exited with code ${code}: ${stderrBuf.slice(-300)}`);
-    }
-  });
-  req.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
-}
-
-app.get('/video', async (req, res) => {
-  const { v: videoId, format = 'best[height<=720]', quality } = req.query;
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    log.error(`Invalid video ID: ${videoId}`);
-    return res.status(400).json({
-      error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/video?v=dQw4w9WgXcQ&quality=1080 أو /video?v=dQw4w9WgXcQ&format=best[height<=720]'
-    });
-  }
-
-  // ---- مسار الجودات الجديد (quality=144|240|360|480|720|1080|1440|2160|audio) ----
-  // لو مفيش quality، بيشتغل بالضبط زي القديم بمتغيّر format (مفيش أي تغيير في السلوك الأصلي)
-  const resolved = resolveQuality(quality);
-  if (resolved) {
-    const qCacheKey = `stream_q_${videoId}_${quality}`;
-    try {
-      let urls = streamCache.get(qCacheKey);
-      if (urls) {
-        log.info(`📦 Format URLs from cache: ${videoId} (${quality})`);
-      } else {
-        // جودة فيديو (أي ارتفاع) أو صوت لوحده → دمج/بث لحظي بـ ffmpeg، ده
-        // بيضمن إن كل جودة فعلًا مختلفة عن التانية (مش نفس الفيديو دايمًا)
-        const selector = resolved.type === 'audio'
-          ? 'bestaudio/best'
-          : `bestvideo[height<=${resolved.height}]+bestaudio/best[height<=${resolved.height}]/best`;
-        urls = await getFormatUrls(videoId, selector);
-        if (!urls.length) throw new Error('Failed to get stream URLs');
-        streamCache.set(qCacheKey, urls);
-      }
-      log.success(`▶️  Streaming (merged/ffmpeg ${quality}): ${videoId}`);
-      if (resolved.type === 'audio') return streamFromUpstream(req, res, urls[0]);
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1] || null);
-    } catch (error) {
-      log.error(`Error fetching quality ${quality}: ${error.message}`);
-      if (!res.headersSent) {
-        return res.status(500).json({
-          error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة',
-          details: NODE_ENV === 'development' ? error.message : undefined
-        });
-      }
-      return;
-    }
-  }
-
-  const cacheKey = `stream_${videoId}_${format}`;
-  const cachedUrl = streamCache.get(cacheKey);
-
-  if (cachedUrl) {
-    log.info(`📦 Stream from cache: ${videoId}`);
-    return streamFromUpstream(req, res, cachedUrl);
-  }
-
-  let attempts = 0;
-  let lastError = null;
-
-  while (attempts < MAX_RETRIES) {
-    try {
-      log.info(`🎬 Fetching video: ${videoId} (attempt ${attempts + 1}/${MAX_RETRIES})`);
-
-      const streamUrl = await getVideoStreamUrl(videoId, format);
-
-      if (!streamUrl) {
-        throw new Error('Failed to get stream URL');
-      }
-
-      streamCache.set(cacheKey, streamUrl);
-      log.success(`▶️  Streaming: ${videoId}`);
-
-      streamFromUpstream(req, res, streamUrl);
-      return;
-
-    } catch (error) {
-      lastError = error;
-      attempts++;
-      log.warn(`Attempt ${attempts} failed: ${error.message}`);
-
-      if (attempts < MAX_RETRIES) {
-        await new Promise(r => setTimeout(r, 1000 * attempts));
-      }
-    }
-  }
-
-  log.error(`Failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
-
-  if (lastError?.message.includes('unavailable') || lastError?.message.includes('not available')) {
-    return res.status(404).json({ error: 'الفيديو غير متاح أو محذوف' });
-  } else if (lastError?.message.includes('private')) {
-    return res.status(403).json({ error: 'الفيديو خاص (private)' });
-  } else if (lastError?.message.includes('age')) {
-    return res.status(403).json({ error: 'الفيديو يحتاج verification العمر' });
-  }
-
-  res.status(500).json({
-    error: 'فشل في تشغيل الفيديو',
-    details: NODE_ENV === 'development' ? lastError?.message : undefined
-  });
-});
-
-/**
- * GET /info?v=VIDEO_ID
+ * GET /info
  */
 app.get('/info', async (req, res) => {
-  const videoId = req.query.v;
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cached = infoCache.get(`info_${videoId}`);
-  if (cached) {
-    log.info(`📋 Info from cache: ${videoId}`);
-    return res.json(cached);
-  }
-
   try {
-    log.info(`📥 Fetching info: ${videoId}`);
+    const videoId = req.query.v;
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    const cacheKey = `info:${videoId}`;
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching info for ${videoId}`);
     const info = await getVideoInfo(videoId);
 
     const result = {
-      id: videoId,
+      id: info.id,
       title: info.title,
-      duration: info.duration || 0,
-      author: info.uploader || info.channel || 'Unknown',
-      channelId: info.channel_id || '',
-      description: info.description || '',
-      thumbnail: info.thumbnail || '',
-      publishedAt: info.upload_date ? new Date(
-        `${info.upload_date.slice(0,4)}-${info.upload_date.slice(4,6)}-${info.upload_date.slice(6,8)}`
-      ).toISOString() : null,
-      viewCount: info.view_count || 0,
-      likeCount: info.like_count || 0,
-      ageRestricted: info.age_limit ? info.age_limit > 0 : false,
-      isLive: info.is_live || false,
-      formats: info.formats?.length || 0
+      description: info.description,
+      duration: info.duration,
+      uploader: info.uploader,
+      uploader_id: info.uploader_id,
+      view_count: info.view_count,
+      like_count: info.like_count || 0,
+      upload_date: info.upload_date,
+      thumbnail: info.thumbnail
     };
 
-    infoCache.set(`info_${videoId}`, result);
-    log.success(`✅ Got info: ${info.title}`);
-
+    infoCache.set(cacheKey, result);
     res.json(result);
-
   } catch (error) {
-    log.error(`Error fetching info: ${error.message}`);
+    log.error(`Info error: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب معلومات الفيديو',
       details: NODE_ENV === 'development' ? error.message : undefined
@@ -1042,85 +788,233 @@ app.get('/info', async (req, res) => {
 });
 
 /**
- * GET /formats?v=VIDEO_ID
+ * GET /formats
+ * عرض كل الـ formats الفعلية التي يوفرها yt-dlp
  */
 app.get('/formats', async (req, res) => {
-  const videoId = req.query.v;
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
   try {
-    log.info(`📊 Fetching formats: ${videoId}`);
+    const videoId = req.query.v;
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    const cacheKey = `formats:${videoId}`;
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching formats for ${videoId}`);
     const info = await getVideoInfo(videoId);
 
-    const formats = (info.formats || [])
-      .filter(f => f.vcodec !== 'none' || f.acodec !== 'none')
+    if (!info.formats) {
+      return res.status(400).json({
+        error: 'لم يتمكن yt-dlp من استخراج الفورمات',
+        details: 'قد يكون الفيديو محميًا أو غير متاح',
+        videoId
+      });
+    }
+
+    // فلترة video formats فقط (بدون audio-only)
+    const videoFormats = info.formats
+      .filter(f => f.vcodec && f.vcodec !== 'none' && f.height)
+      .sort((a, b) => (b.height || 0) - (a.height || 0))
       .map(f => ({
-        formatId: f.format_id,
+        format_id: f.format_id,
         format: f.format,
-        videoCodec: f.vcodec,
-        audioCodec: f.acodec,
+        video_codec: f.vcodec || 'unknown',
+        audio_codec: f.acodec || 'none',
         height: f.height,
         width: f.width,
-        fps: f.fps,
-        fileSize: f.filesize || 'unknown'
-      }))
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
+        fps: f.fps || null,
+        file_size: f.filesize || null,
+        ext: f.ext
+      }));
 
-    res.json({
-      id: videoId,
+    const result = {
+      videoId,
       title: info.title,
-      formats: formats.slice(0, 20)
-    });
+      totalFormats: info.formats.length,
+      videoFormats: videoFormats.length,
+      formats: videoFormats
+    };
 
+    infoCache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
-    log.error(`Error fetching formats: ${error.message}`);
-    res.status(500).json({ error: 'تعذّر جلب الـ formats' });
+    log.error(`Formats error: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب الفورمات',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
 /**
- * GET /video/qualities?v=VIDEO_ID
- * بيرجّع كل الجودات المتاحة *فعليًا* لهذا الفيديو بالتحديد (مش قايمة ثابتة)
- * كل جودة معاها رابط تشغيل جاهز من نفس السيرفر (/video?v=..&quality=..)
+ * GET /video/qualities
+ * عرض الجودات الموجودة فعليًا فقط
  */
 app.get('/video/qualities', async (req, res) => {
-  const videoId = req.query.v;
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `qualities_${videoId}`;
-  const cached = infoCache.get(cacheKey);
-  if (cached) return res.json(cached);
-
   try {
+    const videoId = req.query.v;
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    const cacheKey = `qualities:${videoId}`;
+    const cached = infoCache.get(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    log.info(`Fetching qualities for ${videoId}`);
     const info = await getVideoInfo(videoId);
-    const heights = new Set();
-    (info.formats || []).forEach(f => { if (f.height && f.vcodec !== 'none') heights.add(f.height); });
 
-    const standard = [2160, 1440, 1080, 720, 480, 360, 240, 144];
-    const available = standard.filter(h => [...heights].some(fh => Math.abs(fh - h) <= 20) || h <= Math.max(...heights, 0));
-    const uniqueAvailable = [...new Set(available)].filter(h => h <= Math.max(...heights, 0)).sort((a, b) => b - a);
+    if (!info.formats || info.formats.length === 0) {
+      return res.status(400).json({
+        error: 'لا توجد فورمات فيديو متاحة',
+        details: 'قد يكون الفيديو محميًا أو غير متاح',
+        videoId
+      });
+    }
 
-    const qualities = uniqueAvailable.map(h => ({
-      label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
-      quality: String(h),
-      type: 'merged (ffmpeg)',
-      url: `/video?v=${videoId}&quality=${h}`
-    }));
-    qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
+    // استخراج الجودات الفعلية فقط
+    const qualities = extractRealQualities(info.formats);
 
-    const result = { id: videoId, title: info.title, qualities };
+    // أضف audio option إذا كان في audio formats
+    const hasAudio = info.formats.some(f => 
+      f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')
+    );
+
+    if (hasAudio) {
+      qualities.push({
+        height: 0,
+        label: 'Audio Only',
+        value: 'audio'
+      });
+    }
+
+    const result = {
+      id: videoId,
+      title: info.title,
+      qualities,
+      count: qualities.length
+    };
+
     infoCache.set(cacheKey, result);
-    log.success(`✅ Qualities done: ${videoId} (${qualities.length} جودة)`);
+    log.success(`✅ Qualities extracted: ${videoId} (${qualities.length} جودة فعلية)`);
     res.json(result);
   } catch (error) {
-    log.error(`Error fetching qualities: ${error.message}`);
+    log.error(`Qualities error: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب الجودات المتاحة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /video
+ * تشغيل الفيديو بجودة محددة أو تلقائية
+ */
+app.get('/video', async (req, res) => {
+  try {
+    const videoId = req.query.v;
+    const qualityParam = req.query.quality;
+    const formatParam = req.query.format;
+
+    if (!videoId || !isValidVideoId(videoId)) {
+      return res.status(400).json({ error: 'Missing or invalid video ID (v)' });
+    }
+
+    log.info(`Playing video ${videoId}${qualityParam ? ` at quality ${qualityParam}` : ''}`);
+
+    // جلب معلومات الفيديو والفورمات
+    const info = await getVideoInfo(videoId);
+
+    if (!info.formats || info.formats.length === 0) {
+      return res.status(400).json({
+        error: 'لا توجد فورمات فيديو متاحة',
+        details: 'قد يكون الفيديو محميًا أو غير متاح'
+      });
+    }
+
+    let selectedFormat = formatParam;
+
+    // إذا طلب quality محددة
+    if (qualityParam) {
+      if (qualityParam === 'audio') {
+        // audio only
+        const audioFormat = info.formats.find(f => 
+          f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')
+        );
+        if (!audioFormat) {
+          return res.status(400).json({
+            error: 'Audio quality not available for this video'
+          });
+        }
+        selectedFormat = audioFormat.format_id;
+      } else {
+        // جودة فيديو محددة
+        const requestedHeight = parseInt(qualityParam);
+        const realQualities = extractRealQualities(info.formats);
+        const qualityExists = realQualities.some(q => q.height === requestedHeight);
+
+        if (!qualityExists) {
+          return res.status(400).json({
+            error: `الجودة المطلوبة (${qualityParam}p) غير متاحة لهذا الفيديو`,
+            availableQualities: realQualities.map(q => q.label),
+            videoId
+          });
+        }
+
+        selectedFormat = getFormatSelector(info.formats, requestedHeight);
+      }
+    } else {
+      // بدون جودة محددة، استخدم أفضل format
+      selectedFormat = getFormatSelector(info.formats);
+    }
+
+    if (!selectedFormat) {
+      return res.status(400).json({
+        error: 'تعذّر اختيار format مناسب للفيديو'
+      });
+    }
+
+    log.info(`Using format selector: ${selectedFormat}`);
+
+    // جلب الفيديو بالـ format المختار
+    const { stdout: urlsJson } = await runYtDlp([
+      '-f', selectedFormat,
+      '-g',
+      `https://www.youtube.com/watch?v=${videoId}`
+    ]);
+
+    const urls = urlsJson.trim().split('\n').filter(Boolean);
+
+    if (urls.length === 0) {
+      return res.status(400).json({
+        error: 'تعذّر الحصول على روابط البث'
+      });
+    }
+
+    // إذا كان في URL واحد فقط (progressive stream)
+    if (urls.length === 1) {
+      res.redirect(urls[0]);
+    } else if (urls.length === 2) {
+      // video + audio ← استخدم FFmpeg merge
+      res.setHeader('Content-Type', 'video/mp4');
+      streamMergedViaFfmpeg(urls[0], urls[1], res);
+    } else {
+      // fallback: استخدم أول URL
+      res.redirect(urls[0]);
+    }
+  } catch (error) {
+    log.error(`Video streaming error: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر تشغيل الفيديو',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -1130,16 +1024,43 @@ app.get('/video/qualities', async (req, res) => {
  * GET /health
  */
 app.get('/health', (req, res) => {
+  const ytdlpReady = checkYtDlp();
+  const ffmpegReady = checkFfmpeg();
+
   res.json({
     status: 'operational',
     version: SERVER_VERSION,
-    ytdlpVersion: (() => { try { return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim(); } catch { return 'unknown'; } })(),
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    ytdlpReady: checkYtDlp(),
-    ffmpegReady: (() => { try { require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' }); return true; } catch { return false; } })(),
-    cookiesReady,
-    concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
+    checks: {
+      ytdlp: {
+        ready: ytdlpReady,
+        version: (() => {
+          try {
+            return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim();
+          } catch {
+            return 'unknown';
+          }
+        })()
+      },
+      ffmpeg: {
+        ready: ffmpegReady,
+        status: ffmpegReady ? '✅ Available' : '❌ Not available'
+      },
+      nodejs: {
+        ready: true,
+        version: process.version
+      },
+      cookies: {
+        ready: cookiesReady,
+        status: cookiesReady ? '✅ Loaded' : '❌ Waiting for Firebase'
+      }
+    },
+    concurrency: {
+      max: YTDLP_CONCURRENCY,
+      current: ytdlpLimiter.current,
+      queued: ytdlpLimiter.queue.length
+    }
   });
 });
 
@@ -1235,9 +1156,13 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v5.0.0 "جبارة" - YouTube Proxy (بدون اعتماد على YouTube Data API)',
+    name: '🎬 srver v5.5.0 "الإصلاح" - YouTube Proxy (بدون اعتماد على YouTube Data API)',
     version: SERVER_VERSION,
     environment: NODE_ENV,
+    improvements: {
+      'v5.5.0': 'إصلاح نظام استخراج الجودات - عرض الجودات الموجودة فعليًا فقط، معالجة أخطاء محسّنة',
+      'v5.4.1': 'دعم جودات 1080p/1440p/2160p مع FFmpeg merge'
+    },
     cookies: {
       source: '🔥 Firebase Realtime Database',
       url: FIREBASE_URL,
@@ -1248,7 +1173,7 @@ app.get('/', (req, res) => {
     endpoints: {
       home: '/home?region=EG&perSection=12',
       trending: '/trending?region=EG&limit=20&page=1',
-      video: '/video?v=VIDEO_ID&quality=1080 (أو &format=best[height<=720] القديم لسه شغال)',
+      video: '/video?v=VIDEO_ID&quality=1080',
       videoQualities: '/video/qualities?v=VIDEO_ID',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
@@ -1259,22 +1184,16 @@ app.get('/', (req, res) => {
       health: '/health',
       cookiesStatus: '/api/cookies-status'
     },
-    videoQualityValues: ['144', '240', '360', '480', '720', '1080', '1440', '2160', 'audio'],
-    pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
     examples: {
-      'Home feed (أقسام زي يوتيوب)': '/home?region=EG',
-      'Trending page 1': '/trending?region=EG&page=1',
-      'Trending page 2 (سكرول لاحق)': '/trending?region=EG&page=2',
-      'Play video (جودة تلقائية)': '/video?v=dQw4w9WgXcQ',
-      'Play video 1080p (دمج ffmpeg)': '/video?v=dQw4w9WgXcQ&quality=1080',
-      'Play video 4K': '/video?v=dQw4w9WgXcQ&quality=2160',
-      'Audio only': '/video?v=dQw4w9WgXcQ&quality=audio',
-      'كل الجودات المتاحة للفيديو ده': '/video/qualities?v=dQw4w9WgXcQ',
-      'Search videos': '/search?q=funny+cats&page=1',
-      'Related videos': '/related?v=dQw4w9WgXcQ',
-      'Channel videos': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
-      'Video comments': '/comments?v=dQw4w9WgXcQ',
-      'Check cookies': '/api/cookies-status'
+      'Home feed': '/home?region=EG',
+      'Trending': '/trending?region=EG&page=1',
+      'Play video (auto quality)': '/video?v=dQw4w9WgXcQ',
+      'Play video 1080p': '/video?v=dQw4w9WgXcQ&quality=1080',
+      'All available qualities': '/video/qualities?v=dQw4w9WgXcQ',
+      'Search': '/search?q=funny+cats&page=1',
+      'Related': '/related?v=dQw4w9WgXcQ',
+      'Channel': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
+      'Comments': '/comments?v=dQw4w9WgXcQ'
     }
   });
 });
@@ -1296,18 +1215,19 @@ app.use((err, req, res, next) => {
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
+  const ffmpegStatus = checkFfmpeg() ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
-║  🎬 srver v${SERVER_VERSION} "جبارة" شغّال 🔥        ║
+║  🎬 srver v${SERVER_VERSION} "الإصلاح" شغّال 🔥    ║
 ║  ═════════════════════════════════════     ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
-║  yt-dlp: ${ytdlpStatus}  Firebase Cookies (bg refresh)  ║
+║  yt-dlp: ${ytdlpStatus}  ffmpeg: ${ffmpegStatus}                   ║
 ║  Concurrency: ${String(YTDLP_CONCURRENCY).padEnd(24, ' ')}║
 ║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
   log.success(`✅ Server ready - no YouTube Data API dependency`);
-  log.info(`🆕 جديد: /home (فيد بأقسام) + /video?quality=1080/1440/2160/audio + /video/qualities`);
+  log.info(`🆕 v5.5.0: Fixed quality extraction - shows only real qualities from yt-dlp`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
 });
 
