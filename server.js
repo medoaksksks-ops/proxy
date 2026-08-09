@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '5.3.0';
+const SERVER_VERSION = '5.4.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -150,7 +150,7 @@ async function updateYtDlp() {
   try {
     log.info('🔄 جاري التأكد من تحديث yt-dlp...');
     const { stdout } = await execFileAsync('pip3', [
-      'install', '--break-system-packages', '--no-cache-dir', '--upgrade', 'yt-dlp'
+      'install', '--break-system-packages', '--no-cache-dir', '--upgrade', 'yt-dlp[default]'
     ], { timeout: 120000 });
     const alreadyLatest = /already up-to-date|already satisfied/i.test(stdout);
     if (alreadyLatest) {
@@ -189,11 +189,27 @@ function sanitizeFilename(name) {
  * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
+/**
+ * إعدادات ثابتة بتتحط مع كل استدعاء لـ yt-dlp — يوتيوب في 2026 بدأ يفرض
+ * بروتوكول SABR وبيطلب "PO Token" لمعظم الفورمات على الـ client الافتراضي
+ * (web)، وده بيخلي yt-dlp يرجّع "Requested format is not available" حتى
+ * لو الكوكيز والنسخة سليمين 100%. الحل المعروف من فريق yt-dlp نفسه:
+ * - نستخدم clients تانية (android/ios/tv) لسه مش متأثرة بنفس القوة.
+ * - نسمح صراحةً بالفورمات اللي ناقصها PO token بدل ما نرفضها تمامًا
+ *   (ممكن تفشل أحيانًا بـ 403، بس أحسن من "مفيش فورمات خالص").
+ * - نستخدم Node.js (المتاح أصلًا في صورة الداكر) كـ JS runtime لحل أي
+ *   "تحديات جافاسكريبت" (challenges) يوتيوب بيطلبها.
+ */
+const YTDLP_EXTRA_ARGS = [
+  '--extractor-args', 'youtube:player_client=android,ios,tv,web;formats=missing_pot',
+  '--js-runtimes', 'node'
+];
+
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...finalArgs], {
+    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...YTDLP_EXTRA_ARGS, ...finalArgs], {
       timeout,
       maxBuffer,
       encoding: 'utf-8'
