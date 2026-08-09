@@ -7,9 +7,15 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     wget \
     ca-certificates \
-    && pip3 install --break-system-packages --no-cache-dir yt-dlp \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# ضروري: بنحط ARG بتاريخ البناء عشان نكسر الـ Docker layer cache بتاع سطر
+# تثبيت yt-dlp في كل مرة نعمل فيها build جديد — من غير السطر ده، Railway
+# ممكن يفضل مستخدم نفس نسخة yt-dlp القديمة المخزّنة (cached) للأبد حتى لو
+# عدّلنا كود السيرفر بس، ويوتيوب بيغيّر شكله باستمرار فده بيكسر التشغيل.
+ARG CACHEBUST=1
+RUN pip3 install --break-system-packages --no-cache-dir --upgrade yt-dlp
 
 # Working directory
 WORKDIR /app
