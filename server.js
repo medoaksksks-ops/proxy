@@ -55,6 +55,7 @@ const failureCache = new NodeCache({ stdTTL: 20 });         // 20 seconds
 
 // Track in-flight format extractions to avoid duplicate yt-dlp calls
 const inFlightFormats = new Map();
+const inFlightUrls = new Map();
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
@@ -346,9 +347,22 @@ async function getFormatMetadata(videoId) {
  * بيرجع واحد أو أكتر من الروابط (فيديو، صوت، أو مدمج)
  */
 async function getFormatUrls(videoId, formatSelector) {
-  const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
-  const urls = stdout.trim().split('\n').filter(Boolean);
-  return urls;
+  const cacheKey = `url_${videoId}_${formatSelector}`;
+  const cached = streamCache.get(cacheKey);
+  if (cached) return Array.isArray(cached) ? cached : [cached];
+  if (inFlightUrls.has(cacheKey)) return inFlightUrls.get(cacheKey);
+
+  const promise = (async () => {
+    const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
+    const urls = stdout.trim().split(/\r?\n/).filter(Boolean);
+    if (!urls.length) throw new Error('yt-dlp returned no media URLs');
+    streamCache.set(cacheKey, urls);
+    return urls;
+  })();
+
+  inFlightUrls.set(cacheKey, promise);
+  try { return await promise; }
+  finally { inFlightUrls.delete(cacheKey); }
 }
 
 /**
@@ -543,24 +557,36 @@ async function searchVideos(query, limit = 10) {
 }
 
 async function getRelatedVideos(videoId, limit = 10) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-  log.info(`🧭 Fetching related videos for: ${videoId} (limit ${limit})`);
+  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 30);
+  log.info(`🧭 Fetching related videos for: ${videoId} (limit ${safeLimit})`);
+  const items = [];
+  const seen = new Set([videoId]);
+  const addUnique = (list = []) => {
+    for (const v of list) {
+      if (!v || !v.id || seen.has(v.id)) continue;
+      seen.add(v.id);
+      items.push(v);
+      if (items.length >= safeLimit) break;
+    }
+  };
 
-  let items = [];
   try {
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--yes-playlist', '--playlist-end', String(limit + 1), url]);
-    items = parseFlatItems(stdout, videoId);
+    const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+    const stdout = await runYtDlp(['--dump-json','--flat-playlist','--yes-playlist','--playlist-end',String(safeLimit + 3),url]);
+    addUnique(filterUnwanted(parseFlatItems(stdout, videoId)));
   } catch (e) {
     log.warn(`Flat related fetch failed: ${e.message}`);
   }
 
-  if (items.length === 0) {
-    log.warn('⚠️  Flat related empty, retrying with full extraction...');
-    const stdout = await runYtDlp(['--dump-json', '--yes-playlist', '--playlist-end', String(limit + 1), '--skip-download', url]);
-    items = parseFlatItems(stdout, videoId);
+  if (items.length < safeLimit) {
+    try {
+      const fallback = await getRecommendedVideos('EG', Math.max(safeLimit * 2, 20));
+      addUnique(fallback?.items || []);
+    } catch (e) {
+      log.warn(`Recommended fallback failed: ${e.message}`);
+    }
   }
-
-  return items.slice(0, limit);
+  return items.slice(0, safeLimit);
 }
 
 const FOLLOWED_CREATORS = [
@@ -992,6 +1018,48 @@ app.get('/comments', async (req, res) => {
  * 3. Try Progressive format first (direct stream, no FFmpeg)
  * 4. Fallback to separate video+audio (FFmpeg merge)
  */
+app.head('/video', async (req, res) => {
+  const { v: videoId, quality } = req.query;
+  if (!videoId || !isValidVideoId(videoId)) return res.status(400).end();
+  try {
+    const resolved = resolveQuality(quality);
+    if (!resolved) return res.status(200).end();
+    const qCacheKey = `stream_q_${videoId}_${quality}`;
+    let url = streamCache.get(qCacheKey);
+    if (!url) {
+      const metadata = await getFormatMetadata(videoId);
+      let formatId = resolved.type === 'audio' ? null : selectProgressiveFormat(metadata, resolved.height);
+      if (!formatId && resolved.type !== 'audio') {
+        const pair = selectSeparateFormats(metadata, resolved.height);
+        if (pair) formatId = pair.join('+');
+      }
+      if (resolved.type === 'audio') {
+        const audioId = (metadata.audioOnlyFormats || [])[0];
+        if (audioId) {
+          const urls = await getFormatUrls(videoId, audioId);
+          url = urls[0];
+        }
+      } else if (formatId) {
+        const urls = await getFormatUrls(videoId, formatId);
+        url = urls[0];
+      }
+    }
+    if (!url) return res.status(200).end();
+    const upstream = await new Promise((resolve, reject) => {
+      const r = https.get(url, { headers: req.headers.range ? { Range: req.headers.range } : {}, timeout: 10000, agent: keepAliveAgent }, resolve);
+      r.on('error', reject);
+    });
+    for (const h of ['content-type','content-length','content-range','accept-ranges','etag','last-modified']) {
+      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+    }
+    upstream.resume();
+    return res.status(upstream.statusCode || 200).end();
+  } catch (e) {
+    log.warn(`HEAD /video failed: ${e.message}`);
+    return res.status(200).end();
+  }
+});
+
 app.get('/video', async (req, res) => {
   const startTime = Date.now();
   const { v: videoId, format = 'best[height<=720]', quality } = req.query;
