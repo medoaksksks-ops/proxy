@@ -207,10 +207,9 @@ function sanitizeFilename(name) {
  *    يسمح بكوكيز على الـ clients دي)، فمفيش أي فايدة نحطهم في القايمة.
  */
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
+  '--remote-components', 'ejs:github',
   '--js-runtimes', 'node'
 ];
-
 let lastStderrLogTs = 0;
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
   await ytdlpLimiter.acquire();
