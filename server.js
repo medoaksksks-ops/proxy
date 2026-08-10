@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '5.5.0';
+const SERVER_VERSION = '5.6.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -55,6 +55,12 @@ const infoCache = new NodeCache({ stdTTL: 7200 });          // معلومات ف
 const trendingCache = new NodeCache({ stdTTL: 1200 });      // الرائج: 20 دقيقة
 const streamCache = new NodeCache({ stdTTL: 240 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
 const channelCache = new NodeCache({ stdTTL: 3600 });       // بيانات وفيديوهات القنوات: ساعة
+// لما فيديو معيّن بجودة معيّنة يفشل، بنحفظ الفشل ده لمدة قصيرة عشان لو
+// المتصفح حاول تاني بسرعة (زي ما بيحصل طبيعي مع fallback بين الجودات) نرجّع
+// نفس الخطأ فورًا من غير ما نعيد مناداة yt-dlp تاني — ده بيمنع "عاصفة
+// إعادة المحاولة" اللي بتغرق اللوج (Railway rate limit) وبيقلل الضغط على
+// يوتيوب نفسه (اللي ممكن يشدّد الحظر لو حسّ بطلبات متكررة بسرعة)
+const failureCache = new NodeCache({ stdTTL: 20 });
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
@@ -205,24 +211,28 @@ const YTDLP_EXTRA_ARGS = [
   '--js-runtimes', 'node'
 ];
 
+let lastStderrLogTs = 0;
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    // ملحوظة: شلنا --no-warnings عمدًا — رسائل الـ WARNING من yt-dlp هي اللي
-    // بتوضح السبب الحقيقي (PO Token ناقص، JS solver فشل، إلخ)، وكانت مختفية
-    // تمامًا وده كان بيصعّب التشخيص. أي WARNING هتظهر دلوقتي في اللوج.
     const { stdout, stderr } = await execFileAsync('yt-dlp', [...YTDLP_EXTRA_ARGS, ...finalArgs], {
       timeout,
       maxBuffer,
       encoding: 'utf-8'
     });
-    if (stderr && stderr.trim()) log.warn(`yt-dlp stderr: ${stderr.trim().slice(0, 500)}`);
+    // بنطبع الـ warnings بس مرة كل 10 ثواني كحد أقصى (مش مع كل طلب) عشان
+    // منغرقش اللوج — نفس السبب غالبًا بيتكرر مع كل الطلبات المتشابهة
+    if (stderr && stderr.trim() && Date.now() - lastStderrLogTs > 10000) {
+      lastStderrLogTs = Date.now();
+      log.warn(`yt-dlp stderr (نموذج، هيتكرر مش هنطبعه كل مرة): ${stderr.trim().slice(0, 300)}`);
+    }
     return stdout;
   } catch (e) {
-    // بنضمن إن أي رسالة خطأ فيها تفاصيل الـ stderr كاملة، مش بس "Command failed"
+    // بنضمن إن رسالة الخطأ فيها أهم سطر من الـ stderr بس (مش كل حاجة)
     if (e.stderr && !e.message.includes(e.stderr.trim().slice(0, 30))) {
-      e.message = `${e.message}\n${e.stderr}`;
+      const shortStderr = e.stderr.trim().split('\n').slice(-2).join(' | ').slice(0, 250);
+      e.message = `${e.message.split('\n')[0]} :: ${shortStderr}`;
     }
     throw e;
   } finally {
@@ -906,6 +916,18 @@ app.get('/video', async (req, res) => {
   const resolved = resolveQuality(quality);
   if (resolved) {
     const qCacheKey = `stream_q_${videoId}_${quality}`;
+    const failKey = `fail_${videoId}_${quality}`;
+    // لو نفس الفيديو/الجودة فشل قبل كده من ثوانٍ، رجّع نفس الخطأ فورًا من
+    // غير ما نعيد مناداة yt-dlp — ده بيقفل "عاصفة إعادة المحاولة" اللي
+    // ممكن المتصفح يعملها (تجربة كل جودة واحدة ورا التانية بسرعة) وبتغرق
+    // اللوج وتحمّل السيرفر ويوتيوب من غير أي فايدة حقيقية
+    const recentFailure = failureCache.get(failKey);
+    if (recentFailure) {
+      return res.status(503).json({
+        error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة (فشلت من ثوانٍ، بنستنى شوية قبل ما نعيد المحاولة)',
+        details: NODE_ENV === 'development' ? recentFailure : undefined
+      });
+    }
     try {
       let urls = streamCache.get(qCacheKey);
       if (urls) {
@@ -924,6 +946,7 @@ app.get('/video', async (req, res) => {
       if (resolved.type === 'audio') return streamFromUpstream(req, res, urls[0]);
       return streamMergedViaFfmpeg(req, res, urls[0], urls[1] || null);
     } catch (error) {
+      failureCache.set(failKey, error.message);
       log.error(`Error fetching quality ${quality}: ${error.message}`);
       if (!res.headersSent) {
         return res.status(500).json({
