@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:22-slim
 
 # Install system packages
 RUN apt-get update && apt-get install -y \
@@ -10,12 +10,15 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ضروري: بنحط ARG بتاريخ البناء عشان نكسر الـ Docker layer cache بتاع سطر
-# تثبيت yt-dlp في كل مرة نعمل فيها build جديد — من غير السطر ده، Railway
-# ممكن يفضل مستخدم نفس نسخة yt-dlp القديمة المخزّنة (cached) للأبد حتى لو
-# عدّلنا كود السيرفر بس، ويوتيوب بيغيّر شكله باستمرار فده بيكسر التشغيل.
+# Force a fresh yt-dlp/EJS installation on every build
 ARG CACHEBUST=1
-RUN pip3 install --break-system-packages --no-cache-dir --upgrade "yt-dlp[default]" yt-dlp-ejs
+
+RUN pip3 install \
+    --break-system-packages \
+    --no-cache-dir \
+    --upgrade \
+    "yt-dlp[default]" \
+    yt-dlp-ejs
 
 # Working directory
 WORKDIR /app
@@ -31,6 +34,7 @@ COPY . .
 
 # Railway Port
 ENV PORT=3000
+
 EXPOSE 3000
 
 # Health Check
