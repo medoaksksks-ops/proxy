@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '5.0.0';
+const SERVER_VERSION = '5.5.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -137,6 +137,34 @@ async function refreshCookies() {
 refreshCookies();
 setInterval(refreshCookies, 5 * 60 * 1000);
 
+/**
+ * ==========================================================================
+ * تحديث yt-dlp تلقائيًا — يوتيوب بيغيّر طريقة تشفير الفيديوهات باستمرار،
+ * ولو نسخة yt-dlp قديمة بتوقف تقرأ الفورمات فجأة ("Requested format is
+ * not available") لحد ما حد يحدّثها. بدل ما نستنى deploy جديد (اللي ممكن
+ * برضو يستخدم نسخة قديمة متخزّنة في كاش الداكر)، بنحدّثها من جوّه السيرفر
+ * نفسه أول ما يشتغل، وبعدين كل 12 ساعة تلقائيًا.
+ * ==========================================================================
+ */
+async function updateYtDlp() {
+  try {
+    log.info('🔄 جاري التأكد من تحديث yt-dlp...');
+    const { stdout } = await execFileAsync('pip3', [
+      'install', '--break-system-packages', '--no-cache-dir', '--upgrade', 'yt-dlp[default]', 'yt-dlp-ejs'
+    ], { timeout: 120000 });
+    const alreadyLatest = /already up-to-date|already satisfied/i.test(stdout);
+    if (alreadyLatest) {
+      log.info('✅ yt-dlp أصلًا أحدث نسخة');
+    } else {
+      log.success('✅ تم تحديث yt-dlp لأحدث نسخة');
+    }
+  } catch (e) {
+    log.error(`فشل تحديث yt-dlp: ${e.message}`);
+  }
+}
+updateYtDlp();
+setInterval(updateYtDlp, 12 * 60 * 60 * 1000);
+
 // Check if yt-dlp is installed
 function checkYtDlp() {
   try {
@@ -161,16 +189,42 @@ function sanitizeFilename(name) {
  * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
+/**
+ * إعدادات ثابتة بتتحط مع كل استدعاء لـ yt-dlp — يوتيوب في 2026 بدأ يفرض
+ * بروتوكول SABR وبيطلب "PO Token" لمعظم الفورمات، وده بيخلي yt-dlp يرجّع
+ * "Requested format is not available" حتى لو الكوكيز والنسخة سليمين 100%.
+ *
+ * من اللوج الحقيقي اللي شفناه، طلعت حقيقتين مهمين:
+ * 1) الـ clients اللي محتاجين "n challenge" (تحدي جافاسكريبت) بتفشل لأن
+ *    سكريبت الحل (yt-dlp-ejs) مكنش متثبّت فعليًا رغم إننا طلبنا [default].
+ * 2) android/ios بيتشالوا تلقائيًا وقت ما بنبعت --cookies (يوتيوب معمرش
+ *    يسمح بكوكيز على الـ clients دي)، فمفيش أي فايدة نحطهم في القايمة.
+ */
+const YTDLP_EXTRA_ARGS = [
+  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
+  '--js-runtimes', 'node'
+];
+
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...finalArgs], {
+    // ملحوظة: شلنا --no-warnings عمدًا — رسائل الـ WARNING من yt-dlp هي اللي
+    // بتوضح السبب الحقيقي (PO Token ناقص، JS solver فشل، إلخ)، وكانت مختفية
+    // تمامًا وده كان بيصعّب التشخيص. أي WARNING هتظهر دلوقتي في اللوج.
+    const { stdout, stderr } = await execFileAsync('yt-dlp', [...YTDLP_EXTRA_ARGS, ...finalArgs], {
       timeout,
       maxBuffer,
       encoding: 'utf-8'
     });
+    if (stderr && stderr.trim()) log.warn(`yt-dlp stderr: ${stderr.trim().slice(0, 500)}`);
     return stdout;
+  } catch (e) {
+    // بنضمن إن أي رسالة خطأ فيها تفاصيل الـ stderr كاملة، مش بس "Command failed"
+    if (e.stderr && !e.message.includes(e.stderr.trim().slice(0, 30))) {
+      e.message = `${e.message}\n${e.stderr}`;
+    }
+    throw e;
   } finally {
     ytdlpLimiter.release();
   }
@@ -204,6 +258,34 @@ function parseFlatItems(raw, excludeId) {
       return mapFlatEntry(item, excludeId);
     })
     .filter(Boolean);
+}
+
+/**
+ * ==========================================================================
+ * فلتر محتوى غير مرغوب فيه — بيستبعد فيديوهات الأطفال/الكرتون ومحتوى الطبخ
+ * من "المقترحات" و"الهوم فيد" و"الترند" بس (مش من البحث الصريح أو القنوات
+ * أو related لفيديو معيّن اختاره المستخدم بنفسه — لو المستخدم دور بايده على
+ * "وصفات طبخ" مثلًا من الشيبس، ده اختياره وهيتنفّذ عادي).
+ * ==========================================================================
+ */
+const UNWANTED_KEYWORDS = [
+  // أطفال / كرتون
+  'كرتون', 'رسوم متحركة', 'للأطفال', 'اطفال', 'أطفال', 'بيبي', 'بيبى', 'روضة',
+  'حضانة', 'قصص اطفال', 'قصص أطفال', 'اغاني اطفال', 'أغاني أطفال', 'العاب اطفال',
+  'ألعاب أطفال', 'تعليم اطفال', 'تعليم أطفال', 'انمي اطفال', 'مسلسل كرتون',
+  'cartoon', 'kids', 'for kids', 'nursery rhyme', 'nursery rhymes', 'cocomelon',
+  'baby shark', 'peppa pig', 'toddler', 'preschool', 'children song',
+  // طبخ / وصفات
+  'وصفة', 'وصفات', 'طبخ', 'طبخة', 'طريقة عمل', 'حلويات', 'أكلة', 'اكلة',
+  'مطبخ', 'شيف', 'recipe', 'cooking', 'kitchen'
+];
+function isUnwantedContent(title) {
+  if (!title) return false;
+  const t = title.toLowerCase();
+  return UNWANTED_KEYWORDS.some(k => t.includes(k.toLowerCase()));
+}
+function filterUnwanted(items) {
+  return items.filter(v => !isUnwantedContent(v.title));
 }
 
 /**
@@ -284,30 +366,83 @@ async function getRelatedVideos(videoId, limit = 10) {
 }
 
 /**
+ * ==========================================================================
+ * القنوات/المبدعين المفضّلين — المحتوى المقترح بيدّي لهم أولوية قبل أي
+ * حاجة تانية (ترند عام أو مواضيع عشوائية). دول أسماء حقيقية اختارها
+ * صاحب الموقع، فبنبحث باسم كل واحد فيهم على يوتيوب ونجيب أحدث فيديوهاته.
+ * ==========================================================================
+ */
+const FOLLOWED_CREATORS = [
+  'كامل العربي',
+  'اوشا',
+  'صلاح القصة وما فيها',
+  'سامح سند',
+  'بدر العلوي',
+  'ابو الصادق',
+  'مستر محمد ايمن الجوهري',
+  'مستر محمد صلاح مدرس لغة انجليزية', // بإضافة "مستر/مدرس" عشان مايتلخبطش مع لاعب الكورة
+  'مستر محمد عبدالمعبود',
+  'مستر رضا الفاروق',
+  'انجلشاوي',
+  'عبقري لغة خالد صقر',
+  'قناة توست',
+  'كوتش الغلابة'
+];
+
+async function getFollowedCreatorsPool(perCreator = 4) {
+  const settled = await Promise.allSettled(
+    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearch${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
+  );
+  const pool = [];
+  settled.forEach((r, i) => {
+    if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
+    else log.warn(`Followed creator fetch failed "${FOLLOWED_CREATORS[i]}": ${r.reason?.message}`);
+  });
+  return pool;
+}
+
+/**
  * جلب محتوى عام متنوع للاستخدام كـ fallback لما مفيش تاريخ مشاهدة كفاية
  * عند المستخدم بعد (مستخدم جديد مثلًا). الشخصنة الحقيقية بتحصل في المتصفح
  * نفسه (client-side) عن طريق جلب "فيديوهات متشابهة" لآخر حاجات المستخدم
  * اتفرج عليها فعليًا — مش هنا في السيرفر، لأن صفحة يوتيوب الرئيسية
  * الشخصية (Home feed) مش endpoint مدعوم بشكل موثوق في yt-dlp، وتبويب
  * "الرائج" (Trending) نفسه ثابت وواحد لكل الناس بغض النظر عن الكوكيز.
+ *
+ * الأولوية دلوقتي: فيديوهات القنوات المفضّلة (FOLLOWED_CREATORS) أولًا،
+ * وبعدين الترند العام، وبعدين مواضيع عشوائية — بس لو لسه ناقص عدد.
  */
 async function getRecommendedVideos(region = 'EG', limit = 20) {
   let items = [];
-
-  try {
-    const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-    const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit), url]);
-    items = parseFlatItems(stdout);
-  } catch (e) {
-    log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
+  const seen = new Set();
+  function addUnique(list) {
+    list.forEach(v => { if (v && v.id && !seen.has(v.id)) { seen.add(v.id); items.push(v); } });
   }
 
-  if (items.length < 5) {
+  try {
+    const perCreator = Math.max(3, Math.ceil((limit * 1.4) / FOLLOWED_CREATORS.length));
+    const creatorsPool = await getFollowedCreatorsPool(perCreator);
+    addUnique(creatorsPool.sort(() => Math.random() - 0.5));
+  } catch (e) {
+    log.warn(`Followed creators pool failed: ${e.message}`);
+  }
+
+  if (items.length < limit) {
+    try {
+      const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
+      const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit * 2), url]);
+      addUnique(filterUnwanted(parseFlatItems(stdout)));
+    } catch (e) {
+      log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
+    }
+  }
+
+  if (items.length < limit) {
     const topicPool = [
       'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
       'بودكاست عربي', 'أفلام كوميدي مصرية', 'مسلسلات رمضان', 'تكنولوجيا وتقنية',
-      'وصفات طبخ سريعة', 'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة',
-      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس'
+      'ألعاب فيديو', 'سيارات ومحركات', 'سفر وسياحة', 'كورة أهداف دوري أبطال أوروبا',
+      'علوم وتاريخ', 'موسيقى عربي مختلط', 'تمثيليات وكواليس', 'أفلام أكشن مترجمة'
     ];
     const shuffled = topicPool.sort(() => Math.random() - 0.5).slice(0, 5);
     const perQuery = Math.max(10, Math.ceil(limit / shuffled.length) + 5);
@@ -318,13 +453,10 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
     );
     const pool = [];
     settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') pool.push(...parseFlatItems(r.value));
+      if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
       else log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`);
     });
-    const seen = new Set();
-    items = pool
-      .filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; })
-      .sort(() => Math.random() - 0.5);
+    addUnique(pool.sort(() => Math.random() - 0.5));
   }
 
   return { items: items.slice(0, limit), personalized: false };
@@ -361,11 +493,11 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
       let items;
       if (section.key === 'trending') {
         const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-        const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection), url]);
-        items = parseFlatItems(stdout);
+        const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection * 2), url]);
+        items = filterUnwanted(parseFlatItems(stdout)).slice(0, perSection);
       } else {
-        const stdout = await runYtDlp([`ytsearch${perSection}:${section.query}`, '--dump-json', '--flat-playlist']);
-        items = parseFlatItems(stdout);
+        const stdout = await runYtDlp([`ytsearch${perSection * 2}:${section.query}`, '--dump-json', '--flat-playlist']);
+        items = filterUnwanted(parseFlatItems(stdout)).slice(0, perSection);
       }
       return { key: section.key, title: section.title, items };
     } catch (e) {
@@ -694,15 +826,18 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
 
 // ==========================================================================
 // نظام "كل الجودات" — 144p لحد 4K + صوت لوحده
-// - الجودات لحد 720p غالبًا بتكون progressive (فيديو+صوت في رابط واحد)
-//   فبنستخدم نفس مسار البروكسي المباشر (streamFromUpstream) وده الأسرع.
-// - الجودات الأعلى (1080p, 1440p, 4K) عادةً مفيش ليها progressive على
-//   يوتيوب، فبنجيب رابط الفيديو ورابط الصوت لوحدهم وندمجهم لحظيًا بـ ffmpeg
-//   (-c copy يعني نسخ بدون إعادة ترميز، سريع وموفّر معالج) ونبعتهم كـ stream
-//   واحد للمتصفح من غير ما نخزّن أي ملف على القرص.
+// - قبل كده كنا بنحاول نستخدم "progressive" (رابط واحد فيه فيديو+صوت مع بعض)
+//   للجودات لحد 720p، بس ده كان بيسبب مشكلة: يوتيوب فعليًا مش بيوفّر روابط
+//   progressive إلا على ارتفاع واحد أو اتنين بس (غالبًا 360p)، فلما نطلب
+//   144/240/480/720 وما فيش progressive عليها، الفولباك "/best" كان بيتجاهل
+//   الارتفاع المطلوب تمامًا ويرجّع نفس الفيديو الافتراضي كل مرة (ده اللي كان
+//   بيخلي كل الجودات من 144 لحد 720 شكلها واحد بالظبط).
+// - الحل: كل الجودات (من 144 لحد 4K) بقت بتاخد نفس مسار الدمج الموثوق:
+//   bestvideo[height<=H] (ده موجود فعليًا على كل الارتفاعات القياسية على
+//   يوتيوب) + bestaudio، ودمجهم لحظيًا بـ ffmpeg (-c copy = نسخ بدون إعادة
+//   ترميز، سريع وموفّر معالج) من غير ما نخزّن أي ملف على القرص.
 // ==========================================================================
 const QUALITY_HEIGHTS = { '2160': 2160, '4k': 2160, '1440': 1440, '2k': 1440, '1080': 1080, '720': 720, '480': 480, '360': 360, '240': 240, '144': 144 };
-const PROGRESSIVE_MAX_HEIGHT = 720; // فوق كده يوتيوب مبيدّيش progressive عادةً
 
 function resolveQuality(quality) {
   if (!quality) return null;
@@ -710,7 +845,7 @@ function resolveQuality(quality) {
   if (q === 'audio') return { type: 'audio' };
   const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
   if (!height || Number.isNaN(height)) return null;
-  return { type: height <= PROGRESSIVE_MAX_HEIGHT ? 'progressive' : 'merge', height };
+  return { type: 'merge', height };
 }
 
 /** بيرجع رابط أو رابطين (فيديو + صوت) حسب الفورمات المطلوب */
@@ -772,22 +907,19 @@ app.get('/video', async (req, res) => {
   if (resolved) {
     const qCacheKey = `stream_q_${videoId}_${quality}`;
     try {
-      if (resolved.type === 'progressive') {
-        const cachedUrl = streamCache.get(qCacheKey);
-        if (cachedUrl) { log.info(`📦 Stream from cache: ${videoId} (${quality})`); return streamFromUpstream(req, res, cachedUrl); }
-        const streamUrl = await getVideoStreamUrl(videoId, `best[height<=${resolved.height}]/best`);
-        if (!streamUrl) throw new Error('Failed to get stream URL');
-        streamCache.set(qCacheKey, streamUrl);
-        log.success(`▶️  Streaming (progressive ${quality}): ${videoId}`);
-        return streamFromUpstream(req, res, streamUrl);
+      let urls = streamCache.get(qCacheKey);
+      if (urls) {
+        log.info(`📦 Format URLs from cache: ${videoId} (${quality})`);
+      } else {
+        // جودة فيديو (أي ارتفاع) أو صوت لوحده → دمج/بث لحظي بـ ffmpeg، ده
+        // بيضمن إن كل جودة فعلًا مختلفة عن التانية (مش نفس الفيديو دايمًا)
+        const selector = resolved.type === 'audio'
+          ? 'bestaudio/best'
+          : `bestvideo[height<=${resolved.height}]+bestaudio/best[height<=${resolved.height}]/best`;
+        urls = await getFormatUrls(videoId, selector);
+        if (!urls.length) throw new Error('Failed to get stream URLs');
+        streamCache.set(qCacheKey, urls);
       }
-
-      // جودة عالية أو صوت لوحده → دمج/بث لحظي بـ ffmpeg
-      const selector = resolved.type === 'audio'
-        ? 'bestaudio/best'
-        : `bestvideo[height<=${resolved.height}]+bestaudio/best[height<=${resolved.height}]`;
-      const urls = await getFormatUrls(videoId, selector);
-      if (!urls.length) throw new Error('Failed to get stream URLs');
       log.success(`▶️  Streaming (merged/ffmpeg ${quality}): ${videoId}`);
       if (resolved.type === 'audio') return streamFromUpstream(req, res, urls[0]);
       return streamMergedViaFfmpeg(req, res, urls[0], urls[1] || null);
@@ -976,7 +1108,7 @@ app.get('/video/qualities', async (req, res) => {
     const qualities = uniqueAvailable.map(h => ({
       label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
       quality: String(h),
-      type: h <= PROGRESSIVE_MAX_HEIGHT ? 'progressive' : 'merged (ffmpeg)',
+      type: 'merged (ffmpeg)',
       url: `/video?v=${videoId}&quality=${h}`
     }));
     qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
@@ -1001,6 +1133,8 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'operational',
     version: SERVER_VERSION,
+    ytdlpVersion: (() => { try { return require('child_process').execSync('yt-dlp --version', { encoding: 'utf-8' }).trim(); } catch { return 'unknown'; } })(),
+    ejsReady: (() => { try { require('child_process').execSync('python3 -c "import yt_dlp_ejs"', { stdio: 'ignore' }); return true; } catch { return false; } })(),
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
