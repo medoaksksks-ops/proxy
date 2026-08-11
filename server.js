@@ -15,13 +15,24 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '5.7.1';
+const SERVER_VERSION = '5.8.0-fast';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 const execFileAsync = promisify(execFile);
 
 const app = express();
+let server;
+app.use((req,res,next)=>{
+  const rid=requestId(); req.requestId=rid; metrics.requests++; res.setHeader('X-Request-ID',rid);
+  const started=process.hrtime.bigint();
+  res.on('finish',()=>{
+    const ms=Number(process.hrtime.bigint()-started)/1e6;
+    if(ms>1500) log.warn(`🐢 ${req.method} ${req.originalUrl} ${res.statusCode} ${ms.toFixed(0)}ms [${rid}]`);
+  });
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -55,7 +66,6 @@ const failureCache = new NodeCache({ stdTTL: 20 });         // 20 seconds
 
 // Track in-flight format extractions to avoid duplicate yt-dlp calls
 const inFlightFormats = new Map();
-const inFlightUrls = new Map();
 
 const TIMEOUT = 60000;
 const MAX_RETRIES = 3;
@@ -177,6 +187,7 @@ const YTDLP_EXTRA_ARGS = [
 
 let lastStderrLogTs = 0;
 async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
+  metrics.ytDlpRuns++;
   await ytdlpLimiter.acquire();
   try {
     const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
@@ -347,22 +358,9 @@ async function getFormatMetadata(videoId) {
  * بيرجع واحد أو أكتر من الروابط (فيديو، صوت، أو مدمج)
  */
 async function getFormatUrls(videoId, formatSelector) {
-  const cacheKey = `url_${videoId}_${formatSelector}`;
-  const cached = streamCache.get(cacheKey);
-  if (cached) return Array.isArray(cached) ? cached : [cached];
-  if (inFlightUrls.has(cacheKey)) return inFlightUrls.get(cacheKey);
-
-  const promise = (async () => {
-    const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
-    const urls = stdout.trim().split(/\r?\n/).filter(Boolean);
-    if (!urls.length) throw new Error('yt-dlp returned no media URLs');
-    streamCache.set(cacheKey, urls);
-    return urls;
-  })();
-
-  inFlightUrls.set(cacheKey, promise);
-  try { return await promise; }
-  finally { inFlightUrls.delete(cacheKey); }
+  const stdout = await runYtDlp(['--get-url', '-f', formatSelector, `https://www.youtube.com/watch?v=${videoId}`]);
+  const urls = stdout.trim().split('\n').filter(Boolean);
+  return urls;
 }
 
 /**
@@ -556,37 +554,24 @@ async function searchVideos(query, limit = 10) {
   return parseFlatItems(stdout);
 }
 
-async function getRelatedVideos(videoId, limit = 10) {
-  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 30);
-  log.info(`🧭 Fetching related videos for: ${videoId} (limit ${safeLimit})`);
-  const items = [];
-  const seen = new Set([videoId]);
-  const addUnique = (list = []) => {
-    for (const v of list) {
-      if (!v || !v.id || seen.has(v.id)) continue;
-      seen.add(v.id);
-      items.push(v);
-      if (items.length >= safeLimit) break;
+async function getRelatedVideos(videoId, limit=10){
+  const n=Math.min(Math.max(parseInt(limit,10)||10,1),30);
+  const key=`related_pool_${videoId}_${n}`;
+  const cached=cacheGet(infoCache,key); if(cached) return cached;
+  return memoizeInflight(key,async()=>{
+    const seen=new Set([videoId]), items=[];
+    const add=list=>{for(const v of list||[]){if(!v?.id||seen.has(v.id))continue;seen.add(v.id);items.push(v);if(items.length>=n)break;}};
+    const url=`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
+    try{
+      const out=await withTimeout(runYtDlp(['--dump-json','--flat-playlist','--yes-playlist','--playlist-end',String(n+3),url]),25000,'related extraction');
+      add(filterUnwanted(parseFlatItems(out,videoId)));
+    }catch(e){log.warn(`Related primary failed: ${e.message}`);}
+    if(items.length<Math.min(5,n)){
+      try{add(await withTimeout(getRecommendedVideos('EG',Math.max(n*2,16)),30000,'recommendation fallback'));}
+      catch(e){log.warn(`Related fallback failed: ${e.message}`);}
     }
-  };
-
-  try {
-    const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-    const stdout = await runYtDlp(['--dump-json','--flat-playlist','--yes-playlist','--playlist-end',String(safeLimit + 3),url]);
-    addUnique(filterUnwanted(parseFlatItems(stdout, videoId)));
-  } catch (e) {
-    log.warn(`Flat related fetch failed: ${e.message}`);
-  }
-
-  if (items.length < safeLimit) {
-    try {
-      const fallback = await getRecommendedVideos('EG', Math.max(safeLimit * 2, 20));
-      addUnique(fallback?.items || []);
-    } catch (e) {
-      log.warn(`Recommended fallback failed: ${e.message}`);
-    }
-  }
-  return items.slice(0, safeLimit);
+    const result=items.slice(0,n); infoCache.set(key,result); return result;
+  });
 }
 
 const FOLLOWED_CREATORS = [
@@ -1018,48 +1003,6 @@ app.get('/comments', async (req, res) => {
  * 3. Try Progressive format first (direct stream, no FFmpeg)
  * 4. Fallback to separate video+audio (FFmpeg merge)
  */
-app.head('/video', async (req, res) => {
-  const { v: videoId, quality } = req.query;
-  if (!videoId || !isValidVideoId(videoId)) return res.status(400).end();
-  try {
-    const resolved = resolveQuality(quality);
-    if (!resolved) return res.status(200).end();
-    const qCacheKey = `stream_q_${videoId}_${quality}`;
-    let url = streamCache.get(qCacheKey);
-    if (!url) {
-      const metadata = await getFormatMetadata(videoId);
-      let formatId = resolved.type === 'audio' ? null : selectProgressiveFormat(metadata, resolved.height);
-      if (!formatId && resolved.type !== 'audio') {
-        const pair = selectSeparateFormats(metadata, resolved.height);
-        if (pair) formatId = pair.join('+');
-      }
-      if (resolved.type === 'audio') {
-        const audioId = (metadata.audioOnlyFormats || [])[0];
-        if (audioId) {
-          const urls = await getFormatUrls(videoId, audioId);
-          url = urls[0];
-        }
-      } else if (formatId) {
-        const urls = await getFormatUrls(videoId, formatId);
-        url = urls[0];
-      }
-    }
-    if (!url) return res.status(200).end();
-    const upstream = await new Promise((resolve, reject) => {
-      const r = https.get(url, { headers: req.headers.range ? { Range: req.headers.range } : {}, timeout: 10000, agent: keepAliveAgent }, resolve);
-      r.on('error', reject);
-    });
-    for (const h of ['content-type','content-length','content-range','accept-ranges','etag','last-modified']) {
-      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
-    }
-    upstream.resume();
-    return res.status(upstream.statusCode || 200).end();
-  } catch (e) {
-    log.warn(`HEAD /video failed: ${e.message}`);
-    return res.status(200).end();
-  }
-});
-
 app.get('/video', async (req, res) => {
   const startTime = Date.now();
   const { v: videoId, format = 'best[height<=720]', quality } = req.query;
@@ -1370,6 +1313,23 @@ app.get('/video/qualities', async (req, res) => {
 /**
  * GET /health
  */
+app.get('/api/metrics',(req,res)=>res.json({
+  ok:true,uptimeSeconds:Math.round((Date.now()-metrics.startedAt)/1000),
+  requests:metrics.requests,errors:metrics.errors,
+  cache:{hits:metrics.cacheHits,misses:metrics.cacheMisses},
+  ytDlpRuns:metrics.ytDlpRuns,streams:metrics.streams,bytesSent:metrics.bytesSent,
+  inflight:inflight.size,concurrency:{max:YTDLP_CONCURRENCY,current:ytdlpLimiter.current,queued:ytdlpLimiter.queue.length},
+  lastError:metrics.lastError
+}));
+app.get('/api/diagnostics',(req,res)=>res.json({
+  node:process.version,platform:process.platform,arch:process.arch,memory:process.memoryUsage(),
+  uptime:process.uptime(),env:NODE_ENV,cookiesReady,ytdlpReady:checkYtDlp(),metrics
+}));
+app.post('/api/cache/clear',(req,res)=>{
+  try{infoCache.clear?.();streamCache.clear?.();inflight.clear();res.json({ok:true});}
+  catch(e){publicError(res,500,'تعذّر مسح الـcache',e,req.requestId);}
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'operational',
@@ -1497,7 +1457,7 @@ app.use((err, req, res, next) => {
 // Server startup
 // ==========================================================================
 
-const server = app.listen(PORT, '0.0.0.0', () => {
+server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
