@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '5.8.0';
+const SERVER_VERSION = '5.9.0-speed';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -316,6 +316,43 @@ async function getVideoInfo(videoId) {
 }
 
 /**
+ * Fast path for common low/medium progressive qualities.
+ * This avoids parsing a full --dump-json response on the first play request.
+ */
+async function getFastProgressiveUrl(videoId, height) {
+  const h = Math.max(1, Number(height) || 0);
+  if (!h || h > 720) return null;
+  const key = `fast_progressive_${videoId}_${h}`;
+  const cached = streamCache.get(key);
+  if (cached) { metrics.cacheHits++; return cached; }
+  metrics.cacheMisses++;
+  if (inFlightUrls.has(key)) return inFlightUrls.get(key);
+
+  const promise = (async () => {
+    try {
+      const selector = `best[height<=${h}][vcodec!=none][acodec!=none]/best[height<=${h}]`;
+      const stdout = await runYtDlp([
+        '--get-url', '-f', selector,
+        `https://www.youtube.com/watch?v=${videoId}`
+      ], { timeout: 22000, maxBuffer: 1024 * 1024 * 2 });
+      const url = stdout.trim().split(/\r?\n/).filter(Boolean)[0];
+      if (url) {
+        streamCache.set(key, url);
+        return url;
+      }
+      return null;
+    } catch (e) {
+      log.warn(`Fast progressive lookup failed (${videoId}/${h}): ${e.message}`);
+      return null;
+    } finally {
+      inFlightUrls.delete(key);
+    }
+  })();
+  inFlightUrls.set(key, promise);
+  return promise;
+}
+
+/**
  * Get format metadata for a video (cached)
  * استخراج معلومات الـformats فقط بدون URL extraction
  */
@@ -343,10 +380,11 @@ async function getFormatMetadata(videoId) {
         title: info.title,
         duration: info.duration,
         hasProgressiveFormats: false,
-        progressiveFormats: [],  // format_id[]
-        videoOnlyFormats: {},     // height -> [format_id]
-        audioOnlyFormats: [],     // format_id[]
-        allFormats: formats
+        progressiveFormats: [],
+        videoOnlyFormats: {},
+        audioOnlyFormats: [],
+        allFormats: formats,
+        allHeights: []
       };
 
       // Analyze formats
@@ -368,7 +406,22 @@ async function getFormatMetadata(videoId) {
         }
       });
 
+      metadata.allHeights = [...new Set(
+        formats
+          .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+          .map(f => Number(f.height))
+      )].sort((a, b) => b - a);
+
       formatCache.set(cacheKey, metadata);
+
+      // Warm direct URLs for progressive formats so the first play after
+      // opening the quality menu does not have to invoke yt-dlp again.
+      const warm = metadata.progressiveFormats.slice(0, 12);
+      for (const fid of warm) {
+        const f = formats.find(x => String(x.format_id) === String(fid));
+        if (f?.url) streamCache.set(`urls_${videoId}_${fid}`, [f.url]);
+      }
+
       return metadata;
     } catch (e) {
       log.error(`Format metadata extraction failed: ${e.message}`);
@@ -422,17 +475,25 @@ async function getFormatUrls(videoId, formatSelector) {
  * بيرجع format_id أو null
  */
 function selectProgressiveFormat(metadata, requestedHeight) {
-  if (!metadata.hasProgressiveFormats || !metadata.progressiveFormats.length) return null;
   const formats = metadata.allFormats || [];
-  const candidates = metadata.progressiveFormats
-    .map(fid => formats.find(f => String(f.format_id) === String(fid)))
-    .filter(f => f && f.height && f.vcodec !== 'none' && f.acodec !== 'none');
-  if (!candidates.length) return null;
+  const target = Number(requestedHeight) || 0;
+  if (!target) return null;
 
-  const under = candidates.filter(f => Number(f.height) <= Number(requestedHeight));
-  const pool = under.length ? under : candidates;
-  pool.sort((a,b) => (Number(b.height)||0)-(Number(a.height)||0) || (Number(b.abr)||0)-(Number(a.abr)||0));
-  return pool[0].format_id;
+  // First determine the best REAL video height available at or below target.
+  const actualHeights = [...new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  )].sort((a, b) => b - a);
+  const bestHeight = actualHeights.find(h => h <= target);
+  if (!bestHeight) return null;
+
+  // Only return a progressive format when it represents that real best height.
+  // This prevents a requested 1080p stream from silently becoming 720p.
+  const candidates = formats
+    .filter(f => f && Number(f.height) === bestHeight && f.vcodec !== 'none' && f.acodec !== 'none' && f.url)
+    .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0));
+
+  return candidates[0]?.format_id || null;
 }
 
 /**
@@ -494,6 +555,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
     }
 
     res.status(upstreamRes.statusCode);
+    if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', upstreamRes.headers['accept-ranges'] || 'bytes');
     ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']
       .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
 
@@ -1064,7 +1126,19 @@ app.get('/video', async (req, res) => {
         return streamFromUpstream(req, res, cachedUrl);
       }
 
-      // Get format metadata
+      // Fast path: common 144p–720p progressive playback. This is intentionally
+      // attempted before the full JSON extraction because some managed/school
+      // tablets stop waiting if the proxy takes too long to produce the first URL.
+      if (resolved.type !== 'audio' && resolved.height <= 720) {
+        const fastUrl = await getFastProgressiveUrl(videoId, resolved.height);
+        if (fastUrl) {
+          const elapsed = Date.now() - startTime;
+          log.success(`▶️ Fast direct stream (${quality}): ${videoId} startup=${elapsed}ms`);
+          return streamFromUpstream(req, res, fastUrl);
+        }
+      }
+
+      // Full metadata path for exact high-quality selection / DASH fallback.
       log.info(`[VIDEO] id=${videoId}, quality=${quality}, startup...`);
       const metadata = await getFormatMetadata(videoId);
       const requestedHeight = resolved.type === 'audio' ? 0 : resolved.height;
@@ -1117,7 +1191,8 @@ app.get('/video', async (req, res) => {
       if (!res.headersSent) {
         return res.status(500).json({
           error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة',
-          details: NODE_ENV === 'development' ? error.message : undefined
+          details: NODE_ENV === 'development' ? error.message : undefined,
+          requestId: req.requestId
         });
       }
       return;
@@ -1293,22 +1368,20 @@ app.get('/video/qualities', async (req, res) => {
     log.info(`📊 Extracting qualities: ${videoId}`);
     const metadata = await getFormatMetadata(videoId);
     
-    const heights = new Set();
-    metadata.allFormats.forEach(f => {
-      if (f.height && f.vcodec !== 'none') heights.add(f.height);
-    });
+    // Return ONLY qualities that actually exist. Never invent 144/240/360/etc.
+    // from maxHeight; this was the reason some quality buttons did not match reality.
+    const uniqueAvailable = (metadata.allHeights || []).filter(h => h > 0);
 
-    const standard = [2160, 1440, 1080, 720, 480, 360, 240, 144];
-    const maxHeight = Math.max(...heights, 0);
-    const available = standard.filter(h => 
-      [...heights].some(fh => Math.abs(fh - h) <= 20) || h <= maxHeight
+    const progressiveHeights = new Set(
+      (metadata.allFormats || [])
+        .filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
+        .map(f => Number(f.height))
     );
-    const uniqueAvailable = [...new Set(available)].filter(h => h <= maxHeight).sort((a, b) => b - a);
 
     const qualities = uniqueAvailable.map(h => ({
       label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
       quality: String(h),
-      type: metadata.hasProgressiveFormats ? 'direct' : 'merged (ffmpeg)',
+      type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
       url: `/video?v=${videoId}&quality=${h}`
     }));
     qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
