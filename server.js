@@ -553,21 +553,42 @@ function pickBestProgressiveUrl(metadata, requestedHeight = 0) {
 
 function getAvailableQualityObjects(metadata, videoId) {
   const formats = metadata?.allFormats || [];
-  const heights = [...new Set(
-    formats.filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
-      .map(f => Number(f.height))
-  )].sort((a, b) => b - a);
-  const progressiveHeights = new Set(
-    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
-      .map(f => Number(f.height))
-  );
-  return heights.map(h => ({
-    label: h >= 2160 ? '4K' : `${h}p`,
-    quality: String(h),
-    height: h,
-    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
-    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
-  }));
+
+  // Build qualities from REAL video formats, not from a hard-coded list.
+  // Prefer the highest-quality video representation at each height.
+  const byHeight = new Map();
+  for (const f of formats) {
+    const height = Number(f?.height) || 0;
+    if (!height || f?.vcodec === 'none') continue;
+
+    const current = byHeight.get(height);
+    const score = (Number(f.tbr) || 0) + (Number(f.fps) || 0) * 0.01;
+    const currentScore = current ? (Number(current.tbr) || 0) + (Number(current.fps) || 0) * 0.01 : -1;
+    if (!current || score > currentScore) byHeight.set(height, f);
+  }
+
+  return [...byHeight.entries()]
+    .sort(([a], [b]) => b - a)
+    .map(([height, best]) => {
+      const hasProgressive = formats.some(f =>
+        Number(f?.height) === height &&
+        f?.vcodec !== 'none' &&
+        f?.acodec !== 'none' &&
+        f?.url
+      );
+
+      return {
+        label: height >= 2160 ? '4K' : `${height}p`,
+        quality: String(height),
+        height,
+        width: Number(best.width) || null,
+        fps: Number(best.fps) || null,
+        codec: best.vcodec || null,
+        bitrate: Number(best.tbr) || null,
+        type: hasProgressive ? 'direct' : 'merged (ffmpeg)',
+        url: `/video?v=${encodeURIComponent(videoId)}&quality=${height}`
+      };
+    });
 }
 
 async function getLiveStreamUrl(videoId) {
@@ -1153,27 +1174,43 @@ app.get('/video', async (req, res) => {
       const cached = streamCache.get(qKey);
       if (cached) return streamFromUpstream(req, res, cached);
 
-      const progressive = pickBestProgressiveUrl(metadata, resolved.height);
-      if (progressive?.url) {
-        streamCache.set(qKey, progressive.url);
-        return streamFromUpstream(req, res, progressive.url);
+      // First try an exact progressive representation at the requested height.
+      // Do NOT silently downgrade 1080p -> 720p just because a progressive format exists.
+      const exactProgressive = (metadata.allFormats || [])
+        .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' &&
+          Number(f.height) === resolved.height)
+        .sort((a, b) => {
+          const abr = (Number(b.abr) || 0) - (Number(a.abr) || 0);
+          return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
+        })[0];
+
+      if (exactProgressive?.url) {
+        streamCache.set(qKey, exactProgressive.url);
+        return streamFromUpstream(req, res, exactProgressive.url);
       }
 
-      const heights = [...new Set(
-        (metadata.allFormats || [])
-          .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
-          .map(f => Number(f.height))
-      )].sort((a, b) => b - a);
+      // YouTube normally serves HD as separate video + audio. Select the
+      // exact requested height first; only fall back to the nearest LOWER
+      // real height when the requested representation does not exist.
+      const videoFormats = (metadata.allFormats || [])
+        .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) > 0);
 
-      const bestHeight = heights.find(h => h <= resolved.height) || heights[0];
-      const video = (metadata.allFormats || [])
-        .filter(f => f && f.vcodec !== 'none' && f.acodec === 'none' &&
-          Number(f.height) === bestHeight && f.url)
-        .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0];
+      const heights = [...new Set(videoFormats.map(f => Number(f.height)))]
+        .sort((a, b) => b - a);
+      const bestHeight = heights.find(h => h <= resolved.height);
+      const video = videoFormats
+        .filter(f => Number(f.height) === bestHeight)
+        .sort((a, b) => {
+          const tbr = (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
+          return tbr || ((Number(b.fps) || 0) - (Number(a.fps) || 0));
+        })[0];
 
       const audio = (metadata.allFormats || [])
-        .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
-        .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+        .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
+        .sort((a, b) => {
+          const abr = (Number(b.abr) || 0) - (Number(a.abr) || 0);
+          return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
+        })[0];
 
       if (!video?.url) throw new Error(`No video format available for ${resolved.height}p`);
       return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
@@ -1282,7 +1319,7 @@ app.get('/formats', async (req, res) => {
     res.json({
       id: videoId,
       title: info.title,
-      formats: formats.slice(0, 20)
+      formats
     });
 
   } catch (error) {
