@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.0-quality-engine';
+const SERVER_VERSION = '6.3.1-speed-engine';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -331,7 +331,8 @@ async function getFastProgressiveUrl(videoId, height) {
 
   const promise = (async () => {
     try {
-      const selector = `best[height=${h}][vcodec!=none][acodec!=none]/best[height=${h}][vcodec!=none][acodec=none]/best[height<=${h}][vcodec!=none][acodec!=none]`;
+      // Exact progressive lookup only: never trade speed for a lower quality.
+      const selector = `best[height=${h}][vcodec!=none][acodec!=none]`;
       const stdout = await runYtDlp([
         '--get-url', '-f', selector,
         `https://www.youtube.com/watch?v=${videoId}`
@@ -633,7 +634,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   };
   if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
+  const upstreamReq = https.get(url, { headers, timeout: 30000, agent: keepAliveAgent, highWaterMark: 1024 * 1024 }, (upstreamRes) => {
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
@@ -652,6 +653,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
       .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
 
     if (req.method === 'HEAD') { upstreamRes.resume(); return res.end(); }
+    if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'public, max-age=60');
     upstreamRes.pipe(res);
   });
 
@@ -676,10 +678,13 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
 
   const args = [
     '-loglevel', 'error', '-hide_banner',
+    '-probesize', '32k', '-analyzeduration', '0',
     ...inputArgs,
     '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
+    '-copyinkf',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-flush_packets', '1',
     '-f', 'mp4', 'pipe:1'
   ];
 
@@ -1141,6 +1146,17 @@ app.get('/video', async (req, res) => {
   }
 
   try {
+    // Fast path: for common progressive qualities, resolve the exact direct URL
+    // before doing the full format metadata pass. This cuts first-play latency.
+    const resolvedEarly = resolveQuality(quality);
+    if (resolvedEarly?.type === 'merge' && resolvedEarly.height <= 720) {
+      const fastUrl = await getFastProgressiveUrl(videoId, resolvedEarly.height);
+      if (fastUrl) {
+        streamCache.set(`stream_q_${videoId}_${resolvedEarly.height}`, fastUrl);
+        return streamFromUpstream(req, res, fastUrl);
+      }
+    }
+
     const metadata = await getFormatMetadata(videoId);
 
     if (metadata.isLive) {
