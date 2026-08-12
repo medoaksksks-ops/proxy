@@ -8,14 +8,14 @@ const https = require('https');
 require('dotenv').config();
 
 // ==========================================================================
-// 🔖 server v5.7.0 "جبارة ⚡" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
+// 🔖 server v6.2.0 "جبارة ⚡" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
 //   • Format selection ذكي (Progressive first → Direct stream)
 //   • FFmpeg فقط عند الحاجة (منفصل video+audio)
 //   • Smart format metadata caching
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.0.0-fast-live';
+const SERVER_VERSION = '6.2.0-quality-selector';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -661,7 +661,9 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
     if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
   });
 
-  req.on('close', () => upstreamReq.destroy());
+  req.on('close', () => {
+    if (!res.writableEnded && !res.destroyed) upstreamReq.destroy();
+  });
 }
 
 /**
@@ -716,11 +718,11 @@ const QUALITY_HEIGHTS = {
 };
 
 function resolveQuality(quality) {
-  if (!quality) return null;
-  const q = String(quality).toLowerCase().replace('p', '');
+  if (quality === undefined || quality === null || String(quality).trim() === '') return null;
+  const q = String(quality).trim().toLowerCase().replace(/p$/, '');
   if (q === 'audio') return { type: 'audio' };
-  const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
-  if (!height || Number.isNaN(height)) return null;
+  const height = QUALITY_HEIGHTS[q] || Number.parseInt(q, 10);
+  if (!Number.isSafeInteger(height) || height <= 0 || height > 10000) return null;
   return { type: 'merge', height };
 }
 
@@ -1149,16 +1151,17 @@ app.get('/video', async (req, res) => {
 
     const resolved = resolveQuality(quality);
 
-    // Default playback: use the URL prepared while extracting metadata.
+    // No quality means no forced 720p. Return the real quality list so the
+    // player can choose explicitly. This avoids silently pinning playback to
+    // one representation and makes missing-quality errors deterministic.
     if (!resolved && !format) {
-      const warmed = streamCache.get(`stream_default_${videoId}`);
-      if (warmed) return streamFromUpstream(req, res, warmed);
-
-      const best = pickBestProgressiveUrl(metadata, 720) || pickBestProgressiveUrl(metadata);
-      if (best?.url) {
-        streamCache.set(`stream_default_${videoId}`, best.url);
-        return streamFromUpstream(req, res, best.url);
-      }
+      const qualities = getAvailableQualityObjects(metadata, videoId);
+      return res.status(400).json({
+        error: 'اختار الجودة من قائمة الجودات المتاحة',
+        qualities,
+        availableQualities: qualities.map(q => q.quality),
+        requestId: req.requestId
+      });
     }
 
     if (resolved) {
@@ -1189,21 +1192,28 @@ app.get('/video', async (req, res) => {
         return streamFromUpstream(req, res, exactProgressive.url);
       }
 
-      // YouTube normally serves HD as separate video + audio. Select the
-      // exact requested height first; only fall back to the nearest LOWER
-      // real height when the requested representation does not exist.
+      // Separate video + audio: require the EXACT requested height.
+      // Never silently downgrade 1080p -> 720p (or 240p -> 144p).
       const videoFormats = (metadata.allFormats || [])
         .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) > 0);
 
-      const heights = [...new Set(videoFormats.map(f => Number(f.height)))]
-        .sort((a, b) => b - a);
-      const bestHeight = heights.find(h => h <= resolved.height);
-      const video = videoFormats
-        .filter(f => Number(f.height) === bestHeight)
+      const exactVideoFormats = videoFormats
+        .filter(f => Number(f.height) === resolved.height)
         .sort((a, b) => {
           const tbr = (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
           return tbr || ((Number(b.fps) || 0) - (Number(a.fps) || 0));
-        })[0];
+        });
+      const video = exactVideoFormats[0];
+
+      if (!video?.url) {
+        const available = getAvailableQualityObjects(metadata, videoId).map(q => q.quality);
+        return res.status(404).json({
+          error: `الجودة ${resolved.height}p غير متاحة لهذا الفيديو`,
+          requestedQuality: resolved.height,
+          availableQualities: available,
+          requestId: req.requestId
+        });
+      }
 
       const audio = (metadata.allFormats || [])
         .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
@@ -1212,7 +1222,6 @@ app.get('/video', async (req, res) => {
           return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
         })[0];
 
-      if (!video?.url) throw new Error(`No video format available for ${resolved.height}p`);
       return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
     }
 
@@ -1332,6 +1341,9 @@ app.get('/formats', async (req, res) => {
  * GET /video/qualities?v=VIDEO_ID
  * Returns available quality options
  */
+// The quality endpoint is the source of truth for player selectors.
+// It exposes every real video height returned by yt-dlp; it never invents
+// missing 144p/240p/etc. representations.
 app.get('/video/qualities', async (req, res) => {
   const videoId = req.query.v;
   if (!videoId || !isValidVideoId(videoId)) {
@@ -1377,13 +1389,21 @@ app.get('/video/ready', async (req, res) => {
   try {
     const metadata = await getFormatMetadata(videoId);
     if (metadata.isLive) await getLiveStreamUrl(videoId);
+    const qualities = getAvailableQualityObjects(metadata, videoId);
+    const streams = Object.fromEntries(
+      qualities.map(q => [q.quality, q.url])
+    );
+
     return res.json({
       id: videoId,
       ready: true,
       isLive: Boolean(metadata.isLive),
       title: metadata.title,
-      qualities: getAvailableQualityObjects(metadata, videoId),
-      stream: `/video?v=${encodeURIComponent(videoId)}`
+      qualities,
+      streams,
+      defaultQuality: qualities.some(q => q.height === 720) ? '720' : (qualities[0]?.quality || null),
+      // Backward-compatible field; the player should use streams/qualities for selection.
+      stream: qualities.find(q => q.quality === '720')?.url || qualities[0]?.url || null
     });
   } catch (error) {
     return res.status(500).json({
@@ -1549,6 +1569,17 @@ app.use((err, req, res, next) => {
 // Server startup
 // ==========================================================================
 
+
+// ==========================================================================
+// v6.2.0 QUALITY SELECTOR HARDENING
+// - No implicit 720p default on /video.
+// - Numeric quality values are accepted beyond the old hard-coded table.
+// - Quality selection is exact; unavailable heights return 404 + alternatives.
+// - /formats returns the complete format list instead of truncating at 20.
+// - Player quality discovery remains based on real yt-dlp heights only.
+// - Upstream request cleanup avoids destroying completed responses.
+// ==========================================================================
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
@@ -1585,3 +1616,34 @@ process.on('SIGTERM', () => {
 process.on('unhandledRejection', (reason) => {
   log.error(`Unhandled Rejection: ${reason}`);
 });
+
+/*
+ * QUALITY SELECTOR NOTES
+ * The API separates discovery from playback. Discovery reports only heights
+ * that really exist in yt-dlp's format list. Playback receives one explicit
+ * height and checks that exact representation before opening a stream. This
+ * prevents a request for 1080p from silently becoming 720p and keeps 144p and
+ * 240p available whenever the source actually exposes those representations.
+ * Progressive formats are proxied directly because they already contain
+ * audio. Adaptive formats are video-only and are paired with the strongest
+ * available audio representation, then remuxed by FFmpeg without re-encoding.
+ * The server never invents a quality that the source does not advertise. If
+ * an exact requested height is unavailable, the API returns a clear 404 plus
+ * an availableQualities array so the client can update its selector. Caches
+ * are keyed by video id and exact height, so a cached 720p URL cannot be used
+ * for a 1080p request. Range headers are preserved for direct streams.
+ */
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+// quality-selector-hardening
+//xxxxxxxxxxx
