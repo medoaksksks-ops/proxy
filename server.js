@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '5.9.0-speed';
+const SERVER_VERSION = '6.0.0-fast-live';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -66,6 +66,7 @@ const streamCache = new NodeCache({ stdTTL: 240 });         // 4 minutes (URLs e
 const formatCache = new NodeCache({ stdTTL: 3600 });        // 1 hour (format metadata)
 const channelCache = new NodeCache({ stdTTL: 3600 });       // 1 hour
 const failureCache = new NodeCache({ stdTTL: 20 });         // 20 seconds
+const liveCache = new NodeCache({ stdTTL: 20 });             // short-lived live URLs
 
 // Track in-flight format extractions to avoid duplicate yt-dlp calls
 const inFlightFormats = new Map();
@@ -412,16 +413,26 @@ async function getFormatMetadata(videoId) {
           .map(f => Number(f.height))
       )].sort((a, b) => b - a);
 
-      formatCache.set(cacheKey, metadata);
+      metadata.isLive = Boolean(info.is_live || info.live_status === 'is_live');
+      metadata.liveStatus = info.live_status || null;
 
-      // Warm direct URLs for progressive formats so the first play after
-      // opening the quality menu does not have to invoke yt-dlp again.
-      const warm = metadata.progressiveFormats.slice(0, 12);
-      for (const fid of warm) {
-        const f = formats.find(x => String(x.format_id) === String(fid));
-        if (f?.url) streamCache.set(`urls_${videoId}_${fid}`, [f.url]);
+      // Prewarm every direct/progressive format returned by yt-dlp.
+      const progressive = formats
+        .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none')
+        .sort((a, b) => {
+          const ah = Number(a.height) || 0, bh = Number(b.height) || 0;
+          if (ah !== bh) return bh - ah;
+          return (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
+        });
+
+      for (const f of progressive) {
+        streamCache.set(`urls_${videoId}_${f.format_id}`, [f.url]);
+      }
+      if (progressive[0]?.url) {
+        streamCache.set(`stream_default_${videoId}`, progressive[0].url);
       }
 
+      formatCache.set(cacheKey, metadata);
       return metadata;
     } catch (e) {
       log.error(`Format metadata extraction failed: ${e.message}`);
@@ -524,6 +535,66 @@ function selectSeparateFormats(metadata, requestedHeight) {
 }
 
 // ==========================================================================
+
+function pickBestProgressiveUrl(metadata, requestedHeight = 0) {
+  const formats = (metadata?.allFormats || [])
+    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0);
+  if (!formats.length) return null;
+  const target = Number(requestedHeight) || 0;
+  return formats.sort((a, b) => {
+    const ah = Number(a.height) || 0, bh = Number(b.height) || 0;
+    const aOk = !target || ah <= target, bOk = !target || bh <= target;
+    if (aOk !== bOk) return aOk ? -1 : 1;
+    if (aOk && ah !== bh) return bh - ah;
+    if (!aOk && ah !== bh) return ah - bh;
+    return (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
+  })[0];
+}
+
+function getAvailableQualityObjects(metadata, videoId) {
+  const formats = metadata?.allFormats || [];
+  const heights = [...new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  )].sort((a, b) => b - a);
+  const progressiveHeights = new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  );
+  return heights.map(h => ({
+    label: h >= 2160 ? '4K' : `${h}p`,
+    quality: String(h),
+    height: h,
+    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
+    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
+  }));
+}
+
+async function getLiveStreamUrl(videoId) {
+  const key = `live_${videoId}`;
+  const cached = liveCache.get(key);
+  if (cached) return cached;
+  if (inFlightUrls.has(key)) return inFlightUrls.get(key);
+
+  const promise = (async () => {
+    try {
+      const stdout = await runYtDlp([
+        '--get-url', '-f', 'best',
+        `https://www.youtube.com/watch?v=${videoId}`
+      ], { timeout: 30000, maxBuffer: 1024 * 1024 * 4 });
+      const url = stdout.trim().split(/\r?\n/).filter(Boolean)[0];
+      if (!url) throw new Error('Live stream URL not available');
+      liveCache.set(key, url);
+      return url;
+    } finally {
+      inFlightUrls.delete(key);
+    }
+  })();
+
+  inFlightUrls.set(key, promise);
+  return promise;
+}
+
 // Streaming functions
 // ==========================================================================
 
@@ -823,30 +894,6 @@ async function getChannelVideos(channelId, limit = 20) {
   };
 }
 
-/**
- * Get video comments
- */
-async function getVideoComments(videoId, limit = 50) {
-  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
-  const stdout = await runYtDlp([
-    '--dump-json', '--skip-download', '--write-comments',
-    `https://www.youtube.com/watch?v=${videoId}`
-  ]);
-  let info;
-  try {
-    info = JSON.parse(stdout);
-  } catch {
-    return [];
-  }
-  const comments = (info.comments || []).slice(0, limit).map(c => ({
-    author: c.author || 'Unknown',
-    text: c.text || '',
-    time: c.time_text || '',
-    likeCount: c.like_count || 0
-  }));
-  return comments;
-}
-
 // ==========================================================================
 // HTTP Routes
 // ==========================================================================
@@ -881,7 +928,7 @@ app.get('/', (req, res) => {
       cookiesStatus: '/api/cookies-status'
     },
     videoQualityValues: ['144', '240', '360', '480', '720', '1080', '1440', '2160', 'audio'],
-    improvements: ['Fast startup (Progressive format first)', 'Direct streaming', 'Request deduplication', 'Range support']
+    improvements: ['Prewarmed first-play URL', 'All detected qualities', 'Live stream support', 'Request deduplication', 'Range support']
   });
 });
 
@@ -1046,39 +1093,6 @@ app.get('/channel', async (req, res) => {
   }
 });
 
-/**
- * GET /comments?v=VIDEO_ID&limit=50
- */
-app.get('/comments', async (req, res) => {
-  const videoId = req.query.v;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `comments_${videoId}_${limit}`;
-  const cached = infoCache.get(cacheKey);
-  if (cached) {
-    log.info(`📦 Comments from cache: ${videoId}`);
-    return res.json(cached);
-  }
-
-  try {
-    const comments = await getVideoComments(videoId, limit);
-    const response = { id: videoId, count: comments.length, results: comments };
-    infoCache.set(cacheKey, response, 1800);
-    log.success(`✅ Comments done: ${videoId}`);
-    res.json(response);
-  } catch (error) {
-    log.error(`Error fetching comments: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب التعليقات',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
 // ==========================================================================
 // VIDEO STREAMING — OPTIMIZED FOR FAST STARTUP
 // ==========================================================================
@@ -1094,165 +1108,95 @@ app.get('/comments', async (req, res) => {
  */
 app.get('/video', async (req, res) => {
   const startTime = Date.now();
-  const { v: videoId, format = 'best[height<=720]', quality } = req.query;
+  const { v: videoId, format, quality } = req.query;
 
   if (!videoId || !isValidVideoId(videoId)) {
-    log.error(`Invalid video ID: ${videoId}`);
     return res.status(400).json({
       error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/video?v=dQw4w9WgXcQ&quality=1080'
+      example: '/video?v=dQw4w9WgXcQ&quality=720'
     });
   }
 
-  // Handle quality parameter (new path)
-  const resolved = resolveQuality(quality);
-  if (resolved) {
-    const qCacheKey = `stream_q_${videoId}_${quality}`;
-    const failKey = `fail_${videoId}_${quality}`;
+  try {
+    const metadata = await getFormatMetadata(videoId);
 
-    const recentFailure = failureCache.get(failKey);
-    if (recentFailure) {
-      return res.status(503).json({
-        error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة (فشلت من ثوانٍ)',
-        details: NODE_ENV === 'development' ? recentFailure : undefined
+    if (metadata.isLive) {
+      const liveUrl = await getLiveStreamUrl(videoId);
+      log.success(`🔴 Live: ${videoId} startup=${Date.now() - startTime}ms`);
+      return streamFromUpstream(req, res, liveUrl);
+    }
+
+    const resolved = resolveQuality(quality);
+
+    // Default playback: use the URL prepared while extracting metadata.
+    if (!resolved && !format) {
+      const warmed = streamCache.get(`stream_default_${videoId}`);
+      if (warmed) return streamFromUpstream(req, res, warmed);
+
+      const best = pickBestProgressiveUrl(metadata, 720) || pickBestProgressiveUrl(metadata);
+      if (best?.url) {
+        streamCache.set(`stream_default_${videoId}`, best.url);
+        return streamFromUpstream(req, res, best.url);
+      }
+    }
+
+    if (resolved) {
+      if (resolved.type === 'audio') {
+        const audio = (metadata.allFormats || [])
+          .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
+          .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+        if (!audio?.url) throw new Error('No audio-only format found');
+        return streamFromUpstream(req, res, audio.url);
+      }
+
+      const qKey = `stream_q_${videoId}_${resolved.height}`;
+      const cached = streamCache.get(qKey);
+      if (cached) return streamFromUpstream(req, res, cached);
+
+      const progressive = pickBestProgressiveUrl(metadata, resolved.height);
+      if (progressive?.url) {
+        streamCache.set(qKey, progressive.url);
+        return streamFromUpstream(req, res, progressive.url);
+      }
+
+      const heights = [...new Set(
+        (metadata.allFormats || [])
+          .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+          .map(f => Number(f.height))
+      )].sort((a, b) => b - a);
+
+      const bestHeight = heights.find(h => h <= resolved.height) || heights[0];
+      const video = (metadata.allFormats || [])
+        .filter(f => f && f.vcodec !== 'none' && f.acodec === 'none' &&
+          Number(f.height) === bestHeight && f.url)
+        .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0];
+
+      const audio = (metadata.allFormats || [])
+        .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
+        .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+
+      if (!video?.url) throw new Error(`No video format available for ${resolved.height}p`);
+      return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
+    }
+
+    // Legacy compatibility.
+    const selector = format || 'best[height<=720]/best';
+    const urls = await getFormatUrls(videoId, selector);
+    if (!urls.length) throw new Error('Failed to get stream URL');
+    return streamFromUpstream(req, res, urls[0]);
+
+  } catch (error) {
+    metrics.errors++;
+    metrics.lastError = { at: new Date().toISOString(), message: error.message };
+    log.error(`Error fetching video ${videoId}: ${error.message}`);
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: 'تعذّر تشغيل الفيديو',
+        details: NODE_ENV === 'development' ? error.message : undefined,
+        requestId: req.requestId
       });
     }
-
-    try {
-      // Check cache first
-      let cachedUrl = streamCache.get(qCacheKey);
-      if (cachedUrl) {
-        log.info(`📦 Cached URL (quality=${quality}): ${videoId} (${Date.now() - startTime}ms)`);
-        return streamFromUpstream(req, res, cachedUrl);
-      }
-
-      // Fast path: common 144p–720p progressive playback. This is intentionally
-      // attempted before the full JSON extraction because some managed/school
-      // tablets stop waiting if the proxy takes too long to produce the first URL.
-      if (resolved.type !== 'audio' && resolved.height <= 720) {
-        const fastUrl = await getFastProgressiveUrl(videoId, resolved.height);
-        if (fastUrl) {
-          const elapsed = Date.now() - startTime;
-          log.success(`▶️ Fast direct stream (${quality}): ${videoId} startup=${elapsed}ms`);
-          return streamFromUpstream(req, res, fastUrl);
-        }
-      }
-
-      // Full metadata path for exact high-quality selection / DASH fallback.
-      log.info(`[VIDEO] id=${videoId}, quality=${quality}, startup...`);
-      const metadata = await getFormatMetadata(videoId);
-      const requestedHeight = resolved.type === 'audio' ? 0 : resolved.height;
-
-      // Try progressive format first
-      let selectedFormatId = null;
-      if (resolved.type !== 'audio') {
-        selectedFormatId = selectProgressiveFormat(metadata, requestedHeight);
-        if (selectedFormatId) {
-          log.info(`[FORMAT] progressive (direct stream)`);
-        }
-      }
-
-      if (selectedFormatId) {
-        // Use progressive format — direct stream
-        let urls = streamCache.get(qCacheKey);
-        if (!urls) {
-          urls = await getFormatUrls(videoId, selectedFormatId);
-          if (!urls.length) throw new Error('Failed to get stream URL');
-          streamCache.set(qCacheKey, urls[0]);
-        }
-        const elapsed = Date.now() - startTime;
-        log.success(`▶️  Stream (direct/${quality}): ${videoId} startup=${elapsed}ms`);
-        return streamFromUpstream(req, res, urls[0] || urls);
-      }
-
-      // Fallback: separate video+audio with FFmpeg
-      log.info(`[FORMAT] separate (FFmpeg fallback)`);
-      const separateFormats = selectSeparateFormats(metadata, requestedHeight);
-      if (!separateFormats) {
-        throw new Error('No suitable format found');
-      }
-
-      const [videoFormatId, audioFormatId] = separateFormats;
-      const selector = audioFormatId
-        ? `${videoFormatId}+${audioFormatId}`
-        : videoFormatId;
-
-      const urls = await getFormatUrls(videoId, selector);
-      if (!urls.length) throw new Error('Failed to get stream URLs');
-
-      const elapsed = Date.now() - startTime;
-      log.success(`▶️  Stream (FFmpeg/${quality}): ${videoId} startup=${elapsed}ms`);
-      
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1] || null);
-
-    } catch (error) {
-      failureCache.set(failKey, error.message);
-      log.error(`Error fetching quality ${quality}: ${error.message}`);
-      if (!res.headersSent) {
-        return res.status(500).json({
-          error: 'تعذّر تشغيل الفيديو بالجودة المطلوبة',
-          details: NODE_ENV === 'development' ? error.message : undefined,
-          requestId: req.requestId
-        });
-      }
-      return;
-    }
   }
-
-  // Legacy format parameter path
-  const cacheKey = `stream_${videoId}_${format}`;
-  const cachedUrl = streamCache.get(cacheKey);
-
-  if (cachedUrl) {
-    log.info(`📦 Stream from cache: ${videoId} (${Date.now() - startTime}ms)`);
-    return streamFromUpstream(req, res, cachedUrl);
-  }
-
-  let attempts = 0;
-  let lastError = null;
-
-  while (attempts < MAX_RETRIES) {
-    try {
-      log.info(`🎬 Fetching video: ${videoId} (attempt ${attempts + 1}/${MAX_RETRIES})`);
-      const stdout = await runYtDlp(['--get-url', '-f', format, `https://www.youtube.com/watch?v=${videoId}`]);
-      const streamUrl = stdout.trim().split('\n')[0];
-
-      if (!streamUrl) {
-        throw new Error('Failed to get stream URL');
-      }
-
-      streamCache.set(cacheKey, streamUrl);
-      const elapsed = Date.now() - startTime;
-      log.success(`▶️  Streaming: ${videoId} startup=${elapsed}ms`);
-
-      streamFromUpstream(req, res, streamUrl);
-      return;
-
-    } catch (error) {
-      lastError = error;
-      attempts++;
-      log.warn(`Attempt ${attempts} failed: ${error.message}`);
-
-      if (attempts < MAX_RETRIES) {
-        await new Promise(r => setTimeout(r, 1000 * attempts));
-      }
-    }
-  }
-
-  log.error(`Failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
-
-  if (lastError?.message.includes('unavailable') || lastError?.message.includes('not available')) {
-    return res.status(404).json({ error: 'الفيديو غير متاح أو محذوف' });
-  } else if (lastError?.message.includes('private')) {
-    return res.status(403).json({ error: 'الفيديو خاص (private)' });
-  } else if (lastError?.message.includes('age')) {
-    return res.status(403).json({ error: 'الفيديو يحتاج تحقق العمر' });
-  }
-
-  res.status(500).json({
-    error: 'فشل في تشغيل الفيديو',
-    details: NODE_ENV === 'development' ? lastError?.message : undefined
-  });
 });
 
 /**
@@ -1359,51 +1303,59 @@ app.get('/video/qualities', async (req, res) => {
 
   const cacheKey = `qualities_${videoId}`;
   const cached = infoCache.get(cacheKey);
-  if (cached) {
-    log.info(`📦 Qualities from cache: ${videoId}`);
-    return res.json(cached);
-  }
+  if (cached) return res.json(cached);
 
   try {
-    log.info(`📊 Extracting qualities: ${videoId}`);
     const metadata = await getFormatMetadata(videoId);
-    
-    // Return ONLY qualities that actually exist. Never invent 144/240/360/etc.
-    // from maxHeight; this was the reason some quality buttons did not match reality.
-    const uniqueAvailable = (metadata.allHeights || []).filter(h => h > 0);
-
-    const progressiveHeights = new Set(
-      (metadata.allFormats || [])
-        .filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
-        .map(f => Number(f.height))
-    );
-
-    const qualities = uniqueAvailable.map(h => ({
-      label: h >= 2160 ? '4K' : h >= 1440 ? '1440p' : `${h}p`,
-      quality: String(h),
-      type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
-      url: `/video?v=${videoId}&quality=${h}`
-    }));
-    qualities.push({ label: '🎧 صوت فقط', quality: 'audio', type: 'audio', url: `/video?v=${videoId}&quality=audio` });
-
-    const result = { id: videoId, title: metadata.title, qualities };
+    const qualities = getAvailableQualityObjects(metadata, videoId);
+    const result = {
+      id: videoId,
+      title: metadata.title,
+      isLive: Boolean(metadata.isLive),
+      liveStatus: metadata.liveStatus,
+      qualities,
+      count: qualities.length
+    };
     infoCache.set(cacheKey, result);
-    log.success(`✅ Qualities done: ${videoId} (${qualities.length} جودة)`);
-    res.json(result);
+    return res.json(result);
   } catch (error) {
     log.error(`Error fetching qualities: ${error.message}`);
-    res.status(500).json({
+    return res.status(500).json({
       error: 'تعذّر جلب الجودات المتاحة',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// ==========================================================================
+// ==
 // System endpoints
 // ==========================================================================
 
 /** Runtime diagnostics (no secrets/cookies exposed) */
+app.get('/video/ready', async (req, res) => {
+  const videoId = req.query.v;
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+  try {
+    const metadata = await getFormatMetadata(videoId);
+    if (metadata.isLive) await getLiveStreamUrl(videoId);
+    return res.json({
+      id: videoId,
+      ready: true,
+      isLive: Boolean(metadata.isLive),
+      title: metadata.title,
+      qualities: getAvailableQualityObjects(metadata, videoId),
+      stream: `/video?v=${encodeURIComponent(videoId)}`
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: 'تعذّر تجهيز الفيديو',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 app.get('/api/metrics', (req, res) => {
   res.json({
     ok: true,
