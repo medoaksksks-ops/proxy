@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.2.0-quality-selector';
+const SERVER_VERSION = '6.3.0-quality-engine';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -192,7 +192,7 @@ function checkYtDlp() {
 // yt-dlp configuration — CRITICAL: DO NOT CHANGE
 // ==========================================================================
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
+  '--extractor-args', 'youtube:player_client=default,web_embedded;formats=missing_pot',
   '--js-runtimes', 'node'
 ];
 
@@ -331,7 +331,7 @@ async function getFastProgressiveUrl(videoId, height) {
 
   const promise = (async () => {
     try {
-      const selector = `best[height<=${h}][vcodec!=none][acodec!=none]/best[height<=${h}]`;
+      const selector = `best[height=${h}][vcodec!=none][acodec!=none]/best[height=${h}][vcodec!=none][acodec=none]/best[height<=${h}][vcodec!=none][acodec!=none]`;
       const stdout = await runYtDlp([
         '--get-url', '-f', selector,
         `https://www.youtube.com/watch?v=${videoId}`
@@ -559,7 +559,7 @@ function getAvailableQualityObjects(metadata, videoId) {
   const byHeight = new Map();
   for (const f of formats) {
     const height = Number(f?.height) || 0;
-    if (!height || f?.vcodec === 'none') continue;
+    if (!height || f?.vcodec === 'none' || !f?.url) continue;
 
     const current = byHeight.get(height);
     const score = (Number(f.tbr) || 0) + (Number(f.fps) || 0) * 0.01;
@@ -1342,7 +1342,7 @@ app.get('/formats', async (req, res) => {
  * Returns available quality options
  */
 // The quality endpoint is the source of truth for player selectors.
-// It exposes every real video height returned by yt-dlp; it never invents
+// It exposes every playable video height returned by yt-dlp; it never invents
 // missing 144p/240p/etc. representations.
 app.get('/video/qualities', async (req, res) => {
   const videoId = req.query.v;
