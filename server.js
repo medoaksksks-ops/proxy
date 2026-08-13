@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.6-6.0-stream-quality-ytdlp-client-fix';
+const SERVER_VERSION = '6.0.0-fast-live';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -192,7 +192,7 @@ function checkYtDlp() {
 // yt-dlp configuration — CRITICAL: DO NOT CHANGE
 // ==========================================================================
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=default,web_embedded',
+  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
   '--js-runtimes', 'node'
 ];
 
@@ -700,48 +700,7 @@ function resolveQuality(quality) {
   if (q === 'audio') return { type: 'audio' };
   const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
   if (!height || Number.isNaN(height)) return null;
-  return { type: 'video', height };
-}
-
-function availableHeights(metadata) {
-  return [...new Set((metadata?.allFormats || [])
-    .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
-    .map(f => Number(f.height)))]
-    .sort((a, b) => b - a);
-}
-
-function findExactProgressive(metadata, height) {
-  return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
-    .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
-}
-
-function findExactVideoOnly(metadata, height) {
-  return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
-    .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
-}
-
-function findBestAudio(metadata) {
-  return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
-    .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0] || null;
-}
-
-function getAvailableQualityObjects(metadata, videoId) {
-  const formats = metadata?.allFormats || [];
-  const heights = availableHeights(metadata);
-  const progressiveHeights = new Set(
-    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
-      .map(f => Number(f.height))
-  );
-  return heights.map(h => ({
-    label: h >= 2160 ? '4K' : `${h}p`,
-    quality: String(h),
-    height: h,
-    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
-    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
-  }));
+  return { type: 'merge', height };
 }
 
 // ==========================================================================
@@ -1169,58 +1128,11 @@ app.get('/video', async (req, res) => {
 
     const resolved = resolveQuality(quality);
 
-    // Explicit quality: exact height only. Never silently downgrade.
-    if (resolved?.type === 'video') {
-      const heights = availableHeights(metadata);
-      if (!heights.includes(resolved.height)) {
-        return res.status(404).json({
-          error: `الجودة ${resolved.height}p غير متاحة لهذا الفيديو`,
-          requestedQuality: resolved.height,
-          availableQualities: heights.map(String),
-          requestId: req.requestId
-        });
-      }
-
-      const cacheKey = `stream_q_${videoId}_${resolved.height}`;
-      const cached = streamCache.get(cacheKey);
-      if (cached) {
-        log.info(`⚡ Exact cached quality ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
-        return streamFromUpstream(req, res, cached);
-      }
-
-      // Keep 6.0's direct HTTP streaming path for progressive formats.
-      const progressive = findExactProgressive(metadata, resolved.height);
-      if (progressive?.url) {
-        streamCache.set(cacheKey, progressive.url);
-        log.info(`⚡ Exact progressive ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
-        return streamFromUpstream(req, res, progressive.url);
-      }
-
-      // Adaptive format: exact video height + best audio, remux only when necessary.
-      const video = findExactVideoOnly(metadata, resolved.height);
-      const audio = findBestAudio(metadata);
-      if (!video?.url) {
-        return res.status(404).json({
-          error: `الجودة ${resolved.height}p موجودة في القائمة لكن رابط الفيديو غير متاح حاليًا`,
-          requestedQuality: resolved.height,
-          availableQualities: heights.map(String),
-          requestId: req.requestId
-        });
-      }
-      log.info(`🎬 Exact adaptive ${videoId}/${resolved.height}p -> FFmpeg startup=${Date.now() - startTime}ms`);
-      return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
-    }
-
-    if (resolved?.type === 'audio') {
-      const audio = findBestAudio(metadata);
-      if (!audio?.url) return res.status(404).json({ error: 'الصوت غير متاح', requestId: req.requestId });
-      return streamFromUpstream(req, res, audio.url);
-    }
-
-    // Default playback remains compatible with 6.0: direct progressive stream first.
+    // Default playback: use the URL prepared while extracting metadata.
     if (!resolved && !format) {
       const warmed = streamCache.get(`stream_default_${videoId}`);
       if (warmed) return streamFromUpstream(req, res, warmed);
+
       const best = pickBestProgressiveUrl(metadata, 720) || pickBestProgressiveUrl(metadata);
       if (best?.url) {
         streamCache.set(`stream_default_${videoId}`, best.url);
@@ -1228,7 +1140,46 @@ app.get('/video', async (req, res) => {
       }
     }
 
-    // Legacy format parameter. Preserve explicit selector behavior.
+    if (resolved) {
+      if (resolved.type === 'audio') {
+        const audio = (metadata.allFormats || [])
+          .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
+          .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+        if (!audio?.url) throw new Error('No audio-only format found');
+        return streamFromUpstream(req, res, audio.url);
+      }
+
+      const qKey = `stream_q_${videoId}_${resolved.height}`;
+      const cached = streamCache.get(qKey);
+      if (cached) return streamFromUpstream(req, res, cached);
+
+      const progressive = pickBestProgressiveUrl(metadata, resolved.height);
+      if (progressive?.url) {
+        streamCache.set(qKey, progressive.url);
+        return streamFromUpstream(req, res, progressive.url);
+      }
+
+      const heights = [...new Set(
+        (metadata.allFormats || [])
+          .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+          .map(f => Number(f.height))
+      )].sort((a, b) => b - a);
+
+      const bestHeight = heights.find(h => h <= resolved.height) || heights[0];
+      const video = (metadata.allFormats || [])
+        .filter(f => f && f.vcodec !== 'none' && f.acodec === 'none' &&
+          Number(f.height) === bestHeight && f.url)
+        .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0];
+
+      const audio = (metadata.allFormats || [])
+        .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
+        .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+
+      if (!video?.url) throw new Error(`No video format available for ${resolved.height}p`);
+      return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
+    }
+
+    // Legacy compatibility.
     const selector = format || 'best[height<=720]/best';
     const urls = await getFormatUrls(videoId, selector);
     if (!urls.length) throw new Error('Failed to get stream URL');
@@ -1331,7 +1282,7 @@ app.get('/formats', async (req, res) => {
     res.json({
       id: videoId,
       title: info.title,
-      formats
+      formats: formats.slice(0, 20)
     });
 
   } catch (error) {
@@ -1597,6 +1548,3 @@ process.on('SIGTERM', () => {
 process.on('unhandledRejection', (reason) => {
   log.error(`Unhandled Rejection: ${reason}`);
 });
-
-
-// v6.3.5: 6.0 HTTP streaming engine + exact quality selector; no implicit downgrade.
