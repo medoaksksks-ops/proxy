@@ -8,14 +8,14 @@ const https = require('https');
 require('dotenv').config();
 
 // ==========================================================================
-// 🔖 server v6.3.4 "Diagnostic + Fast Path" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
+// 🔖 server v5.7.0 "جبارة ⚡" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
 //   • Format selection ذكي (Progressive first → Direct stream)
 //   • FFmpeg فقط عند الحاجة (منفصل video+audio)
 //   • Smart format metadata caching
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.4-diagnostic-fastpath';
+const SERVER_VERSION = '6.3.5-6.0-stream-quality';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -63,7 +63,7 @@ app.use(express.text({ limit: '10mb' }));
 const infoCache = new NodeCache({ stdTTL: 7200 });          // 2 hours
 const trendingCache = new NodeCache({ stdTTL: 1200 });      // 20 minutes
 const streamCache = new NodeCache({ stdTTL: 240 });         // 4 minutes (URLs expire)
-const formatCache = new NodeCache({ stdTTL: 7200 });        // 2 hours (format metadata)
+const formatCache = new NodeCache({ stdTTL: 3600 });        // 1 hour (format metadata)
 const channelCache = new NodeCache({ stdTTL: 3600 });       // 1 hour
 const failureCache = new NodeCache({ stdTTL: 20 });         // 20 seconds
 const liveCache = new NodeCache({ stdTTL: 20 });             // short-lived live URLs
@@ -88,15 +88,6 @@ const log = {
   error: (msg) => console.error(`[${new Date().toISOString()}] ❌ ${msg}`),
   warn: (msg) => console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`)
 };
-
-function elapsedMs(startNs) {
-  return Number(process.hrtime.bigint() - startNs) / 1e6;
-}
-
-function videoDiag(label, videoId, startNs, extra = '') {
-  const suffix = extra ? ` ${extra}` : '';
-  log.info(`🎬 [VIDEO-DIAG] ${label} ${videoId} +${elapsedMs(startNs).toFixed(0)}ms${suffix}`);
-}
 
 // ==========================================================================
 // Concurrency limiter
@@ -201,7 +192,7 @@ function checkYtDlp() {
 // yt-dlp configuration — CRITICAL: DO NOT CHANGE
 // ==========================================================================
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=default,web_embedded;formats=missing_pot',
+  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
   '--js-runtimes', 'node'
 ];
 
@@ -309,7 +300,7 @@ async function getVideoInfo(videoId) {
 
   const promise = (async () => {
     try {
-      const stdout = await runYtDlp(['--no-playlist', '--dump-json', `https://www.youtube.com/watch?v=${videoId}`], { timeout: 45000 });
+      const stdout = await runYtDlp(['--dump-json', `https://www.youtube.com/watch?v=${videoId}`], { timeout: 45000 });
       const info = JSON.parse(stdout);
       infoCache.set(key, info);
       return info;
@@ -340,10 +331,9 @@ async function getFastProgressiveUrl(videoId, height) {
 
   const promise = (async () => {
     try {
-      // Exact progressive lookup only: never trade speed for a lower quality.
-      const selector = `best[height=${h}][vcodec!=none][acodec!=none]`;
+      const selector = `best[height<=${h}][vcodec!=none][acodec!=none]/best[height<=${h}]`;
       const stdout = await runYtDlp([
-        '--no-playlist', '--get-url', '-f', selector,
+        '--get-url', '-f', selector,
         `https://www.youtube.com/watch?v=${videoId}`
       ], { timeout: 22000, maxBuffer: 1024 * 1024 * 2 });
       const url = stdout.trim().split(/\r?\n/).filter(Boolean)[0];
@@ -563,42 +553,21 @@ function pickBestProgressiveUrl(metadata, requestedHeight = 0) {
 
 function getAvailableQualityObjects(metadata, videoId) {
   const formats = metadata?.allFormats || [];
-
-  // Build qualities from REAL video formats, not from a hard-coded list.
-  // Prefer the highest-quality video representation at each height.
-  const byHeight = new Map();
-  for (const f of formats) {
-    const height = Number(f?.height) || 0;
-    if (!height || f?.vcodec === 'none' || !f?.url) continue;
-
-    const current = byHeight.get(height);
-    const score = (Number(f.tbr) || 0) + (Number(f.fps) || 0) * 0.01;
-    const currentScore = current ? (Number(current.tbr) || 0) + (Number(current.fps) || 0) * 0.01 : -1;
-    if (!current || score > currentScore) byHeight.set(height, f);
-  }
-
-  return [...byHeight.entries()]
-    .sort(([a], [b]) => b - a)
-    .map(([height, best]) => {
-      const hasProgressive = formats.some(f =>
-        Number(f?.height) === height &&
-        f?.vcodec !== 'none' &&
-        f?.acodec !== 'none' &&
-        f?.url
-      );
-
-      return {
-        label: height >= 2160 ? '4K' : `${height}p`,
-        quality: String(height),
-        height,
-        width: Number(best.width) || null,
-        fps: Number(best.fps) || null,
-        codec: best.vcodec || null,
-        bitrate: Number(best.tbr) || null,
-        type: hasProgressive ? 'direct' : 'merged (ffmpeg)',
-        url: `/video?v=${encodeURIComponent(videoId)}&quality=${height}`
-      };
-    });
+  const heights = [...new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  )].sort((a, b) => b - a);
+  const progressiveHeights = new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  );
+  return heights.map(h => ({
+    label: h >= 2160 ? '4K' : `${h}p`,
+    quality: String(h),
+    height: h,
+    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
+    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
+  }));
 }
 
 async function getLiveStreamUrl(videoId) {
@@ -643,16 +612,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   };
   if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamStart = process.hrtime.bigint();
-  let firstUpstreamByte = false;
-  const upstreamReq = https.get(url, { headers, timeout: 30000, agent: keepAliveAgent, highWaterMark: 1024 * 1024 }, (upstreamRes) => {
-    log.info(`🎥 [STREAM-DIAG] upstream-headers status=${upstreamRes.statusCode} t=${elapsedMs(upstreamStart).toFixed(0)}ms range=${req.headers.range || 'none'}`);
-    upstreamRes.once('data', () => {
-      if (!firstUpstreamByte) {
-        firstUpstreamByte = true;
-        log.info(`🎥 [STREAM-DIAG] first-byte t=${elapsedMs(upstreamStart).toFixed(0)}ms status=${upstreamRes.statusCode}`);
-      }
-    });
+  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
@@ -671,12 +631,6 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
       .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
 
     if (req.method === 'HEAD') { upstreamRes.resume(); return res.end(); }
-    if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'public, max-age=60');
-    // Flush headers as soon as the upstream response arrives so Chrome can
-    // start processing the media response without waiting for the first body
-    // chunk. Node documents that headers are otherwise held until the first
-    // write.
-    if (typeof res.flushHeaders === 'function') res.flushHeaders();
     upstreamRes.pipe(res);
   });
 
@@ -686,9 +640,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
     if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
   });
 
-  req.on('close', () => {
-    if (!res.writableEnded && !res.destroyed) upstreamReq.destroy();
-  });
+  req.on('close', () => upstreamReq.destroy());
 }
 
 /**
@@ -701,34 +653,20 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
 
   const args = [
     '-loglevel', 'error', '-hide_banner',
-    '-probesize', '32k', '-analyzeduration', '0',
     ...inputArgs,
     '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
-    '-copyinkf',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-flush_packets', '1',
     '-f', 'mp4', 'pipe:1'
   ];
 
-  const ffStart = process.hrtime.bigint();
   res.status(200);
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('Cache-Control', 'no-cache, no-store');
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.setHeader('Cache-Control', 'no-cache');
 
   const ff = spawn('ffmpeg', args);
-  log.info(`🎞️ [STREAM-DIAG] ffmpeg-spawn t=${elapsedMs(ffStart).toFixed(0)}ms`);
   let stderrBuf = '';
   ff.stderr.on('data', d => { stderrBuf += d.toString(); });
-  let ffFirstOutput = false;
-  ff.stdout.once('data', () => {
-    if (!ffFirstOutput) {
-      ffFirstOutput = true;
-      log.info(`🎞️ [STREAM-DIAG] ffmpeg-first-output t=${elapsedMs(ffStart).toFixed(0)}ms`);
-    }
-  });
   ff.stdout.pipe(res);
   ff.on('error', (e) => {
     log.error(`ffmpeg spawn error: ${e.message}`);
@@ -757,12 +695,53 @@ const QUALITY_HEIGHTS = {
 };
 
 function resolveQuality(quality) {
-  if (quality === undefined || quality === null || String(quality).trim() === '') return null;
-  const q = String(quality).trim().toLowerCase().replace(/p$/, '');
+  if (!quality) return null;
+  const q = String(quality).toLowerCase().replace('p', '');
   if (q === 'audio') return { type: 'audio' };
-  const height = QUALITY_HEIGHTS[q] || Number.parseInt(q, 10);
-  if (!Number.isSafeInteger(height) || height <= 0 || height > 10000) return null;
-  return { type: 'merge', height };
+  const height = QUALITY_HEIGHTS[q] || parseInt(q, 10);
+  if (!height || Number.isNaN(height)) return null;
+  return { type: 'video', height };
+}
+
+function availableHeights(metadata) {
+  return [...new Set((metadata?.allFormats || [])
+    .filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
+    .map(f => Number(f.height)))]
+    .sort((a, b) => b - a);
+}
+
+function findExactProgressive(metadata, height) {
+  return (metadata?.allFormats || [])
+    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
+    .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
+}
+
+function findExactVideoOnly(metadata, height) {
+  return (metadata?.allFormats || [])
+    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
+    .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
+}
+
+function findBestAudio(metadata) {
+  return (metadata?.allFormats || [])
+    .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
+    .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0] || null;
+}
+
+function getAvailableQualityObjects(metadata, videoId) {
+  const formats = metadata?.allFormats || [];
+  const heights = availableHeights(metadata);
+  const progressiveHeights = new Set(
+    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
+      .map(f => Number(f.height))
+  );
+  return heights.map(h => ({
+    label: h >= 2160 ? '4K' : `${h}p`,
+    quality: String(h),
+    height: h,
+    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
+    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
+  }));
 }
 
 // ==========================================================================
@@ -1180,30 +1159,7 @@ app.get('/video', async (req, res) => {
   }
 
   try {
-    const resolvedEarly = resolveQuality(quality);
-    const diagStart = process.hrtime.bigint();
-
-    // FIRST-PLAY FAST PATH:
-    // For common progressive qualities, try one exact URL lookup BEFORE the
-    // expensive full metadata extraction. This is intentionally single-flight
-    // per video+quality, so simultaneous requests do not multiply the work.
-    // If no progressive representation exists, we fall back to the shared
-    // metadata path below (needed for video-only + audio FFmpeg merging).
-    if (resolvedEarly && resolvedEarly.type === 'merge' && resolvedEarly.height <= 720) {
-      videoDiag('fast-path:start', videoId, diagStart, `quality=${resolvedEarly.height}`);
-      const fastStart = process.hrtime.bigint();
-      const fastUrl = await getFastProgressiveUrl(videoId, resolvedEarly.height);
-      videoDiag('fast-path:done', videoId, diagStart, `quality=${resolvedEarly.height} took=${elapsedMs(fastStart).toFixed(0)}ms hit=${Boolean(fastUrl)}`);
-      if (fastUrl) {
-        log.success(`⚡ Fast progressive start: ${videoId}/${resolvedEarly.height} startup=${Date.now() - startTime}ms`);
-        return streamFromUpstream(req, res, fastUrl);
-      }
-    }
-
-    videoDiag('metadata:start', videoId, diagStart);
-    const metadataStart = process.hrtime.bigint();
     const metadata = await getFormatMetadata(videoId);
-    videoDiag('metadata:done', videoId, diagStart, `took=${elapsedMs(metadataStart).toFixed(0)}ms formats=${metadata.allFormats?.length || 0}`);
 
     if (metadata.isLive) {
       const liveUrl = await getLiveStreamUrl(videoId);
@@ -1211,98 +1167,68 @@ app.get('/video', async (req, res) => {
       return streamFromUpstream(req, res, liveUrl);
     }
 
-    const resolved = resolvedEarly || resolveQuality(quality);
+    const resolved = resolveQuality(quality);
 
-    // No quality means no forced 720p. Return the real quality list so the
-    // player can choose explicitly. This avoids silently pinning playback to
-    // one representation and makes missing-quality errors deterministic.
-    if (!resolved && !format) {
-      const qualities = getAvailableQualityObjects(metadata, videoId);
-      return res.status(400).json({
-        error: 'اختار الجودة من قائمة الجودات المتاحة',
-        qualities,
-        availableQualities: qualities.map(q => q.quality),
-        requestId: req.requestId
-      });
-    }
-
-    if (resolved) {
-      if (resolved.type === 'audio') {
-        const audio = (metadata.allFormats || [])
-          .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none' && f.url)
-          .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
-        if (!audio?.url) throw new Error('No audio-only format found');
-        return streamFromUpstream(req, res, audio.url);
-      }
-
-      const qKey = `stream_q_${videoId}_${resolved.height}`;
-      const cached = streamCache.get(qKey);
-      if (cached) return streamFromUpstream(req, res, cached);
-
-      // First try an exact progressive representation at the requested height.
-      // Do NOT silently downgrade 1080p -> 720p just because a progressive format exists.
-      const exactProgressive = (metadata.allFormats || [])
-        .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' &&
-          Number(f.height) === resolved.height)
-        .sort((a, b) => {
-          const abr = (Number(b.abr) || 0) - (Number(a.abr) || 0);
-          return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
-        })[0];
-
-      if (exactProgressive?.url) {
-        streamCache.set(qKey, exactProgressive.url);
-        streamCache.set(`fast_progressive_${videoId}_${resolved.height}`, exactProgressive.url);
-        videoDiag('metadata-progressive:direct', videoId, diagStart, `quality=${resolved.height}`);
-        return streamFromUpstream(req, res, exactProgressive.url);
-      }
-
-      // Only if the shared metadata did not contain a direct URL, make one
-      // targeted URL lookup. This is deliberately a fallback, not a parallel
-      // extraction, so simultaneous /info + /qualities + /video requests share
-      // the same expensive metadata operation.
-      if (resolved.height <= 720) {
-        const fastUrl = await getFastProgressiveUrl(videoId, resolved.height);
-        if (fastUrl) {
-          streamCache.set(qKey, fastUrl);
-          return streamFromUpstream(req, res, fastUrl);
-        }
-      }
-
-      // Separate video + audio: require the EXACT requested height.
-      // Never silently downgrade 1080p -> 720p (or 240p -> 144p).
-      const videoFormats = (metadata.allFormats || [])
-        .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) > 0);
-
-      const exactVideoFormats = videoFormats
-        .filter(f => Number(f.height) === resolved.height)
-        .sort((a, b) => {
-          const tbr = (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
-          return tbr || ((Number(b.fps) || 0) - (Number(a.fps) || 0));
-        });
-      const video = exactVideoFormats[0];
-
-      if (!video?.url) {
-        const available = getAvailableQualityObjects(metadata, videoId).map(q => q.quality);
+    // Explicit quality: exact height only. Never silently downgrade.
+    if (resolved?.type === 'video') {
+      const heights = availableHeights(metadata);
+      if (!heights.includes(resolved.height)) {
         return res.status(404).json({
           error: `الجودة ${resolved.height}p غير متاحة لهذا الفيديو`,
           requestedQuality: resolved.height,
-          availableQualities: available,
+          availableQualities: heights.map(String),
           requestId: req.requestId
         });
       }
 
-      const audio = (metadata.allFormats || [])
-        .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
-        .sort((a, b) => {
-          const abr = (Number(b.abr) || 0) - (Number(a.abr) || 0);
-          return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
-        })[0];
+      const cacheKey = `stream_q_${videoId}_${resolved.height}`;
+      const cached = streamCache.get(cacheKey);
+      if (cached) {
+        log.info(`⚡ Exact cached quality ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
+        return streamFromUpstream(req, res, cached);
+      }
 
-      videoDiag('ffmpeg:spawn', videoId, diagStart, `quality=${resolved.height}`);
+      // Keep 6.0's direct HTTP streaming path for progressive formats.
+      const progressive = findExactProgressive(metadata, resolved.height);
+      if (progressive?.url) {
+        streamCache.set(cacheKey, progressive.url);
+        log.info(`⚡ Exact progressive ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
+        return streamFromUpstream(req, res, progressive.url);
+      }
+
+      // Adaptive format: exact video height + best audio, remux only when necessary.
+      const video = findExactVideoOnly(metadata, resolved.height);
+      const audio = findBestAudio(metadata);
+      if (!video?.url) {
+        return res.status(404).json({
+          error: `الجودة ${resolved.height}p موجودة في القائمة لكن رابط الفيديو غير متاح حاليًا`,
+          requestedQuality: resolved.height,
+          availableQualities: heights.map(String),
+          requestId: req.requestId
+        });
+      }
+      log.info(`🎬 Exact adaptive ${videoId}/${resolved.height}p -> FFmpeg startup=${Date.now() - startTime}ms`);
       return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
     }
 
-    // Legacy compatibility.
+    if (resolved?.type === 'audio') {
+      const audio = findBestAudio(metadata);
+      if (!audio?.url) return res.status(404).json({ error: 'الصوت غير متاح', requestId: req.requestId });
+      return streamFromUpstream(req, res, audio.url);
+    }
+
+    // Default playback remains compatible with 6.0: direct progressive stream first.
+    if (!resolved && !format) {
+      const warmed = streamCache.get(`stream_default_${videoId}`);
+      if (warmed) return streamFromUpstream(req, res, warmed);
+      const best = pickBestProgressiveUrl(metadata, 720) || pickBestProgressiveUrl(metadata);
+      if (best?.url) {
+        streamCache.set(`stream_default_${videoId}`, best.url);
+        return streamFromUpstream(req, res, best.url);
+      }
+    }
+
+    // Legacy format parameter. Preserve explicit selector behavior.
     const selector = format || 'best[height<=720]/best';
     const urls = await getFormatUrls(videoId, selector);
     if (!urls.length) throw new Error('Failed to get stream URL');
@@ -1418,9 +1344,6 @@ app.get('/formats', async (req, res) => {
  * GET /video/qualities?v=VIDEO_ID
  * Returns available quality options
  */
-// The quality endpoint is the source of truth for player selectors.
-// It exposes every playable video height returned by yt-dlp; it never invents
-// missing 144p/240p/etc. representations.
 app.get('/video/qualities', async (req, res) => {
   const videoId = req.query.v;
   if (!videoId || !isValidVideoId(videoId)) {
@@ -1466,21 +1389,13 @@ app.get('/video/ready', async (req, res) => {
   try {
     const metadata = await getFormatMetadata(videoId);
     if (metadata.isLive) await getLiveStreamUrl(videoId);
-    const qualities = getAvailableQualityObjects(metadata, videoId);
-    const streams = Object.fromEntries(
-      qualities.map(q => [q.quality, q.url])
-    );
-
     return res.json({
       id: videoId,
       ready: true,
       isLive: Boolean(metadata.isLive),
       title: metadata.title,
-      qualities,
-      streams,
-      defaultQuality: qualities.some(q => q.height === 720) ? '720' : (qualities[0]?.quality || null),
-      // Backward-compatible field; the player should use streams/qualities for selection.
-      stream: qualities.find(q => q.quality === '720')?.url || qualities[0]?.url || null
+      qualities: getAvailableQualityObjects(metadata, videoId),
+      stream: `/video?v=${encodeURIComponent(videoId)}`
     });
   } catch (error) {
     return res.status(500).json({
@@ -1646,17 +1561,6 @@ app.use((err, req, res, next) => {
 // Server startup
 // ==========================================================================
 
-
-// ==========================================================================
-// v6.2.0 QUALITY SELECTOR HARDENING
-// - No implicit 720p default on /video.
-// - Numeric quality values are accepted beyond the old hard-coded table.
-// - Quality selection is exact; unavailable heights return 404 + alternatives.
-// - /formats returns the complete format list instead of truncating at 20.
-// - Player quality discovery remains based on real yt-dlp heights only.
-// - Upstream request cleanup avoids destroying completed responses.
-// ==========================================================================
-
 const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = checkYtDlp() ? '✅' : '❌';
   console.log(`
@@ -1669,9 +1573,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 ║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
-  log.success(`✅ Server ready - Persistent format cache + optimized video startup`);
+  log.success(`✅ Server ready - Optimized video startup`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
-  log.info(`⚡ Improvements: Shared metadata cache → Direct stream → FFmpeg fallback`);
+  log.info(`⚡ Improvements: Progressive format first → Direct stream → FFmpeg fallback`);
 });
 
 // Graceful shutdown
@@ -1694,35 +1598,5 @@ process.on('unhandledRejection', (reason) => {
   log.error(`Unhandled Rejection: ${reason}`);
 });
 
-/*
- * QUALITY SELECTOR NOTES
- * The API separates discovery from playback. Discovery reports only heights
- * that really exist in yt-dlp's format list. Playback receives one explicit
- * height and checks that exact representation before opening a stream. This
- * prevents a request for 1080p from silently becoming 720p and keeps 144p and
- * 240p available whenever the source actually exposes those representations.
- * Progressive formats are proxied directly because they already contain
- * audio. Adaptive formats are video-only and are paired with the strongest
- * available audio representation, then remuxed by FFmpeg without re-encoding.
- * The server never invents a quality that the source does not advertise. If
- * an exact requested height is unavailable, the API returns a clear 404 plus
- * an availableQualities array so the client can update its selector. Caches
- * are keyed by video id and exact height, so a cached 720p URL cannot be used
- * for a 1080p request. Range headers are preserved for direct streams.
- */
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-// quality-selector-hardening
-//xxxxxxxxxxx
-// v6.3.3: shared metadata extraction prevents duplicate yt-dlp work across /info, /qualities, and /video.
-// Direct URLs discovered in metadata are cached per exact quality; targeted --get-url is fallback only.
+
+// v6.3.5: 6.0 HTTP streaming engine + exact quality selector; no implicit downgrade.
