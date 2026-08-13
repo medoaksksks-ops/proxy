@@ -49,6 +49,7 @@ app.use((req, res, next) => {
   res.setHeader('Timing-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Type');
   res.setHeader('Vary', 'Origin');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
