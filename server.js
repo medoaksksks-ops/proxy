@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.2-chrome-tablet-optimized';
+const SERVER_VERSION = '6.3.3-persistent-format-cache';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -63,7 +63,7 @@ app.use(express.text({ limit: '10mb' }));
 const infoCache = new NodeCache({ stdTTL: 7200 });          // 2 hours
 const trendingCache = new NodeCache({ stdTTL: 1200 });      // 20 minutes
 const streamCache = new NodeCache({ stdTTL: 240 });         // 4 minutes (URLs expire)
-const formatCache = new NodeCache({ stdTTL: 3600 });        // 1 hour (format metadata)
+const formatCache = new NodeCache({ stdTTL: 7200 });        // 2 hours (format metadata)
 const channelCache = new NodeCache({ stdTTL: 3600 });       // 1 hour
 const failureCache = new NodeCache({ stdTTL: 20 });         // 20 seconds
 const liveCache = new NodeCache({ stdTTL: 20 });             // short-lived live URLs
@@ -634,7 +634,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   };
   if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamReq = https.get(url, { headers, timeout: 15000, agent: keepAliveAgent, highWaterMark: 512 * 1024 }, (upstreamRes) => {
+  const upstreamReq = https.get(url, { headers, timeout: 30000, agent: keepAliveAgent, highWaterMark: 1024 * 1024 }, (upstreamRes) => {
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
@@ -654,10 +654,12 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
 
     if (req.method === 'HEAD') { upstreamRes.resume(); return res.end(); }
     if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'public, max-age=60');
-    // Chrome-friendly streaming: send headers immediately and preserve upstream Range semantics.
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // Flush headers as soon as the upstream response arrives so Chrome can
+    // start processing the media response without waiting for the first body
+    // chunk. Node documents that headers are otherwise held until the first
+    // write.
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
-    upstreamRes.pipe(res, { end: true });
+    upstreamRes.pipe(res);
   });
 
   upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
@@ -681,22 +683,19 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
 
   const args = [
     '-loglevel', 'error', '-hide_banner',
-    '-probesize', '16k', '-analyzeduration', '0', '-fflags', 'nobuffer', '-avioflags', 'direct',
+    '-probesize', '32k', '-analyzeduration', '0',
     ...inputArgs,
     '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
     '-copyinkf',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-    '-flush_packets', '1', '-max_interleave_delta', '0',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-flush_packets', '1',
     '-f', 'mp4', 'pipe:1'
   ];
 
   res.status(200);
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  res.setHeader('Cache-Control', 'no-cache');
 
   const ff = spawn('ffmpeg', args);
   let stderrBuf = '';
@@ -1152,17 +1151,13 @@ app.get('/video', async (req, res) => {
   }
 
   try {
-    // Fast path: for common progressive qualities, resolve the exact direct URL
-    // before doing the full format metadata pass. This cuts first-play latency.
     const resolvedEarly = resolveQuality(quality);
-    if (resolvedEarly?.type === 'merge' && resolvedEarly.height <= 720 && req.method !== 'HEAD') {
-      const fastUrl = await getFastProgressiveUrl(videoId, resolvedEarly.height);
-      if (fastUrl) {
-        streamCache.set(`stream_q_${videoId}_${resolvedEarly.height}`, fastUrl);
-        return streamFromUpstream(req, res, fastUrl);
-      }
-    }
 
+    // IMPORTANT: never start a second yt-dlp extraction while another endpoint
+    // is already warming the same video's metadata.  The old fast path could
+    // launch --get-url in parallel with --dump-json, making /info, /qualities
+    // and /video compete and increasing first-play latency on slower devices.
+    // We now share one metadata extraction and use its direct URLs first.
     const metadata = await getFormatMetadata(videoId);
 
     if (metadata.isLive) {
@@ -1211,7 +1206,20 @@ app.get('/video', async (req, res) => {
 
       if (exactProgressive?.url) {
         streamCache.set(qKey, exactProgressive.url);
+        streamCache.set(`fast_progressive_${videoId}_${resolved.height}`, exactProgressive.url);
         return streamFromUpstream(req, res, exactProgressive.url);
+      }
+
+      // Only if the shared metadata did not contain a direct URL, make one
+      // targeted URL lookup. This is deliberately a fallback, not a parallel
+      // extraction, so simultaneous /info + /qualities + /video requests share
+      // the same expensive metadata operation.
+      if (resolved.height <= 720) {
+        const fastUrl = await getFastProgressiveUrl(videoId, resolved.height);
+        if (fastUrl) {
+          streamCache.set(qKey, fastUrl);
+          return streamFromUpstream(req, res, fastUrl);
+        }
       }
 
       // Separate video + audio: require the EXACT requested height.
@@ -1593,7 +1601,7 @@ app.use((err, req, res, next) => {
 
 
 // ==========================================================================
-// v6.3.2 CHROME TABLET OPTIMIZATION
+// v6.2.0 QUALITY SELECTOR HARDENING
 // - No implicit 720p default on /video.
 // - Numeric quality values are accepted beyond the old hard-coded table.
 // - Quality selection is exact; unavailable heights return 404 + alternatives.
@@ -1614,9 +1622,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 ║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
-  log.success(`✅ Server ready - Chrome Tablet optimized: fast first byte + Range-aware proxy + low-buffer FFmpeg`);
+  log.success(`✅ Server ready - Persistent format cache + optimized video startup`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
-  log.info(`⚡ Improvements: Progressive format first → Direct stream → FFmpeg fallback`);
+  log.info(`⚡ Improvements: Shared metadata cache → Direct stream → FFmpeg fallback`);
 });
 
 // Graceful shutdown
@@ -1669,3 +1677,5 @@ process.on('unhandledRejection', (reason) => {
 // quality-selector-hardening
 // quality-selector-hardening
 //xxxxxxxxxxx
+// v6.3.3: shared metadata extraction prevents duplicate yt-dlp work across /info, /qualities, and /video.
+// Direct URLs discovered in metadata are cached per exact quality; targeted --get-url is fallback only.
