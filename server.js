@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.6-6.0-stream-quality-ytdlp-client-fix';
+const SERVER_VERSION = '6.4.0-quality-scale-recommended-cors-fix';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
