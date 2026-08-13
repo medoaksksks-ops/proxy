@@ -8,14 +8,14 @@ const https = require('https');
 require('dotenv').config();
 
 // ==========================================================================
-// 🔖 server v6.2.0 "جبارة ⚡" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
+// 🔖 server v6.3.4 "Diagnostic + Fast Path" — تحسينات startup latency مع الحفاظ على كل الـfeatures:
 //   • Format selection ذكي (Progressive first → Direct stream)
 //   • FFmpeg فقط عند الحاجة (منفصل video+audio)
 //   • Smart format metadata caching
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.3-persistent-format-cache';
+const SERVER_VERSION = '6.3.4-diagnostic-fastpath';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -88,6 +88,15 @@ const log = {
   error: (msg) => console.error(`[${new Date().toISOString()}] ❌ ${msg}`),
   warn: (msg) => console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`)
 };
+
+function elapsedMs(startNs) {
+  return Number(process.hrtime.bigint() - startNs) / 1e6;
+}
+
+function videoDiag(label, videoId, startNs, extra = '') {
+  const suffix = extra ? ` ${extra}` : '';
+  log.info(`🎬 [VIDEO-DIAG] ${label} ${videoId} +${elapsedMs(startNs).toFixed(0)}ms${suffix}`);
+}
 
 // ==========================================================================
 // Concurrency limiter
@@ -300,7 +309,7 @@ async function getVideoInfo(videoId) {
 
   const promise = (async () => {
     try {
-      const stdout = await runYtDlp(['--dump-json', `https://www.youtube.com/watch?v=${videoId}`], { timeout: 45000 });
+      const stdout = await runYtDlp(['--no-playlist', '--dump-json', `https://www.youtube.com/watch?v=${videoId}`], { timeout: 45000 });
       const info = JSON.parse(stdout);
       infoCache.set(key, info);
       return info;
@@ -334,7 +343,7 @@ async function getFastProgressiveUrl(videoId, height) {
       // Exact progressive lookup only: never trade speed for a lower quality.
       const selector = `best[height=${h}][vcodec!=none][acodec!=none]`;
       const stdout = await runYtDlp([
-        '--get-url', '-f', selector,
+        '--no-playlist', '--get-url', '-f', selector,
         `https://www.youtube.com/watch?v=${videoId}`
       ], { timeout: 22000, maxBuffer: 1024 * 1024 * 2 });
       const url = stdout.trim().split(/\r?\n/).filter(Boolean)[0];
@@ -634,7 +643,16 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   };
   if (req.headers.range) headers['Range'] = req.headers.range;
 
+  const upstreamStart = process.hrtime.bigint();
+  let firstUpstreamByte = false;
   const upstreamReq = https.get(url, { headers, timeout: 30000, agent: keepAliveAgent, highWaterMark: 1024 * 1024 }, (upstreamRes) => {
+    log.info(`🎥 [STREAM-DIAG] upstream-headers status=${upstreamRes.statusCode} t=${elapsedMs(upstreamStart).toFixed(0)}ms range=${req.headers.range || 'none'}`);
+    upstreamRes.once('data', () => {
+      if (!firstUpstreamByte) {
+        firstUpstreamByte = true;
+        log.info(`🎥 [STREAM-DIAG] first-byte t=${elapsedMs(upstreamStart).toFixed(0)}ms status=${upstreamRes.statusCode}`);
+      }
+    });
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
@@ -693,13 +711,24 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
     '-f', 'mp4', 'pipe:1'
   ];
 
+  const ffStart = process.hrtime.bigint();
   res.status(200);
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Accept-Ranges', 'none');
+  res.setHeader('Cache-Control', 'no-cache, no-store');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   const ff = spawn('ffmpeg', args);
+  log.info(`🎞️ [STREAM-DIAG] ffmpeg-spawn t=${elapsedMs(ffStart).toFixed(0)}ms`);
   let stderrBuf = '';
   ff.stderr.on('data', d => { stderrBuf += d.toString(); });
+  let ffFirstOutput = false;
+  ff.stdout.once('data', () => {
+    if (!ffFirstOutput) {
+      ffFirstOutput = true;
+      log.info(`🎞️ [STREAM-DIAG] ffmpeg-first-output t=${elapsedMs(ffStart).toFixed(0)}ms`);
+    }
+  });
   ff.stdout.pipe(res);
   ff.on('error', (e) => {
     log.error(`ffmpeg spawn error: ${e.message}`);
@@ -1152,13 +1181,29 @@ app.get('/video', async (req, res) => {
 
   try {
     const resolvedEarly = resolveQuality(quality);
+    const diagStart = process.hrtime.bigint();
 
-    // IMPORTANT: never start a second yt-dlp extraction while another endpoint
-    // is already warming the same video's metadata.  The old fast path could
-    // launch --get-url in parallel with --dump-json, making /info, /qualities
-    // and /video compete and increasing first-play latency on slower devices.
-    // We now share one metadata extraction and use its direct URLs first.
+    // FIRST-PLAY FAST PATH:
+    // For common progressive qualities, try one exact URL lookup BEFORE the
+    // expensive full metadata extraction. This is intentionally single-flight
+    // per video+quality, so simultaneous requests do not multiply the work.
+    // If no progressive representation exists, we fall back to the shared
+    // metadata path below (needed for video-only + audio FFmpeg merging).
+    if (resolvedEarly && resolvedEarly.type === 'merge' && resolvedEarly.height <= 720) {
+      videoDiag('fast-path:start', videoId, diagStart, `quality=${resolvedEarly.height}`);
+      const fastStart = process.hrtime.bigint();
+      const fastUrl = await getFastProgressiveUrl(videoId, resolvedEarly.height);
+      videoDiag('fast-path:done', videoId, diagStart, `quality=${resolvedEarly.height} took=${elapsedMs(fastStart).toFixed(0)}ms hit=${Boolean(fastUrl)}`);
+      if (fastUrl) {
+        log.success(`⚡ Fast progressive start: ${videoId}/${resolvedEarly.height} startup=${Date.now() - startTime}ms`);
+        return streamFromUpstream(req, res, fastUrl);
+      }
+    }
+
+    videoDiag('metadata:start', videoId, diagStart);
+    const metadataStart = process.hrtime.bigint();
     const metadata = await getFormatMetadata(videoId);
+    videoDiag('metadata:done', videoId, diagStart, `took=${elapsedMs(metadataStart).toFixed(0)}ms formats=${metadata.allFormats?.length || 0}`);
 
     if (metadata.isLive) {
       const liveUrl = await getLiveStreamUrl(videoId);
@@ -1166,7 +1211,7 @@ app.get('/video', async (req, res) => {
       return streamFromUpstream(req, res, liveUrl);
     }
 
-    const resolved = resolveQuality(quality);
+    const resolved = resolvedEarly || resolveQuality(quality);
 
     // No quality means no forced 720p. Return the real quality list so the
     // player can choose explicitly. This avoids silently pinning playback to
@@ -1207,6 +1252,7 @@ app.get('/video', async (req, res) => {
       if (exactProgressive?.url) {
         streamCache.set(qKey, exactProgressive.url);
         streamCache.set(`fast_progressive_${videoId}_${resolved.height}`, exactProgressive.url);
+        videoDiag('metadata-progressive:direct', videoId, diagStart, `quality=${resolved.height}`);
         return streamFromUpstream(req, res, exactProgressive.url);
       }
 
@@ -1252,6 +1298,7 @@ app.get('/video', async (req, res) => {
           return abr || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
         })[0];
 
+      videoDiag('ffmpeg:spawn', videoId, diagStart, `quality=${resolved.height}`);
       return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
     }
 
