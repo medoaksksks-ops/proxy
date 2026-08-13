@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.1-speed-engine';
+const SERVER_VERSION = '6.3.2-chrome-tablet-optimized';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -634,7 +634,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
   };
   if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamReq = https.get(url, { headers, timeout: 30000, agent: keepAliveAgent, highWaterMark: 1024 * 1024 }, (upstreamRes) => {
+  const upstreamReq = https.get(url, { headers, timeout: 15000, agent: keepAliveAgent, highWaterMark: 512 * 1024 }, (upstreamRes) => {
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
@@ -654,7 +654,10 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
 
     if (req.method === 'HEAD') { upstreamRes.resume(); return res.end(); }
     if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'public, max-age=60');
-    upstreamRes.pipe(res);
+    // Chrome-friendly streaming: send headers immediately and preserve upstream Range semantics.
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+    upstreamRes.pipe(res, { end: true });
   });
 
   upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
@@ -678,19 +681,22 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
 
   const args = [
     '-loglevel', 'error', '-hide_banner',
-    '-probesize', '32k', '-analyzeduration', '0',
+    '-probesize', '16k', '-analyzeduration', '0', '-fflags', 'nobuffer', '-avioflags', 'direct',
     ...inputArgs,
     '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
     '-copyinkf',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-flush_packets', '1',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
+    '-flush_packets', '1', '-max_interleave_delta', '0',
     '-f', 'mp4', 'pipe:1'
   ];
 
   res.status(200);
   res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Accept-Ranges', 'none');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   const ff = spawn('ffmpeg', args);
   let stderrBuf = '';
@@ -1149,7 +1155,7 @@ app.get('/video', async (req, res) => {
     // Fast path: for common progressive qualities, resolve the exact direct URL
     // before doing the full format metadata pass. This cuts first-play latency.
     const resolvedEarly = resolveQuality(quality);
-    if (resolvedEarly?.type === 'merge' && resolvedEarly.height <= 720) {
+    if (resolvedEarly?.type === 'merge' && resolvedEarly.height <= 720 && req.method !== 'HEAD') {
       const fastUrl = await getFastProgressiveUrl(videoId, resolvedEarly.height);
       if (fastUrl) {
         streamCache.set(`stream_q_${videoId}_${resolvedEarly.height}`, fastUrl);
@@ -1587,7 +1593,7 @@ app.use((err, req, res, next) => {
 
 
 // ==========================================================================
-// v6.2.0 QUALITY SELECTOR HARDENING
+// v6.3.2 CHROME TABLET OPTIMIZATION
 // - No implicit 720p default on /video.
 // - Numeric quality values are accepted beyond the old hard-coded table.
 // - Quality selection is exact; unavailable heights return 404 + alternatives.
@@ -1608,7 +1614,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 ║  http://0.0.0.0:${PORT}                        ║
 ╚═══════════════════════════════════════════╝
   `);
-  log.success(`✅ Server ready - Optimized video startup`);
+  log.success(`✅ Server ready - Chrome Tablet optimized: fast first byte + Range-aware proxy + low-buffer FFmpeg`);
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
   log.info(`⚡ Improvements: Progressive format first → Direct stream → FFmpeg fallback`);
 });
