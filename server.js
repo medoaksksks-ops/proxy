@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.6-6.0-stream-quality-ytdlp-client-fix';
+const SERVER_VERSION = '6.3.7-exact-quality-url-fallback';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -712,19 +712,19 @@ function availableHeights(metadata) {
 
 function findExactProgressive(metadata, height) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
+    .filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
     .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
 }
 
 function findExactVideoOnly(metadata, height) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
+    .filter(f => f && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
     .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
 }
 
 function findBestAudio(metadata) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
+    .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none')
     .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0] || null;
 }
 
@@ -1190,25 +1190,58 @@ app.get('/video', async (req, res) => {
 
       // Keep 6.0's direct HTTP streaming path for progressive formats.
       const progressive = findExactProgressive(metadata, resolved.height);
-      if (progressive?.url) {
-        streamCache.set(cacheKey, progressive.url);
-        log.info(`⚡ Exact progressive ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
-        return streamFromUpstream(req, res, progressive.url);
+      if (progressive) {
+        let progressiveUrl = progressive.url || null;
+        // Some YouTube clients expose an exact format in metadata without a URL.
+        // Resolve that exact format ID on demand; never substitute another height.
+        if (!progressiveUrl && progressive.format_id) {
+          const urls = await getFormatUrls(videoId, String(progressive.format_id));
+          progressiveUrl = urls[0] || null;
+        }
+        if (progressiveUrl) {
+          streamCache.set(cacheKey, progressiveUrl);
+          log.info(`⚡ Exact progressive ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
+          return streamFromUpstream(req, res, progressiveUrl);
+        }
       }
 
       // Adaptive format: exact video height + best audio, remux only when necessary.
+      // The selected video/audio format IDs are resolved individually when their
+      // metadata entry has no URL (for example SABR-exposed formats).
       const video = findExactVideoOnly(metadata, resolved.height);
       const audio = findBestAudio(metadata);
-      if (!video?.url) {
+      if (!video?.format_id) {
         return res.status(404).json({
-          error: `الجودة ${resolved.height}p موجودة في القائمة لكن رابط الفيديو غير متاح حاليًا`,
+          error: `الجودة ${resolved.height}p غير متاحة كرابط تشغيل مباشر حاليًا`,
           requestedQuality: resolved.height,
           availableQualities: heights.map(String),
           requestId: req.requestId
         });
       }
+
+      let videoUrl = video.url || null;
+      if (!videoUrl) {
+        const urls = await getFormatUrls(videoId, String(video.format_id));
+        videoUrl = urls[0] || null;
+      }
+
+      let audioUrl = audio?.url || null;
+      if (!audioUrl && audio?.format_id) {
+        const urls = await getFormatUrls(videoId, String(audio.format_id));
+        audioUrl = urls[0] || null;
+      }
+
+      if (!videoUrl) {
+        return res.status(404).json({
+          error: `الجودة ${resolved.height}p موجودة لكن YouTube لم يعطِ رابط تشغيل لها`,
+          requestedQuality: resolved.height,
+          availableQualities: heights.map(String),
+          requestId: req.requestId
+        });
+      }
+
       log.info(`🎬 Exact adaptive ${videoId}/${resolved.height}p -> FFmpeg startup=${Date.now() - startTime}ms`);
-      return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
+      return streamMergedViaFfmpeg(req, res, videoUrl, audioUrl || null);
     }
 
     if (resolved?.type === 'audio') {
