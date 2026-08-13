@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.7-exact-quality-url-fallback';
+const SERVER_VERSION = '6.3.6-6.0-stream-quality-ytdlp-client-fix';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -270,7 +270,12 @@ const UNWANTED_KEYWORDS = [
   'cartoon', 'kids', 'for kids', 'nursery rhyme', 'nursery rhymes', 'cocomelon',
   'baby shark', 'peppa pig', 'toddler', 'preschool', 'children song',
   'وصفة', 'وصفات', 'طبخ', 'طبخة', 'طريقة عمل', 'حلويات', 'أكلة', 'اكلة',
-  'مطبخ', 'شيف', 'recipe', 'cooking', 'kitchen'
+  'مطبخ', 'شيف', 'recipe', 'cooking', 'kitchen',
+  // سبام / إعلانات / محتوى رخيص
+  'مراهنات', 'قمار', 'betting', 'كازينو', 'casino', 'bet365', '1xbet',
+  'sub4sub', 'اشترك ولايك', 'ربح فلوس بسهولة', 'اربح المال بسهولة', 'استثمار سريع',
+  'فيديو مسرب', 'مسربة', 'leaked video', 'اضغط هنا', 'click here',
+  'فرصة العمر', 'اربح ايفون', 'اربح جوال'
 ];
 
 function isUnwantedContent(title) {
@@ -281,6 +286,41 @@ function isUnwantedContent(title) {
 
 function filterUnwanted(items) {
   return items.filter(v => !isUnwantedContent(v.title));
+}
+
+/**
+ * منع قناة واحدة إنها تسيطر على الفيد — بيسمح بحد أقصى maxPerChannel فيديو
+ * لكل قناة عشان المحتوى المقترح يفضل متنوع.
+ */
+function diversifyByChannel(items, maxPerChannel = 2) {
+  const counts = new Map();
+  const result = [];
+  for (const v of items) {
+    const key = v.channelId || v.author || 'unknown';
+    const c = counts.get(key) || 0;
+    if (c >= maxPerChannel) continue;
+    counts.set(key, c + 1);
+    result.push(v);
+  }
+  return result;
+}
+
+/**
+ * دمج round-robin: بياخد فيديو واحد بالتبادل من كل قايمة بدل التجميع
+ * التسلسلي + خلط عشوائي كامل، عشان المحتوى يبقى متنوع فعلاً مش عشوائي بحت.
+ */
+function roundRobinMerge(lists) {
+  const result = [];
+  let i = 0;
+  let added = true;
+  while (added) {
+    added = false;
+    for (const list of lists) {
+      if (list[i]) { result.push(list[i]); added = true; }
+    }
+    i++;
+  }
+  return result;
 }
 
 // ==========================================================================
@@ -551,25 +591,6 @@ function pickBestProgressiveUrl(metadata, requestedHeight = 0) {
   })[0];
 }
 
-function getAvailableQualityObjects(metadata, videoId) {
-  const formats = metadata?.allFormats || [];
-  const heights = [...new Set(
-    formats.filter(f => f && f.vcodec !== 'none' && Number(f.height) > 0)
-      .map(f => Number(f.height))
-  )].sort((a, b) => b - a);
-  const progressiveHeights = new Set(
-    formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
-      .map(f => Number(f.height))
-  );
-  return heights.map(h => ({
-    label: h >= 2160 ? '4K' : `${h}p`,
-    quality: String(h),
-    height: h,
-    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
-    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
-  }));
-}
-
 async function getLiveStreamUrl(videoId) {
   const key = `live_${videoId}`;
   const cached = liveCache.get(key);
@@ -680,6 +701,67 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
   req.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
 }
 
+/**
+ * Stream a video re-scaled (via ffmpeg -vf scale) to an exact target height.
+ * Used when the requested standard quality (زي 240 أو 480) مش موجودة أصلًا
+ * كـformat مستقل عند يوتيوب، فبنولّدها من أقرب جودة أعلى متاحة.
+ */
+function streamScaledViaFfmpeg(req, res, videoUrl, audioUrl, targetHeight) {
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  const inputArgs = ['-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', videoUrl];
+  if (audioUrl) inputArgs.push('-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', audioUrl);
+
+  const args = [
+    '-loglevel', 'error', '-hide_banner',
+    ...inputArgs,
+    '-map', '0:v:0', ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
+    '-vf', `scale=-2:${targetHeight}`,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-c:a', 'aac', '-b:a', targetHeight <= 240 ? '96k' : '128k',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'mp4', 'pipe:1'
+  ];
+
+  res.status(200);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Cache-Control', 'no-cache');
+
+  const ff = spawn('ffmpeg', args);
+  let stderrBuf = '';
+  ff.stderr.on('data', d => { stderrBuf += d.toString(); });
+  ff.stdout.pipe(res);
+  ff.on('error', (e) => {
+    log.error(`ffmpeg (scale) spawn error: ${e.message}`);
+    if (!res.headersSent) res.status(500).json({ error: 'ffmpeg غير متاح على السيرفر' });
+  });
+  ff.on('close', (code) => {
+    if (code !== 0 && code !== null && !res.writableEnded) {
+      log.warn(`ffmpeg (scale ${targetHeight}p) exited with code ${code}: ${stderrBuf.slice(-300)}`);
+    }
+  });
+  req.on('close', () => { try { ff.kill('SIGKILL'); } catch {} });
+}
+
+/**
+ * Pick the best source format to downscale from when the exact requested
+ * height doesn't exist natively. Prefers the smallest available format
+ * that is still >= target (less CPU work), falls back to the largest
+ * available format otherwise (never upscale beyond the real source).
+ */
+function findClosestSourceForHeight(metadata, targetHeight) {
+  const formats = (metadata?.allFormats || [])
+    .filter(f => f && f.url && f.vcodec !== 'none' && Number(f.height) > 0);
+  if (!formats.length) return null;
+
+  const higherOrEqual = formats
+    .filter(f => Number(f.height) >= targetHeight)
+    .sort((a, b) => Number(a.height) - Number(b.height) || (Number(b.tbr) || 0) - (Number(a.tbr) || 0));
+  if (higherOrEqual.length) return higherOrEqual[0];
+
+  return formats
+    .sort((a, b) => Number(b.height) - Number(a.height) || (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0];
+}
+
 // ==========================================================================
 // Quality mapping
 // ==========================================================================
@@ -712,36 +794,52 @@ function availableHeights(metadata) {
 
 function findExactProgressive(metadata, height) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
+    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) === Number(height))
     .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
 }
 
 function findExactVideoOnly(metadata, height) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
+    .filter(f => f && f.url && f.vcodec !== 'none' && f.acodec === 'none' && Number(f.height) === Number(height))
     .sort((a, b) => (Number(b.tbr) || 0) - (Number(a.tbr) || 0))[0] || null;
 }
 
 function findBestAudio(metadata) {
   return (metadata?.allFormats || [])
-    .filter(f => f && f.vcodec === 'none' && f.acodec !== 'none')
+    .filter(f => f && f.url && f.vcodec === 'none' && f.acodec !== 'none')
     .sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0] || null;
 }
 
+// كل الجودات القياسية اللي المفروض نعرضها للمستخدم لو المصدر يسمح
+const STANDARD_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160];
+
 function getAvailableQualityObjects(metadata, videoId) {
   const formats = metadata?.allFormats || [];
-  const heights = availableHeights(metadata);
+  const nativeHeights = availableHeights(metadata); // الجودات الموجودة فعليًا عند يوتيوب
+  const maxNative = nativeHeights[0] || 0;
   const progressiveHeights = new Set(
     formats.filter(f => f && f.vcodec !== 'none' && f.acodec !== 'none' && Number(f.height) > 0)
       .map(f => Number(f.height))
   );
-  return heights.map(h => ({
-    label: h >= 2160 ? '4K' : `${h}p`,
-    quality: String(h),
-    height: h,
-    type: progressiveHeights.has(h) ? 'direct' : 'merged (ffmpeg)',
-    url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
-  }));
+
+  // نعرض كل جودة قياسية <= أعلى جودة موجودة فعلاً (عشان منعرضش جودة أعلى من المصدر نفسه)
+  const standardOffered = STANDARD_QUALITIES.filter(h => h <= maxNative);
+  // + أي جودة أصلية غير قياسية (مثلاً لو فيه height غريب) نضيفها برضو
+  const offerHeights = [...new Set([...standardOffered, ...nativeHeights])].sort((a, b) => b - a);
+
+  return offerHeights.map(h => {
+    let type;
+    if (progressiveHeights.has(h)) type = 'direct';
+    else if (nativeHeights.includes(h)) type = 'merged (ffmpeg)';
+    else type = 'scaled (ffmpeg)'; // مش موجودة أصلًا عند يوتيوب، هتتعمل بالـscale من أقرب جودة أعلى
+    return {
+      label: h >= 2160 ? '4K' : `${h}p`,
+      quality: String(h),
+      height: h,
+      type,
+      url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
+    };
+  });
 }
 
 // ==========================================================================
@@ -796,39 +894,46 @@ async function getFollowedCreatorsPool(perCreator = 4) {
   const settled = await Promise.allSettled(
     FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearch${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
   );
-  const pool = [];
+  const perCreatorLists = [];
   settled.forEach((r, i) => {
-    if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
-    else log.warn(`Followed creator fetch failed "${FOLLOWED_CREATORS[i]}": ${r.reason?.message}`);
+    if (r.status === 'fulfilled') perCreatorLists.push(filterUnwanted(parseFlatItems(r.value)));
+    else { log.warn(`Followed creator fetch failed "${FOLLOWED_CREATORS[i]}": ${r.reason?.message}`); perCreatorLists.push([]); }
   });
-  return pool;
+  // مزج متساوي بين كل القنوات المفضلة بدل ما تتجمع مصفوفة ورا التانية
+  return roundRobinMerge(perCreatorLists);
 }
 
 async function getRecommendedVideos(region = 'EG', limit = 20) {
   let items = [];
+  let hadCreatorsSignal = false;
   const seen = new Set();
   function addUnique(list) {
     list.forEach(v => { if (v && v.id && !seen.has(v.id)) { seen.add(v.id); items.push(v); } });
   }
 
+  // 1) القنوات المفضلة (أقوى إشارة تخصيص) — بحد أقصى فيديوهين لكل قناة عشان التنوع
   try {
     const perCreator = Math.max(3, Math.ceil((limit * 1.4) / FOLLOWED_CREATORS.length));
-    const creatorsPool = await getFollowedCreatorsPool(perCreator);
-    addUnique(creatorsPool.sort(() => Math.random() - 0.5));
+    const creatorsPool = diversifyByChannel(await getFollowedCreatorsPool(perCreator), 2);
+    if (creatorsPool.length) hadCreatorsSignal = true;
+    addUnique(creatorsPool);
   } catch (e) {
     log.warn(`Followed creators pool failed: ${e.message}`);
   }
 
+  // 2) الرائج في المنطقة — تكملة لو لسه ناقص
   if (items.length < limit) {
     try {
       const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
       const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(limit * 2), url]);
-      addUnique(filterUnwanted(parseFlatItems(stdout)));
+      const trendingItems = diversifyByChannel(filterUnwanted(parseFlatItems(stdout)), 2);
+      addUnique(trendingItems);
     } catch (e) {
       log.warn(`Trending feed failed (${e.message}), falling back to search-based mix`);
     }
   }
 
+  // 3) مواضيع عامة كـfallback أخير لو لسه ناقص
   if (items.length < limit) {
     const topicPool = [
       'أخبار مصر اليوم', 'أغاني مصرية جديدة', 'كوميدي مصري', 'رياضة مصر أهداف',
@@ -841,21 +946,22 @@ async function getRecommendedVideos(region = 'EG', limit = 20) {
     const settled = await Promise.allSettled(
       shuffled.map(q => runYtDlp([`ytsearch${perQuery}:${q}`, '--dump-json', '--flat-playlist']))
     );
-    const pool = [];
+    const perTopicLists = [];
     settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
-      else log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`);
+      if (r.status === 'fulfilled') perTopicLists.push(filterUnwanted(parseFlatItems(r.value)));
+      else { log.warn(`Recommended fallback query failed "${shuffled[i]}": ${r.reason?.message}`); perTopicLists.push([]); }
     });
-    addUnique(pool.sort(() => Math.random() - 0.5));
+    addUnique(diversifyByChannel(roundRobinMerge(perTopicLists), 2));
   }
 
-  return { items: items.slice(0, limit), personalized: false };
+  return { items: items.slice(0, limit), personalized: hadCreatorsSignal };
 }
 
 // ==========================================================================
 // Home sections
 // ==========================================================================
 const HOME_SECTIONS = [
+  { key: 'recommended', title: '✨ مقترح لك', query: 'RECOMMENDED' },
   { key: 'trending', title: '🔥 الرائج الآن', query: null },
   { key: 'music', title: '🎵 موسيقى', query: 'أغاني عربي جديد 2026' },
   { key: 'sports', title: '⚽ رياضة', query: 'أهداف وملخصات مباريات' },
@@ -878,7 +984,10 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
   const promises = HOME_SECTIONS.map(async section => {
     try {
       let items = [];
-      if (section.query === null) {
+      if (section.query === 'RECOMMENDED') {
+        const { items: recItems } = await getRecommendedVideos(region, perSection);
+        items = recItems;
+      } else if (section.query === null) {
         const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
         const stdout = await runYtDlp(['--dump-json', '--flat-playlist', '--playlist-end', String(perSection + 1), url]);
         items = filterUnwanted(parseFlatItems(stdout)).slice(0, perSection);
@@ -956,6 +1065,7 @@ app.get('/', (req, res) => {
     concurrency: { max: YTDLP_CONCURRENCY },
     endpoints: {
       home: '/home?region=EG&perSection=12',
+      recommended: '/recommended?region=EG&limit=20&page=1',
       trending: '/trending?region=EG&limit=20&page=1',
       video: '/video?v=VIDEO_ID&quality=1080',
       videoQualities: '/video/qualities?v=VIDEO_ID',
@@ -1028,6 +1138,29 @@ app.get('/trending', async (req, res) => {
     log.error(`Error fetching trending: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب الفيديوهات الرائجة',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * GET /recommended?region=EG&limit=20&page=1
+ * محتوى مقترح شخصي: قنوات مفضلة + رائج + مواضيع، متنوع ومفلتر من السبام
+ */
+app.get('/recommended', async (req, res) => {
+  const region = (req.query.region || 'EG').toUpperCase();
+  try {
+    const { page, limit, results, hasMore } = await getPaginatedPool(
+      trendingCache, `recommended_${region}`,
+      (poolSize) => getRecommendedVideos(region, poolSize).then(r => r.items),
+      req.query.page, req.query.limit, 100
+    );
+    log.success(`✅ Recommended done: ${region} page ${page}`);
+    res.json({ region, page, limit, count: results.length, hasMore, results });
+  } catch (error) {
+    log.error(`Error fetching recommended: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب المحتوى المقترح',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -1169,10 +1302,13 @@ app.get('/video', async (req, res) => {
 
     const resolved = resolveQuality(quality);
 
-    // Explicit quality: exact height only. Never silently downgrade.
+    // Explicit quality: نحاول نلاقي الجودة بالظبط، ولو مش موجودة أصلًا عند يوتيوب
+    // (زي 240/480 اللي بقت شبه نادرة كـformats مستقلة) بنعملها scale من أقرب جودة أعلى بدل ما نرفض الطلب.
     if (resolved?.type === 'video') {
       const heights = availableHeights(metadata);
-      if (!heights.includes(resolved.height)) {
+      const maxNative = heights[0] || 0;
+
+      if (resolved.height > maxNative) {
         return res.status(404).json({
           error: `الجودة ${resolved.height}p غير متاحة لهذا الفيديو`,
           requestedQuality: resolved.height,
@@ -1185,63 +1321,45 @@ app.get('/video', async (req, res) => {
       const cached = streamCache.get(cacheKey);
       if (cached) {
         log.info(`⚡ Exact cached quality ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
+        if (cached.scaled) return streamScaledViaFfmpeg(req, res, cached.videoUrl, cached.audioUrl, resolved.height);
         return streamFromUpstream(req, res, cached);
       }
 
-      // Keep 6.0's direct HTTP streaming path for progressive formats.
-      const progressive = findExactProgressive(metadata, resolved.height);
-      if (progressive) {
-        let progressiveUrl = progressive.url || null;
-        // Some YouTube clients expose an exact format in metadata without a URL.
-        // Resolve that exact format ID on demand; never substitute another height.
-        if (!progressiveUrl && progressive.format_id) {
-          const urls = await getFormatUrls(videoId, String(progressive.format_id));
-          progressiveUrl = urls[0] || null;
-        }
-        if (progressiveUrl) {
-          streamCache.set(cacheKey, progressiveUrl);
+      if (heights.includes(resolved.height)) {
+        // الجودة موجودة أصلًا كـformat عند يوتيوب
+        // Keep 6.0's direct HTTP streaming path for progressive formats.
+        const progressive = findExactProgressive(metadata, resolved.height);
+        if (progressive?.url) {
+          streamCache.set(cacheKey, progressive.url);
           log.info(`⚡ Exact progressive ${videoId}/${resolved.height}p startup=${Date.now() - startTime}ms`);
-          return streamFromUpstream(req, res, progressiveUrl);
+          return streamFromUpstream(req, res, progressive.url);
         }
+
+        // Adaptive format: exact video height + best audio, remux only when necessary.
+        const video = findExactVideoOnly(metadata, resolved.height);
+        const audio = findBestAudio(metadata);
+        if (video?.url) {
+          log.info(`🎬 Exact adaptive ${videoId}/${resolved.height}p -> FFmpeg startup=${Date.now() - startTime}ms`);
+          return streamMergedViaFfmpeg(req, res, video.url, audio?.url || null);
+        }
+        // لو لسبب ما الرابط مش متاح، نكمل على fallback الـscale تحت بدل ما نرجّع خطأ فورًا
       }
 
-      // Adaptive format: exact video height + best audio, remux only when necessary.
-      // The selected video/audio format IDs are resolved individually when their
-      // metadata entry has no URL (for example SABR-exposed formats).
-      const video = findExactVideoOnly(metadata, resolved.height);
-      const audio = findBestAudio(metadata);
-      if (!video?.format_id) {
+      // fallback: الجودة مش موجودة كـformat مستقل (أو رابطها اتعطل) → نعمل scale من أقرب جودة أعلى متاحة
+      const source = findClosestSourceForHeight(metadata, resolved.height);
+      if (!source?.url) {
         return res.status(404).json({
-          error: `الجودة ${resolved.height}p غير متاحة كرابط تشغيل مباشر حاليًا`,
+          error: `تعذّر توفير الجودة ${resolved.height}p لهذا الفيديو حاليًا`,
           requestedQuality: resolved.height,
           availableQualities: heights.map(String),
           requestId: req.requestId
         });
       }
-
-      let videoUrl = video.url || null;
-      if (!videoUrl) {
-        const urls = await getFormatUrls(videoId, String(video.format_id));
-        videoUrl = urls[0] || null;
-      }
-
-      let audioUrl = audio?.url || null;
-      if (!audioUrl && audio?.format_id) {
-        const urls = await getFormatUrls(videoId, String(audio.format_id));
-        audioUrl = urls[0] || null;
-      }
-
-      if (!videoUrl) {
-        return res.status(404).json({
-          error: `الجودة ${resolved.height}p موجودة لكن YouTube لم يعطِ رابط تشغيل لها`,
-          requestedQuality: resolved.height,
-          availableQualities: heights.map(String),
-          requestId: req.requestId
-        });
-      }
-
-      log.info(`🎬 Exact adaptive ${videoId}/${resolved.height}p -> FFmpeg startup=${Date.now() - startTime}ms`);
-      return streamMergedViaFfmpeg(req, res, videoUrl, audioUrl || null);
+      const needsAudio = source.acodec === 'none';
+      const audioForScale = needsAudio ? findBestAudio(metadata) : null;
+      streamCache.set(cacheKey, { scaled: true, videoUrl: source.url, audioUrl: audioForScale?.url || null });
+      log.info(`🎯 Scaled ${videoId}/${resolved.height}p (من مصدر ${source.height}p) -> FFmpeg startup=${Date.now() - startTime}ms`);
+      return streamScaledViaFfmpeg(req, res, source.url, audioForScale?.url || null, resolved.height);
     }
 
     if (resolved?.type === 'audio') {
