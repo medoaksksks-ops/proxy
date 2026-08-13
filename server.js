@@ -15,7 +15,7 @@ require('dotenv').config();
 //   • Request deduplication
 //   • Range support محسّن
 // ==========================================================================
-const SERVER_VERSION = '6.3.5-6.0-stream-quality';
+const SERVER_VERSION = '6.3.6-6.0-stream-quality-ytdlp-client-fix';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
@@ -192,7 +192,7 @@ function checkYtDlp() {
 // yt-dlp configuration — CRITICAL: DO NOT CHANGE
 // ==========================================================================
 const YTDLP_EXTRA_ARGS = [
-  '--extractor-args', 'youtube:player_client=web,tv;formats=missing_pot',
+  '--extractor-args', 'youtube:player_client=default,web_embedded',
   '--js-runtimes', 'node'
 ];
 
