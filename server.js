@@ -30,6 +30,37 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 app.disable('x-powered-by');
 app.set('etag', true);
 
+// ==========================================================================
+// 🌐 CORS — السماح للـ Frontend من أي دومين بالاتصال بالسيرفر
+// لا يحتاج إعادة Deploy جديد إذا كنت ستعدّل الملف ثم تعمل Redeploy من Railway.
+// ==========================================================================
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // السماح لأي Origin. لو عايز تقفلها على دومين محدد غيّر '*' للدومين.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+  );
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Cookie-Update-Key'
+  );
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, ETag, Last-Modified, X-Video-Quality, X-Stream-Mode'
+  );
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  // المتصفح يرسل OPTIONS قبل بعض طلبات POST/headers المخصصة.
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 // Firebase config
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
