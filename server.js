@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '6.0.0';
+const SERVER_VERSION = '7.0.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -159,16 +159,57 @@ function sanitizeFilename(name) {
  * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
-async function runYtDlp(args, { timeout = TIMEOUT, maxBuffer = 1024 * 1024 * 10 } = {}) {
+function commandExists(command) {
+  try { require('child_process').execFileSync(command, ['--version'], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
+function isRetryableYoutubeError(error) {
+  const text = String(error?.message || error || '').toLowerCase();
+  return /page needs to be reloaded|sign in to confirm|confirm you’re not a bot|confirm you're not a bot|http error 403|requested format is not available|video unavailable|not available in your country/.test(text);
+}
+
+async function runYtDlp(args, {
+  timeout = TIMEOUT,
+  maxBuffer = 1024 * 1024 * 10,
+  useCookies = false,
+  allowCookieFallback = true
+} = {}) {
   await ytdlpLimiter.acquire();
   try {
-    const finalArgs = cookiesReady ? ['--cookies', COOKIES_PATH, ...args] : args;
-    const { stdout } = await execFileAsync('yt-dlp', ['--no-warnings', ...finalArgs], {
-      timeout,
-      maxBuffer,
-      encoding: 'utf-8'
-    });
-    return stdout;
+    const base = ['--no-warnings'];
+    if (commandExists('node')) base.push('--js-runtimes', 'node');
+
+    const attempts = [];
+    const pushAttempt = (extra, cookies = false) => {
+      attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
+    };
+
+    // Public extraction first: shared server cookies should not poison normal requests.
+    pushAttempt([], useCookies);
+    if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
+
+    if (allowCookieFallback && cookiesReady && !useCookies) {
+      pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
+    }
+
+    let lastError;
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        const { stdout } = await execFileAsync('yt-dlp', attempts[i], {
+          timeout,
+          maxBuffer,
+          encoding: 'utf-8'
+        });
+        return stdout;
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableYoutubeError(error) && i === 0) throw error;
+        if (i < attempts.length - 1) log.warn(`yt-dlp attempt ${i + 1} failed, trying fallback: ${String(error.message || error).split('\n')[0]}`);
+      }
+    }
+    throw lastError;
   } finally {
     ytdlpLimiter.release();
   }
@@ -322,7 +363,7 @@ async function searchVideos(query, limit = 10) {
  * بيستخدم playlist المكسات التلقائية اللي يوتيوب بيولدها (RD + videoId)
  */
 async function getRelatedVideos(videoId, limit = 10) {
-  const key = `related_pool_${videoId}_${limit}`;
+  const key = `related_pool_v7_${videoId}_${limit}`;
   const cached = infoCache.get(key);
   if (cached) return cached;
 
@@ -330,48 +371,46 @@ async function getRelatedVideos(videoId, limit = 10) {
     const again = infoCache.get(key);
     if (again) return again;
 
-    const info = await getVideoInfo(videoId);
-    const title = (info.title || '').replace(/[|]/g, ' ').trim();
-    const channel = (info.uploader || info.channel || '').trim();
+    let title = '';
+    try {
+      const info = await getVideoInfo(videoId);
+      title = String(info.title || '').replace(/[|]/g, ' ').trim();
+    } catch (e) {
+      log.warn(`Related info lookup failed (continuing): ${e.message}`);
+    }
 
-    const [mixResult, searchResult] = await Promise.allSettled([
-      (async () => {
-        const url = `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`;
-        const stdout = await runYtDlp([
-          '--dump-json', '--flat-playlist', '--yes-playlist',
-          '--playlist-end', String(Math.max(limit * 2, 12)), url
-        ]);
-        return parseFlatItems(stdout, videoId);
-      })(),
-      (async () => {
-        if (!title) return [];
-        const q = `${title} ${channel}`.trim();
-        const stdout = await runYtDlp([
-          `ytsearch${Math.max(limit, 10)}:${q}`,
-          '--dump-json', '--flat-playlist'
-        ]);
-        return parseFlatItems(stdout, videoId);
-      })()
+    const searches = [
+      `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`,
+      ...(title ? [null] : [])
+    ];
+    const results = await Promise.allSettled([
+      runYtDlp([
+        '--dump-json', '--flat-playlist', '--yes-playlist',
+        '--playlist-end', String(Math.max(limit * 3, 20)), searches[0]
+      ]).then(x => parseFlatItems(x, videoId)),
+      ...(title ? [runYtDlp([
+        `ytsearch${Math.max(limit * 3, 20)}:${title}`,
+        '--dump-json', '--flat-playlist'
+      ]).then(x => parseFlatItems(x, videoId))] : [])
     ]);
 
-    const result = [];
+    const ranked = [];
     const seen = new Set([videoId]);
-    const add = list => {
-      for (const item of list || []) {
-        if (!item?.id || seen.has(item.id)) continue;
-        seen.add(item.id);
-        result.push(item);
-        if (result.length >= limit) break;
+    for (const r of results) {
+      if (r.status !== 'fulfilled') {
+        log.warn(`Related source failed: ${r.reason?.message || r.reason}`);
+        continue;
       }
-    };
+      for (const item of r.value) {
+        if (!item?.id || seen.has(item.id) || isUnwantedContent(item.title)) continue;
+        seen.add(item.id);
+        ranked.push(item);
+      }
+    }
 
-    if (mixResult.status === 'fulfilled') add(mixResult.value);
-    if (searchResult.status === 'fulfilled') add(searchResult.value);
-    if (mixResult.status === 'rejected') log.warn(`Related mix failed: ${mixResult.reason?.message}`);
-    if (searchResult.status === 'rejected') log.warn(`Related title search failed: ${searchResult.reason?.message}`);
-
-    infoCache.set(key, result, 1800);
-    return result;
+    const final = ranked.slice(0, limit);
+    infoCache.set(key, final, 1800);
+    return final;
   });
 }
 
@@ -383,92 +422,136 @@ async function getRelatedVideos(videoId, limit = 10) {
  * ==========================================================================
  */
 const FOLLOWED_CREATORS = [
-  'كامل العربي',
-  'اوشا',
-  'صلاح القصة وما فيها',
-  'سامح سند',
-  'بدر العلوي',
-  'ابو الصادق',
-  'مستر محمد ايمن الجوهري',
-  'مستر محمد صلاح مدرس لغة انجليزية', // بإضافة "مستر/مدرس" عشان مايتلخبطش مع لاعب الكورة
-  'مستر محمد عبدالمعبود',
-  'مستر رضا الفاروق',
-  'انجلشاوي',
-  'عبقري لغة خالد صقر',
-  'قناة توست',
-  'كوتش الغلابة'
+  'كامل العربي', 'اوشا', 'صلاح القصة وما فيها', 'سامح سند', 'بدر العلوي',
+  'ابو الصادق', 'مستر محمد ايمن الجوهري', 'مستر محمد صلاح مدرس لغة انجليزية',
+  'مستر محمد عبدالمعبود', 'مستر رضا الفاروق', 'انجلشاوي', 'عبقري لغة خالد صقر',
+  'قناة توست', 'كوتش الغلابة'
 ];
+
+const DISCOVERY_BLOCKED = [
+  'shorts', '#shorts', 'ميمز', 'مقاطع مضحكة جدا',
+  ...UNWANTED_KEYWORDS
+];
+
+function normalizeText(value) {
+  return String(value || '').toLowerCase().replace(/[ً-ٟ]/g, '').replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').trim();
+}
+function hasKeyword(title, keywords) {
+  const t = normalizeText(title);
+  return keywords.some(k => t.includes(normalizeText(k)));
+}
+function isDiscoveryBlocked(item) {
+  return hasKeyword(item?.title, DISCOVERY_BLOCKED);
+}
+function filterDiscovery(items) {
+  return (items || []).filter(v => v?.id && !isDiscoveryBlocked(v));
+}
+function relevanceScore(item, queryTerms = []) {
+  const title = normalizeText(item?.title);
+  const channel = normalizeText(item?.author);
+  let score = 0;
+  for (const term of queryTerms) {
+    const t = normalizeText(term);
+    if (!t) continue;
+    if (title.includes(t)) score += 5;
+    if (channel.includes(t)) score += 2;
+  }
+  if (item?.isLive) score += 1;
+  return score;
+}
+function rankDiscovery(items, queryTerms = []) {
+  return [...filterDiscovery(items)].sort((a, b) => relevanceScore(b, queryTerms) - relevanceScore(a, queryTerms));
+}
 
 async function getFollowedCreatorsPool(perCreator = 4) {
   const settled = await Promise.allSettled(
-    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearch${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
+    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearchdate${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
   );
   const pool = [];
   settled.forEach((r, i) => {
-    if (r.status === 'fulfilled') pool.push(...filterUnwanted(parseFlatItems(r.value)));
+    if (r.status === 'fulfilled') pool.push(...filterDiscovery(parseFlatItems(r.value)));
     else log.warn(`Followed creator fetch failed "${FOLLOWED_CREATORS[i]}": ${r.reason?.message}`);
   });
   return pool;
 }
 
-/**
- * جلب محتوى عام متنوع للاستخدام كـ fallback لما مفيش تاريخ مشاهدة كفاية
- * عند المستخدم بعد (مستخدم جديد مثلًا). الشخصنة الحقيقية بتحصل في المتصفح
- * نفسه (client-side) عن طريق جلب "فيديوهات متشابهة" لآخر حاجات المستخدم
- * اتفرج عليها فعليًا — مش هنا في السيرفر، لأن صفحة يوتيوب الرئيسية
- * الشخصية (Home feed) مش endpoint مدعوم بشكل موثوق في yt-dlp، وتبويب
- * "الرائج" (Trending) نفسه ثابت وواحد لكل الناس بغض النظر عن الكوكيز.
- *
- * الأولوية دلوقتي: فيديوهات القنوات المفضّلة (FOLLOWED_CREATORS) أولًا،
- * وبعدين الترند العام، وبعدين مواضيع عشوائية — بس لو لسه ناقص عدد.
- */
-async function getRecommendedVideos(region = 'EG', limit = 20) {
-  const key = `recommended_v6_${region}_${limit}`;
+const DISCOVERY_QUERIES = [
+  'أخبار مصر اليوم', 'ترند مصر اليوم', 'أهم الأخبار اليوم مصر',
+  'تكنولوجيا اليوم مراجعات', 'كرة القدم مصر اليوم', 'أهداف وملخصات مباريات اليوم',
+  'بودكاست عربي جديد', 'وثائقي عربي جديد', 'محتوى مصري جديد'
+];
+
+function parseSeedIds(value) {
+  if (!value) return [];
+  return String(value).split(',').map(v => v.trim()).filter(isValidVideoId).slice(0, 4);
+}
+
+async function getSeedRecommendations(seedIds, limit) {
+  if (!seedIds.length) return [];
+  const settled = await Promise.allSettled(seedIds.map(id => getRelatedVideos(id, Math.min(12, Math.max(6, Math.ceil(limit / seedIds.length))))));
+  const pool = [];
+  const seen = new Set(seedIds);
+  for (const r of settled) {
+    if (r.status !== 'fulfilled') continue;
+    for (const item of r.value) {
+      if (!item?.id || seen.has(item.id)) continue;
+      seen.add(item.id);
+      pool.push(item);
+      if (pool.length >= limit) return pool;
+    }
+  }
+  return pool;
+}
+
+async function getRecommendedVideos(region = 'EG', limit = 20, seedIds = []) {
+  const seedKey = seedIds.join('_') || 'none';
+  const key = `recommended_v7_${region}_${limit}_${seedKey}`;
   const cached = trendingCache.get(key);
   if (cached) return cached;
 
   return dedupe(key, async () => {
-    const [trendingResult, creatorsResult] = await Promise.allSettled([
-      (async () => {
-        const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
-        const stdout = await runYtDlp([
-          '--dump-json', '--flat-playlist',
-          '--playlist-end', String(Math.max(limit * 2, 30)), url
-        ]);
-        return filterUnwanted(parseFlatItems(stdout));
-      })(),
-      getFollowedCreatorsPool(Math.max(2, Math.ceil(limit / FOLLOWED_CREATORS.length)))
-    ]);
-
     const items = [];
     const seen = new Set();
-    const add = list => {
-      for (const v of list || []) {
-        if (!v?.id || seen.has(v.id) || isUnwantedContent(v.title)) continue;
-        seen.add(v.id);
-        items.push(v);
+    const channelCounts = new Map();
+    const add = (list, maxPerChannel = 2) => {
+      for (const v of filterDiscovery(list)) {
+        if (!v?.id || seen.has(v.id)) continue;
+        const channel = v.channelId || v.author || 'unknown';
+        const count = channelCounts.get(channel) || 0;
+        if (count >= maxPerChannel && items.length < limit - 3) continue;
+        seen.add(v.id); channelCounts.set(channel, count + 1); items.push(v);
         if (items.length >= limit) break;
       }
     };
 
-    if (trendingResult.status === 'fulfilled') add(trendingResult.value);
-    else log.warn(`Trending failed: ${trendingResult.reason?.message}`);
+    const seeded = await getSeedRecommendations(seedIds, limit);
+    add(seeded, 3);
 
-    if (items.length < limit && creatorsResult.status === 'fulfilled') add(creatorsResult.value);
-    if (creatorsResult.status === 'rejected') log.warn(`Creator recommendations failed: ${creatorsResult.reason?.message}`);
-
-    if (items.length < limit) {
-      const fallbackQueries = ['ترند مصر اليوم', 'فيديوهات عربية رائجة', 'محتوى مصري جديد'];
-      const results = await Promise.allSettled(
-        fallbackQueries.map(q => runYtDlp([
-          `ytsearch${Math.max(8, limit)}:${q}`,
-          '--dump-json', '--flat-playlist'
-        ]))
-      );
-      for (const r of results) if (r.status === 'fulfilled') add(filterUnwanted(parseFlatItems(r.value)));
+    const discovery = await Promise.allSettled(DISCOVERY_QUERIES.map(q => runYtDlp([
+      `ytsearchdate${Math.max(8, Math.ceil(limit / 2))}:${q}`,
+      '--dump-json', '--flat-playlist'
+    ])));
+    for (let i = 0; i < discovery.length && items.length < limit; i++) {
+      const r = discovery[i];
+      if (r.status === 'fulfilled') add(rankDiscovery(parseFlatItems(r.value), DISCOVERY_QUERIES[i].split(/\s+/)), 2);
     }
 
-    const result = { items: items.slice(0, limit), personalized: false };
+    if (items.length < limit) add(await getFollowedCreatorsPool(Math.max(2, Math.ceil(limit / FOLLOWED_CREATORS.length))), 2);
+
+    // Final fill without strict channel cap, still keeping all discovery filters.
+    if (items.length < limit) {
+      const extra = await Promise.allSettled(['فيديوهات عربية جديدة', 'محتوى مصري اليوم'].map(q => runYtDlp([
+        `ytsearchdate${Math.max(10, limit)}:${q}`, '--dump-json', '--flat-playlist'
+      ])));
+      for (const r of extra) if (r.status === 'fulfilled') add(parseFlatItems(r.value), 5);
+    }
+
+    const result = {
+      items: items.slice(0, limit),
+      personalized: seedIds.length > 0,
+      strategy: seedIds.length ? 'watched-related + fresh-discovery + creator-fallback' : 'fresh-discovery + creator-fallback',
+      generatedAt: new Date().toISOString()
+    };
     trendingCache.set(key, result, 600);
     return result;
   });
@@ -512,10 +595,9 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
         try {
           let stdout;
           if (section.key === 'trending') {
-            const url = `https://www.youtube.com/feed/trending?gl=${encodeURIComponent(region)}`;
             stdout = await runYtDlp([
-              '--dump-json', '--flat-playlist',
-              '--playlist-end', String(Math.max(perSection * 2, 24)), url
+              `ytsearchdate${Math.max(perSection * 3, 30)}:ترند مصر اليوم`,
+              '--dump-json', '--flat-playlist'
             ]);
           } else {
             stdout = await runYtDlp([
@@ -620,10 +702,11 @@ app.get('/trending', async (req, res) => {
     const needed = pageNum * pageSize;
     const poolSize = Math.min(Math.max(needed, pageSize * 2), 150);
 
-    const cacheKey = `recommended_${region}_${poolSize}`;
+    const seedIds = parseSeedIds(req.query.seed || req.query.seeds || req.query.history);
+    const cacheKey = `recommended_v7_${region}_${poolSize}_${seedIds.join('_') || 'none'}`;
     let cached = trendingCache.get(cacheKey);
     if (!cached) {
-      cached = await getRecommendedVideos(region, poolSize);
+      cached = await getRecommendedVideos(region, poolSize, seedIds);
       trendingCache.set(cacheKey, cached);
     }
 
@@ -1213,8 +1296,12 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: checkYtDlp(),
+    ytdlpVersion: (() => { try { return require('child_process').execFileSync('yt-dlp', ['--version'], { encoding: 'utf8' }).trim(); } catch { return null; } })(),
+    nodeVersion: process.version,
+    jsRuntime: commandExists('node') ? 'node' : (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: (() => { try { require('child_process').execSync('ffmpeg -version', { stdio: 'ignore' }); return true; } catch { return false; } })(),
     cookiesReady,
+    cookieUpdateProtected: Boolean(process.env.COOKIE_UPDATE_SECRET),
     concurrency: { max: YTDLP_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length }
   });
 });
@@ -1224,6 +1311,11 @@ app.get('/health', (req, res) => {
  */
 app.post('/api/update-cookies', async (req, res) => {
   try {
+    const secret = process.env.COOKIE_UPDATE_SECRET || '';
+    const provided = req.get('x-cookie-update-key') || String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+    if (!secret) return res.status(503).json({ error: 'COOKIE_UPDATE_SECRET غير مضبوط على السيرفر' });
+    if (!provided || provided !== secret) return res.status(401).json({ error: 'غير مصرح' });
+
     const cookies = req.body;
 
     if (!cookies || !cookies.trim()) {
@@ -1299,9 +1391,8 @@ app.post('/api/update-cookies', async (req, res) => {
  */
 app.get('/api/cookies-status', async (req, res) => {
   res.json({
-    hasCoockes: cookiesReady,
+    hasCookies: cookiesReady,
     length: lastCookiesContent.length,
-    preview: lastCookiesContent ? lastCookiesContent.substring(0, 50) + '...' : 'لا توجد كوكيز',
     status: cookiesReady ? '✅ موجودة' : '❌ فارغة أو غير موجودة'
   });
 });
@@ -1311,9 +1402,10 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v6.0.0 "Turbo" - YouTube media server',
+    name: '🎬 srver v7.0.0 "Turbo" - YouTube media server',
     version: SERVER_VERSION,
     environment: NODE_ENV,
+    recommended: '/trending?region=EG&seed=dQw4w9WgXcQ',
     cookies: {
       source: '🔥 Firebase Realtime Database',
       url: FIREBASE_URL,
