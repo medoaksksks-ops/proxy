@@ -926,47 +926,77 @@ app.get('/comments', async (req, res) => {
  * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
  * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
  */
-function streamFromUpstream(req, res, url, redirectCount = 0) {
-  if (redirectCount > 5) {
+function streamFromUpstream(req, res, initialUrl, redirectCount = 0) {
+  const MAX_REDIRECTS = 5;
+  if (redirectCount > MAX_REDIRECTS) {
     if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
     return;
   }
 
+  const range = req.headers.range || 'bytes=0-';
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
     'Accept': '*/*',
-    'Accept-Encoding': 'identity'
+    'Accept-Encoding': 'identity',
+    'Range': range
   };
-  if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
-    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
+  let upstreamReq;
+  let clientGone = false;
+  const cleanup = () => {
+    clientGone = true;
+    if (upstreamReq && !upstreamReq.destroyed) upstreamReq.destroy();
+  };
+
+  req.once('aborted', cleanup);
+
+  upstreamReq = https.get(initialUrl, { headers, timeout: 60000, agent: keepAliveAgent }, (upstreamRes) => {
     if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
       upstreamRes.resume();
+      req.removeListener('aborted', cleanup);
       return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
     }
 
-    if (upstreamRes.statusCode >= 400) {
-      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
-      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
+    if (!upstreamRes.statusCode || upstreamRes.statusCode >= 400) {
+      log.error(`Upstream video error: ${upstreamRes.statusCode || 'unknown'}`);
       upstreamRes.resume();
+      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
       return;
     }
 
+    // Preserve the exact upstream Range semantics. This is critical for browsers
+    // to know the complete duration and seek without treating the response as live.
     res.status(upstreamRes.statusCode);
-    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']
-      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
+    const forwardHeaders = [
+      'content-type', 'content-length', 'content-range', 'accept-ranges',
+      'cache-control', 'etag', 'last-modified'
+    ];
+    for (const h of forwardHeaders) {
+      if (upstreamRes.headers[h] !== undefined) res.setHeader(h, upstreamRes.headers[h]);
+    }
+    if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('X-Stream-Mode', 'range-proxy');
 
+    log.info(`VIDEO DEBUG | range=${range} | status=${upstreamRes.statusCode} | length=${upstreamRes.headers['content-length'] || '-'} | content-range=${upstreamRes.headers['content-range'] || '-'} | accept-ranges=${upstreamRes.headers['accept-ranges'] || '-'}`);
+
+    upstreamRes.on('error', err => {
+      log.error(`Upstream response error: ${err.message}`);
+      if (!res.writableEnded) res.destroy(err);
+    });
     upstreamRes.pipe(res);
   });
 
   upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
-  upstreamReq.on('error', (err) => {
+  upstreamReq.on('error', err => {
+    if (clientGone) return;
     log.error(`Stream proxy error: ${err.message}`);
     if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
+    else if (!res.writableEnded) res.destroy(err);
   });
 
-  req.on('close', () => upstreamReq.destroy());
+  res.once('close', () => {
+    if (!res.writableEnded) cleanup();
+  });
 }
 
 // ==========================================================================
