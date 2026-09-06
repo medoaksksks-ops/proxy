@@ -4,6 +4,7 @@ const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 // (مش محتاجين مكتبة cors تاني، الهيدرز بقت بتتحط يدوي فوق)
+const NodeCache = require('node-cache');
 const https = require('https');
 require('dotenv').config();
 
@@ -15,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '7.3.0';
+const SERVER_VERSION = '7.0.0';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -29,6 +30,37 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 app.disable('x-powered-by');
 app.set('etag', true);
 
+// ==========================================================================
+// 🌐 CORS — السماح للـ Frontend من أي دومين بالاتصال بالسيرفر
+// لا يحتاج إعادة Deploy جديد إذا كنت ستعدّل الملف ثم تعمل Redeploy من Railway.
+// ==========================================================================
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // السماح لأي Origin. لو عايز تقفلها على دومين محدد غيّر '*' للدومين.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+  );
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, X-Cookie-Update-Key'
+  );
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, ETag, Last-Modified, X-Video-Quality, X-Stream-Mode'
+  );
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  // المتصفح يرسل OPTIONS قبل بعض طلبات POST/headers المخصصة.
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 // Firebase config
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://english-73376-default-rtdb.firebaseio.com';
 const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
@@ -39,20 +71,10 @@ app.use(express.json());
 app.use(express.text({ limit: '10mb' }));
 
 // ---------------- Cache ----------------
-// الكاش الدائم متعطّل عمدًا: مفيش بيانات بتتخزن في RAM بين الطلبات.
-// بنسيب واجهة get/set موجودة عشان باقي الكود يفضل متوافق، بينما dedupe()
-// يمنع الطلبات المتطابقة من التشغيل أكثر من مرة في نفس اللحظة.
-class NoCache {
-  get() { return undefined; }
-  set() { return true; }
-  del() { return true; }
-  flushAll() {}
-  getStats() { return { keys: 0, hits: 0, misses: 0, ksize: 0, vsize: 0 }; }
-}
-const infoCache = new NoCache();
-const trendingCache = new NoCache();
-const streamCache = new NoCache();
-const channelCache = new NoCache();
+const infoCache = new NodeCache({ stdTTL: 10800 });          // معلومات فيديو/بحث/related: ساعتين
+const trendingCache = new NodeCache({ stdTTL: 600 });      // الرائج: 20 دقيقة
+const streamCache = new NodeCache({ stdTTL: 300 });         // روابط التشغيل المباشرة بتنتهي بسرعة: 4 دقايق بس
+const channelCache = new NodeCache({ stdTTL: 7200 });       // بيانات وفيديوهات القنوات: ساعة
 
 const TIMEOUT = 45000;
 const MAX_RETRIES = 2;
@@ -81,7 +103,7 @@ class Semaphore {
     if (next) { this.current++; next(); }
   }
 }
-const YTDLP_CONCURRENCY = parseInt(process.env.YTDLP_CONCURRENCY, 10) || 4;
+const YTDLP_CONCURRENCY = parseInt(process.env.YTDLP_CONCURRENCY, 10) || 6;
 const ytdlpLimiter = new Semaphore(YTDLP_CONCURRENCY);
 
 // منع تشغيل نفس yt-dlp أكثر من مرة لو عدة مستخدمين طلبوا نفس الشيء في نفس اللحظة.
@@ -1022,106 +1044,13 @@ function getAvailableQualities(info) {
   )].sort((a, b) => b - a);
 }
 
-// بيصلّح الـ duration داخل الـ initial moov atom قبل ما نبعته للمتصفح.
-// FFmpeg لما يطلع fragmented MP4 على pipe بيحط duration = 0 في الـ moov،
-// وChrome/Android ساعات يعتبر مدة أول fragment هي مدة الفيديو.
-// هنا بنستخدم مدة YouTube الحقيقية ونكتبها في mvhd/tkhd/mdhd بدون إعادة ترميز.
-function patchMp4MoovDuration(buffer, durationSeconds) {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return buffer;
-
-  const b = Buffer.from(buffer);
-  const readU32 = (off) => b.readUInt32BE(off);
-  const writeDuration = (boxStart, boxEnd) => {
-    if (boxStart + 12 > boxEnd) return;
-    const type = b.toString('ascii', boxStart + 4, boxStart + 8);
-    const version = b[boxStart + 8];
-    let timescaleOff, durationOff, durationBytes;
-
-    if (type === 'mvhd') {
-      if (version === 1) { timescaleOff = boxStart + 28; durationOff = boxStart + 32; durationBytes = 8; }
-      else { timescaleOff = boxStart + 20; durationOff = boxStart + 24; durationBytes = 4; }
-    } else if (type === 'tkhd') {
-      if (version === 1) { timescaleOff = null; durationOff = boxStart + 36; durationBytes = 8; }
-      else { timescaleOff = null; durationOff = boxStart + 28; durationBytes = 4; }
-    } else if (type === 'mdhd') {
-      if (version === 1) { timescaleOff = boxStart + 28; durationOff = boxStart + 32; durationBytes = 8; }
-      else { timescaleOff = boxStart + 20; durationOff = boxStart + 24; durationBytes = 4; }
-    } else {
-      return;
-    }
-
-    if (durationOff + durationBytes > boxEnd) return;
-
-    let timescale = 1000;
-    if (timescaleOff !== null && timescaleOff + 4 <= boxEnd) {
-      timescale = readU32(timescaleOff) || 1000;
-    }
-
-    const value = Math.max(0, Math.round(durationSeconds * timescale));
-    if (durationBytes === 8) b.writeBigUInt64BE(BigInt(value), durationOff);
-    else b.writeUInt32BE(Math.min(0xffffffff, value), durationOff);
-  };
-
-  const walk = (start, end) => {
-    let off = start;
-    while (off + 8 <= end) {
-      let size = readU32(off);
-      const type = b.toString('ascii', off + 4, off + 8);
-      let header = 8;
-      if (size === 1) {
-        if (off + 16 > end) return;
-        const big = b.readBigUInt64BE(off + 8);
-        if (big > BigInt(Number.MAX_SAFE_INTEGER)) return;
-        size = Number(big); header = 16;
-      } else if (size === 0) {
-        size = end - off;
-      }
-      if (size < header || off + size > end) return;
-
-      if (type === 'mvhd' || type === 'tkhd' || type === 'mdhd') {
-        writeDuration(off, off + size);
-      }
-
-      if (['moov','trak','mdia','minf','mvex','edts'].includes(type)) {
-        walk(off + header, off + size);
-      }
-      off += size;
-    }
-  };
-
-  // أول box في output هو ftyp وبعده moov.
-  let off = 0;
-  while (off + 8 <= b.length) {
-    let size = readU32(off);
-    const type = b.toString('ascii', off + 4, off + 8);
-    let header = 8;
-    if (size === 1) {
-      if (off + 16 > b.length) break;
-      size = Number(b.readBigUInt64BE(off + 8));
-      header = 16;
-    } else if (size === 0) {
-      size = b.length - off;
-    }
-    if (size < header || off + size > b.length) break;
-    if (type === 'moov') {
-      walk(off + header, off + size);
-      break;
-    }
-    off += size;
-  }
-  return b;
-}
-
-async function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, durationSeconds = 0) {
+function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
-  const tempDir = path.join('/tmp', 'yt-merged');
-  fs.mkdirSync(tempDir, { recursive: true });
-  const filePath = path.join(tempDir, `${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`);
-
   const inputArgs = [
     '-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1',
     '-reconnect_delay_max', '2', '-i', videoUrl
   ];
+
   if (audioUrl) inputArgs.push(
     '-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1',
     '-reconnect_delay_max', '2', '-i', audioUrl
@@ -1133,102 +1062,40 @@ async function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, durationSecon
     '-map', '0:v:0',
     ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
-    // مهم: ملف MP4 حقيقي seekable، والـ moov في البداية بعد اكتمال الـ remux.
-    '-movflags', '+faststart',
-    '-f', 'mp4', filePath
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'mp4', 'pipe:1'
   ];
 
+  res.status(200);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Cache-Control', 'no-store');
+
+  const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderrBuf = '';
-  let ff;
-  let cleaned = false;
+
+  ff.stderr.on('data', d => {
+    stderrBuf += d.toString();
+    if (stderrBuf.length > 4000) stderrBuf = stderrBuf.slice(-4000);
+  });
+  ff.stdout.pipe(res);
+
   const cleanup = () => {
-    if (cleaned) return;
-    cleaned = true;
-    try { if (ff && !ff.killed) ff.kill('SIGKILL'); } catch (_) {}
-    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
+    if (!ff.killed) {
+      try { ff.kill('SIGKILL'); } catch {}
+    }
   };
 
-  try {
-    ff = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    ff.stderr.on('data', d => {
-      stderrBuf += d.toString();
-      if (stderrBuf.length > 5000) stderrBuf = stderrBuf.slice(-5000);
-    });
-
-    const code = await new Promise((resolve, reject) => {
-      ff.on('error', reject);
-      ff.on('close', resolve);
-    });
-    if (code !== 0) throw new Error(`ffmpeg exited ${code}: ${stderrBuf.slice(-1000)}`);
-
-    if (!fs.existsSync(filePath)) throw new Error('Merged MP4 was not created');
-    const stat = fs.statSync(filePath);
-    if (!stat.size) throw new Error('Merged MP4 is empty');
-
-    // نخدم الملف بـ Range حقيقي. ده يخلي currentTime/seek يشتغلوا صح،
-    // والأهم إن المتصفح يقرأ duration من moov الحقيقي بدل مدة أول fragment.
-    const range = req.headers.range;
-    const total = stat.size;
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-store');
-    if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
-      res.setHeader('X-Video-Duration', String(durationSeconds));
-    }
-
-    let startByte = 0;
-    let endByte = total - 1;
-    let status = 200;
-
-    if (range) {
-      const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
-      if (m) {
-        if (m[1] === '' && m[2] === '') {
-          cleanup();
-          return res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
-        }
-        if (m[1] === '') {
-          const suffix = Math.min(Number(m[2]), total);
-          startByte = total - suffix;
-        } else {
-          startByte = Number(m[1]);
-          if (m[2] !== '') endByte = Math.min(Number(m[2]), total - 1);
-        }
-        if (!Number.isFinite(startByte) || startByte < 0 || startByte >= total || endByte < startByte) {
-          cleanup();
-          return res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
-        }
-        status = 206;
-      }
-    }
-
-    const length = endByte - startByte + 1;
-    res.status(status);
-    res.setHeader('Content-Length', String(length));
-    if (status === 206) res.setHeader('Content-Range', `bytes ${startByte}-${endByte}/${total}`);
-
-    const stream = fs.createReadStream(filePath, { start: startByte, end: endByte });
-    const finish = () => {
-      stream.destroy();
-      cleanup();
-    };
-    req.on('close', finish);
-    stream.on('error', err => {
-      if (!res.headersSent) res.status(500).json({ error: err.message });
-      else res.destroy(err);
-      cleanup();
-    });
-    stream.on('end', () => {
-      if (!res.writableEnded) res.end();
-      cleanup();
-    });
-    stream.pipe(res);
-  } catch (err) {
+  ff.on('error', e => {
+    log.error(`ffmpeg spawn error: ${e.message}`);
     cleanup();
-    log.warn(`Merged MP4 failed: ${err.message}`);
-    if (!res.headersSent) res.status(500).json({ error: 'Failed to merge video/audio', details: err.message });
-    else res.end();
-  }
+    if (!res.headersSent) res.status(500).json({ error: 'ffmpeg غير متاح على السيرفر' });
+  });
+  ff.on('close', code => {
+    if (code !== 0 && code !== null && !res.writableEnded) {
+      log.warn(`ffmpeg exited ${code}: ${stderrBuf.slice(-500)}`);
+    }
+  });
+  req.on('close', cleanup);
 }
 
 app.get('/video', async (req, res) => {
@@ -1268,7 +1135,7 @@ app.get('/video', async (req, res) => {
 
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
       res.setHeader('X-Stream-Mode', 'ffmpeg');
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1], Number(info.duration || 0));
+      return streamMergedViaFfmpeg(req, res, urls[0], urls[1]);
     }
 
     const cacheKey = `default_stream_${videoId}_${format}`;
@@ -1566,7 +1433,7 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v7.3.0 "Turbo" - YouTube media server',
+    name: '🎬 srver v7.0.0 "Turbo" - YouTube media server',
     version: SERVER_VERSION,
     environment: NODE_ENV,
     recommended: '/trending?region=EG&seed=dQw4w9WgXcQ',
