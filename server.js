@@ -14,7 +14,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '9.0.0-TITAN';
+const SERVER_VERSION = '9.1.0-TITAN';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -334,7 +334,10 @@ function mapFlatEntry(item, excludeId) {
     thumbnail: item.thumbnails?.length
       ? item.thumbnails[item.thumbnails.length - 1].url
       : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`,
-    viewCount: item.view_count || 0
+    viewCount: item.view_count || 0,
+    isLive: !!item.is_live,
+    wasLive: !!item.was_live,
+    liveStatus: item.live_status || null
   };
 }
 
@@ -421,6 +424,7 @@ async function getVideoInfo(videoId) {
 
     const stdout = await runYtDlp([
       '--dump-json', '--no-playlist',
+      '--extractor-args', 'youtube:player_client=default,web_safari',
       `https://www.youtube.com/watch?v=${videoId}`
     ]);
     const info = JSON.parse(stdout);
@@ -725,6 +729,37 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
 /**
  * جلب فيديوهات قناة معيّنة + بيانات القناة نفسها (الاسم، عدد المشتركين، الصورة، الوصف)
  */
+async function getChannelTab(channelId, tab, limit = 30) {
+  const safeTab = ['playlists', 'streams', 'live'].includes(tab) ? (tab === 'live' ? 'streams' : tab) : 'videos';
+  const url = `https://www.youtube.com/channel/${channelId}/${safeTab}`;
+  const stdout = await runYtDlp([
+    '--flat-playlist', '--dump-single-json',
+    '--playlist-end', String(Math.min(Math.max(limit, 1), 100)),
+    url
+  ]);
+  const data = JSON.parse(stdout);
+  const entries = (data.entries || []).map(e => ({
+    ...mapFlatEntry(e),
+    playlistId: e.id || null,
+    playlistTitle: e.title || null,
+    itemCount: e.playlist_count || e.n_entries || null,
+    isLive: !!e.is_live,
+    wasLive: !!e.was_live,
+    liveStatus: e.live_status || null
+  })).filter(Boolean);
+  return {
+    channel: {
+      id: data.channel_id || channelId,
+      title: data.channel || data.uploader || 'قناة',
+      followers: data.channel_follower_count || null,
+      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
+      description: data.description || ''
+    },
+    tab: safeTab,
+    entries
+  };
+}
+
 async function getChannelVideos(channelId, limit = 20) {
   const url = `https://www.youtube.com/channel/${channelId}/videos`;
   log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
@@ -953,6 +988,87 @@ app.get('/channel', async (req, res) => {
 });
 
 /**
+ * GET /channel/playlists?id=CHANNEL_ID&limit=30&page=1
+ * Returns the playlists published by a channel.
+ */
+app.get('/channel/playlists', async (req, res) => {
+  const channelId = String(req.query.id || '');
+  if (!channelId) return res.status(400).json({ error: 'channel id مطلوب' });
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
+  const key = `channel-playlists:${channelId}:${page}:${limit}`;
+  const cached = channelCache.get(key);
+  if (cached) return res.json(cached);
+  try {
+    const data = await getChannelTab(channelId, 'playlists', Math.min(page * limit, 100));
+    const start = (page - 1) * limit;
+    const results = data.entries.slice(start, start + limit);
+    const out = { channel: data.channel, page, limit, count: results.length, hasMore: data.entries.length > start + limit, playlists: results };
+    channelCache.set(key, out, CACHE_TTL.channel);
+    res.json(out);
+  } catch (error) {
+    log.error(`Error fetching channel playlists: ${error.message}`);
+    res.status(500).json({ error: 'تعذّر جلب قوائم تشغيل القناة', details: NODE_ENV === 'development' ? error.message : undefined });
+  }
+});
+
+/**
+ * GET /channel/streams?id=CHANNEL_ID&limit=30&page=1
+ * Returns live streams and past/upcoming live broadcasts from the channel.
+ */
+app.get('/channel/streams', async (req, res) => {
+  const channelId = String(req.query.id || '');
+  if (!channelId) return res.status(400).json({ error: 'channel id مطلوب' });
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
+  const key = `channel-streams:${channelId}:${page}:${limit}`;
+  const cached = channelCache.get(key);
+  if (cached) return res.json(cached);
+  try {
+    const data = await getChannelTab(channelId, 'streams', Math.min(page * limit, 100));
+    const start = (page - 1) * limit;
+    const results = data.entries.slice(start, start + limit);
+    const out = { channel: data.channel, page, limit, count: results.length, hasMore: data.entries.length > start + limit, streams: results };
+    channelCache.set(key, out, CACHE_TTL.channel);
+    res.json(out);
+  } catch (error) {
+    log.error(`Error fetching channel streams: ${error.message}`);
+    res.status(500).json({ error: 'تعذّر جلب لايفات القناة', details: NODE_ENV === 'development' ? error.message : undefined });
+  }
+});
+
+/**
+ * GET /playlist?id=PLAYLIST_ID&limit=30&page=1
+ * Returns the videos/items inside a YouTube playlist.
+ */
+app.get('/playlist', async (req, res) => {
+  const playlistId = String(req.query.id || '');
+  if (!playlistId) return res.status(400).json({ error: 'playlist id مطلوب' });
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
+  const key = `playlist:${playlistId}:${page}:${limit}`;
+  const cached = channelCache.get(key);
+  if (cached) return res.json(cached);
+  try {
+    const stdout = await runYtDlp([
+      '--flat-playlist', '--dump-single-json', '--yes-playlist',
+      '--playlist-end', String(Math.min(page * limit, 100)),
+      `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`
+    ]);
+    const data = JSON.parse(stdout);
+    const entries = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
+    const start = (page - 1) * limit;
+    const results = entries.slice(start, start + limit);
+    const out = { id: playlistId, title: data.title || '', channel: data.channel || data.uploader || '', page, limit, count: results.length, hasMore: entries.length > start + limit, results };
+    channelCache.set(key, out, CACHE_TTL.channel);
+    res.json(out);
+  } catch (error) {
+    log.error(`Error fetching playlist: ${error.message}`);
+    res.status(500).json({ error: 'تعذّر جلب محتوى قائمة التشغيل', details: NODE_ENV === 'development' ? error.message : undefined });
+  }
+});
+
+/**
  * GET /comments?v=VIDEO_ID&limit=50
  */
 app.get('/comments', async (req, res) => {
@@ -994,7 +1110,7 @@ app.get('/comments', async (req, res) => {
  * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
  * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
  */
-function streamFromUpstream(req, res, url, redirectCount = 0) {
+function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
   if (redirectCount > 5) {
     if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
     return;
@@ -1022,6 +1138,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0) {
     }
 
     res.status(upstreamRes.statusCode);
+    if (Number.isFinite(Number(duration)) && Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
     ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']
       .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
 
@@ -1092,9 +1209,17 @@ function chooseQualityFormats(info, requestedHeight) {
   }
 
   const video = same.sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
-  const audio = (info.formats || [])
-    .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
-    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+  const audioCandidates = (info.formats || [])
+    .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
+  const audio = audioCandidates.sort((a, b) => {
+    const ap = Number(a.language_preference ?? -1);
+    const bp = Number(b.language_preference ?? -1);
+    if (bp !== ap) return bp - ap;
+    const ao = /\boriginal\b/i.test(String(a.format_note || '')) ? 1 : 0;
+    const bo = /\boriginal\b/i.test(String(b.format_note || '')) ? 1 : 0;
+    if (bo !== ao) return bo - ao;
+    return (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
+  })[0];
 
   if (!video || !audio) throw new Error('Video/audio format unavailable');
 
@@ -1112,7 +1237,7 @@ function getAvailableQualities(info) {
   )].sort((a, b) => b - a);
 }
 
-function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
+function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
   const inputArgs = [
     '-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1',
@@ -1137,6 +1262,7 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
   res.status(200);
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Cache-Control', 'no-store');
+  if (Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
 
   const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderrBuf = '';
@@ -1166,6 +1292,34 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl) {
   req.on('close', cleanup);
 }
 
+app.get('/video/source', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID غير صحيح' });
+  try {
+    const info = await getVideoInfo(videoId);
+    const requested = resolveQuality(req.query.quality || 'best');
+    if (requested?.type === 'audio') {
+      const urls = await getFormatUrls(videoId, 'bestaudio/best');
+      return res.json({ id: videoId, duration: info.duration || 0, type: 'audio', url: urls[0] });
+    }
+    if (requested?.type === 'video') {
+      const selected = chooseQualityFormats(info, requested.height);
+      const urls = selected.mode === 'direct'
+        ? await getFormatUrls(videoId, selected.videoFormatId)
+        : await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`);
+      return res.json({
+        id: videoId, duration: info.duration || 0,
+        requestedQuality: requested.height, actualQuality: selected.actualHeight,
+        mode: selected.mode, videoUrl: urls[0] || null, audioUrl: urls[1] || null
+      });
+    }
+    const url = await getVideoStreamUrl(videoId, 'best');
+    return res.json({ id: videoId, duration: info.duration || 0, type: 'video', mode: 'direct-or-best', url });
+  } catch (error) {
+    res.status(502).json({ error: 'تعذّر تجهيز مصدر الفيديو', details: NODE_ENV === 'development' ? error.message : undefined });
+  }
+});
+
 app.get('/video', async (req, res) => {
   const { v: videoId, format = 'best', quality } = req.query;
 
@@ -1177,11 +1331,17 @@ app.get('/video', async (req, res) => {
   }
 
   try {
+    const infoForStream = await getVideoInfo(videoId);
+    const videoDuration = Number(infoForStream.duration || 0);
+    // Probe mode: resolve the stream without sending the video bytes.
+    // Useful for automated endpoint testing and health checks.
+    const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
     const resolved = resolveQuality(quality);
 
     if (resolved?.type === 'audio') {
       const urls = await getFormatUrls(videoId, 'bestaudio/best');
-      return streamFromUpstream(req, res, urls[0]);
+      if (probe) return res.json({ probe: true, id: videoId, type: 'audio', resolved: true, urlLength: String(urls[0] || '').length });
+      return streamFromUpstream(req, res, urls[0], 0, videoDuration);
     }
 
     if (resolved?.type === 'video') {
@@ -1192,7 +1352,8 @@ app.get('/video', async (req, res) => {
         const urls = await getFormatUrls(videoId, selected.videoFormatId);
         res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
         res.setHeader('X-Stream-Mode', 'direct');
-        return streamFromUpstream(req, res, urls[0]);
+        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'direct', resolved: true, urlLength: String(urls[0] || '').length });
+        return streamFromUpstream(req, res, urls[0], 0, videoDuration);
       }
 
       const urls = await getFormatUrls(
@@ -1203,7 +1364,8 @@ app.get('/video', async (req, res) => {
 
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
       res.setHeader('X-Stream-Mode', 'ffmpeg');
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1]);
+      if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true, videoUrlLength: String(urls[0] || '').length, audioUrlLength: String(urls[1] || '').length });
+      return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
     }
 
     const cacheKey = `default_stream_${videoId}_${format}`;
@@ -1217,7 +1379,7 @@ app.get('/video', async (req, res) => {
       return url;
     });
 
-    return streamFromUpstream(req, res, streamUrl);
+    return streamFromUpstream(req, res, streamUrl, 0, videoDuration);
 
   } catch (error) {
     log.error(`Error streaming ${videoId}: ${error.message}`);
@@ -1255,6 +1417,16 @@ app.get('/download', async (req, res) => {
     ? 'bestaudio/best'
     : (/^\d+$/.test(quality) ? `bestvideo[height<=${Math.min(2160, Number(quality))}]+bestaudio/best` : 'bestvideo+bestaudio/best');
 
+  const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
+  if (probe) {
+    try {
+      const info = await getVideoInfo(videoId);
+      return res.json({ probe: true, id: videoId, quality, format, title: info.title || null, resolved: true });
+    } catch (e) {
+      return res.status(502).json({ probe: true, id: videoId, resolved: false, error: String(e.message || e) });
+    }
+  }
+
   await downloadLimiter.acquire();
   let child;
   try {
@@ -1263,7 +1435,7 @@ app.get('/download', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.setHeader('Content-Type', quality === 'audio' ? 'audio/mpeg' : 'video/mp4');
 
-    const args = ['--no-warnings', '--no-playlist', '-f', format, '-o', '-', `https://www.youtube.com/watch?v=${videoId}`];
+    const args = ['--no-warnings', '--no-playlist', '--format-sort', 'lang,quality', '-f', format, '-o', '-', `https://www.youtube.com/watch?v=${videoId}`];
     child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     child.stderr.on('data', d => { err += d.toString(); if (err.length > 3000) err = err.slice(-3000); });
@@ -1353,6 +1525,9 @@ app.get('/info', async (req, res) => {
       likeCount: info.like_count || 0,
       ageRestricted: info.age_limit ? info.age_limit > 0 : false,
       isLive: info.is_live || false,
+      liveStatus: info.live_status || null,
+      originalLanguage: info.language || null,
+      audioLanguages: [...new Set((info.formats || []).filter(f => f.acodec && f.acodec !== 'none').map(f => f.language).filter(Boolean))],
       formats: info.formats?.length || 0
     };
 
@@ -1594,11 +1769,15 @@ app.get('/', (req, res) => {
       trending: '/trending?region=EG&limit=20&page=1',
       video: '/video?v=VIDEO_ID&quality=1080 (أو &format=best للوضع السريع)',
       videoQualities: '/video/qualities?v=VIDEO_ID',
+      videoSource: '/video/source?v=VIDEO_ID&quality=1080',
       info: '/info?v=VIDEO_ID',
       formats: '/formats?v=VIDEO_ID',
       search: '/search?q=QUERY&limit=20&page=1',
       related: '/related?v=VIDEO_ID&limit=10&page=1',
       channel: '/channel?id=CHANNEL_ID&limit=20&page=1',
+      channelPlaylists: '/channel/playlists?id=CHANNEL_ID&limit=30&page=1',
+      channelStreams: '/channel/streams?id=CHANNEL_ID&limit=30&page=1',
+      playlist: '/playlist?id=PLAYLIST_ID&limit=30&page=1',
       comments: '/comments?v=VIDEO_ID&limit=50',
       health: '/health',
       performance: '/api/performance',
@@ -1606,7 +1785,8 @@ app.get('/', (req, res) => {
       suggestions: '/search/suggestions?q=QUERY',
       download: '/download?v=VIDEO_ID&quality=720',
       accountFeed: '/api/account-feed?limit=30',
-      cookiesStatus: '/api/cookies-status'
+      cookiesStatus: '/api/cookies-status',
+      testAll: '/api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw'
     },
     videoQualityValues: 'يتم اكتشاف كل الارتفاعات الحقيقية تلقائيًا عبر /video/qualities',
     pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
@@ -1622,6 +1802,8 @@ app.get('/', (req, res) => {
       'Search videos': '/search?q=funny+cats&page=1',
       'Related videos': '/related?v=dQw4w9WgXcQ',
       'Channel videos': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
+      'Channel playlists': '/channel/playlists?id=UCuAXFkgsw1L7xaCfnd5JJOw',
+      'Channel live streams': '/channel/streams?id=UCuAXFkgsw1L7xaCfnd5JJOw',
       'Video comments': '/comments?v=dQw4w9WgXcQ',
       'Check cookies': '/api/cookies-status'
     }
@@ -1709,6 +1891,74 @@ async function warmHotCaches() {
     log.success('🔥 Hot caches warmed');
   } catch (e) { log.warn(`Warmup failed: ${e.message}`); }
   finally { warmupRunning = false; }
+}
+
+// ==========================================================================
+// 🧪 TITAN ENDPOINT TEST SUITE
+// GET /api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw
+// Runs safe probes for every API route. Streaming/download are tested in
+// probe mode so the test does NOT download or stream megabytes to the caller.
+// ==========================================================================
+app.get('/api/test-all', async (req, res) => {
+  const videoId = String(req.query.v || 'dQw4w9WgXcQ');
+  const channelId = String(req.query.channel || 'UCuAXFkgsw1L7xaCfnd5JJOw');
+  const base = `http://127.0.0.1:${PORT}`;
+  const tests = [
+    ['root', '/'],
+    ['health', '/health'],
+    ['performance', '/api/performance'],
+    ['cookies-status', '/api/cookies-status'],
+    ['suggestions', '/search/suggestions?q=music'],
+    ['search', '/search?q=funny%20cats&limit=3&page=1'],
+    ['trending', '/trending?region=EG&limit=3&page=1'],
+    ['home', '/home?region=EG&perSection=4'],
+    ['info', `/info?v=${encodeURIComponent(videoId)}`],
+    ['formats', `/formats?v=${encodeURIComponent(videoId)}`],
+    ['video-qualities', `/video/qualities?v=${encodeURIComponent(videoId)}`],
+    ['related', `/related?v=${encodeURIComponent(videoId)}&limit=3&page=1`],
+    ['comments', `/comments?v=${encodeURIComponent(videoId)}&limit=3`],
+    ['channel', `/channel?id=${encodeURIComponent(channelId)}&limit=3&page=1`],
+    ['video-probe', `/video?v=${encodeURIComponent(videoId)}&format=best&probe=1`],
+    ['video-1080-probe', `/video?v=${encodeURIComponent(videoId)}&quality=1080&probe=1`],
+    ['download-probe', `/download?v=${encodeURIComponent(videoId)}&quality=720&probe=1`],
+    ['prefetch', `/api/prefetch?v=${encodeURIComponent(videoId)}`],
+    ['account-feed', '/api/account-feed?limit=3']
+  ];
+
+  const started = Date.now();
+  const results = await Promise.all(tests.map(async ([name, path]) => {
+    const t = Date.now();
+    try {
+      const r = await fetch(base + path, { headers: { 'X-Titan-Test': '1' } });
+      const text = await r.text();
+      let body = null;
+      try { body = JSON.parse(text); } catch {}
+      return { name, path, status: r.status, ok: r.ok, ms: Date.now() - t, bodyPreview: body ? summarizeTestBody(body) : text.slice(0, 180) };
+    } catch (e) {
+      return { name, path, status: 0, ok: false, ms: Date.now() - t, error: String(e.message || e) };
+    }
+  }));
+
+  const passed = results.filter(x => x.ok).length;
+  const failed = results.length - passed;
+  res.json({
+    suite: 'TITAN endpoint test', version: SERVER_VERSION, videoId, channelId,
+    total: results.length, passed, failed, tookMs: Date.now() - started,
+    note: 'video/download were tested in probe mode فقط؛ لم يتم تنزيل أو بث الملف.',
+    results
+  });
+});
+
+function summarizeTestBody(body) {
+  if (!body || typeof body !== 'object') return body;
+  const out = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (k === 'results' && Array.isArray(v)) out[k] = { count: v.length, sample: v.slice(0, 1) };
+    else if (k === 'sections' && Array.isArray(v)) out[k] = v.map(x => ({ name: x.name || x.title, count: Array.isArray(x.videos) ? x.videos.length : undefined })).slice(0, 8);
+    else if (k === 'memory' && v && typeof v === 'object') out[k] = { rss: v.rss, heapUsed: v.heapUsed };
+    else if (typeof v !== 'string' || v.length < 500) out[k] = v;
+  }
+  return out;
 }
 
 // Start server
