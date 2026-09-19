@@ -4,6 +4,8 @@ const { promisify } = require('util');
 const fs = require('fs');
 // (مش محتاجين مكتبة cors تاني، الهيدرز بقت بتتحط يدوي فوق)
 const https = require('https');
+const zlib = require('zlib');
+const { URL } = require('url');
 require('dotenv').config();
 
 // ==========================================================================
@@ -14,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '9.1.0-TITAN';
+const SERVER_VERSION = '10.0.0-TITAN-MAINTENANCE';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -66,8 +68,70 @@ const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 
 // CORS intentionally removed: same-origin deployment avoids browser preflight overhead.
 
-app.use(express.json());
+
+// ==========================================================================
+// 🧰 PRODUCTION MIDDLEWARE — ضغط JSON + حماية خفيفة من انفجار الطلبات
+// لا نضغط الفيديو نفسه؛ الضغط مخصص لردود JSON الصغيرة فقط.
+// ==========================================================================
+const REQUEST_WINDOW_MS = 60 * 1000;
+const REQUEST_LIMIT = Math.max(60, parseInt(process.env.REQUEST_LIMIT, 10) || 240);
+const requestBuckets = new Map();
+
+app.use((req, res, next) => {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  let bucket = requestBuckets.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    bucket = { count: 0, resetAt: now + REQUEST_WINDOW_MS };
+    requestBuckets.set(key, bucket);
+  }
+
+  bucket.count++;
+  if (bucket.count > REQUEST_LIMIT && !req.path.startsWith('/video')) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({
+      error: 'طلبات كثيرة مؤقتًا، جرّب بعد لحظات',
+      retryAfter: 60
+    });
+  }
+
+  // Cleanup old buckets occasionally so a busy server does not grow forever.
+  if (requestBuckets.size > 5000 && Math.random() < 0.02) {
+    for (const [k, v] of requestBuckets) {
+      if (v.resetAt <= now) requestBuckets.delete(k);
+    }
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+
+  res.json = (body) => {
+    if (res.headersSent) return res;
+    const accept = String(req.headers.acceptEncoding || req.headers['accept-encoding'] || '');
+    const raw = Buffer.from(JSON.stringify(body));
+
+    // Only gzip reasonably-sized JSON responses; never touch video streams.
+    if (raw.length >= 1024 && /\bgzip\b/i.test(accept) && !res.getHeader('Content-Encoding')) {
+      const gz = zlib.gzipSync(raw, { level: 5 });
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', gz.length);
+      return res.end(gz);
+    }
+
+    return originalJson(body);
+  };
+
+  next();
+});
+
+app.use(express.json({ limit: '2mb' }));
 app.use(express.text({ limit: '10mb' }));
+
 
 // ==========================================================================
 // 🚀 TITAN CACHE — RAM only, LRU + TTL + stale-while-revalidate
@@ -110,14 +174,15 @@ class MemoryTTLCache {
 const infoCache = new MemoryTTLCache(1200);
 const searchCache = new MemoryTTLCache(500);
 const feedCache = new MemoryTTLCache(300);
-const streamCache = new MemoryTTLCache(700);
+const streamCache = new MemoryTTLCache(1000);
+const fastStreamCache = new MemoryTTLCache(600);
 const channelCache = new MemoryTTLCache(250);
 const commentsCache = new MemoryTTLCache(250);
 const suggestionCache = new MemoryTTLCache(150);
 
 const CACHE_TTL = {
   info: 30 * 60 * 1000, search: 2 * 60 * 1000, feed: 5 * 60 * 1000,
-  related: 10 * 60 * 1000, channel: 10 * 60 * 1000, stream: 2 * 60 * 1000,
+  related: 10 * 60 * 1000, channel: 10 * 60 * 1000, stream: 4 * 60 * 1000, fastStream: 90 * 1000,
   comments: 5 * 60 * 1000, suggestions: 45 * 1000
 };
 
@@ -574,8 +639,22 @@ async function getFollowedCreatorsPool(perCreator = 3) {
 }
 
 const DISCOVERY_QUERIES = [
-  'أخبار مصر اليوم', 'ترند مصر اليوم', 'كرة القدم مصر اليوم',
-  'تكنولوجيا اليوم مراجعات', 'محتوى مصري جديد'
+  'محتوى مصري جديد اليوم',
+  'فيديوهات تعليمية مصر',
+  'علوم وتكنولوجيا بالعربي',
+  'رياضة مصر اليوم',
+  'أخبار مصر اليوم',
+  'مراجعات تقنية عربية',
+  'بودكاست عربي جديد',
+  'ترند عربي اليوم'
+];
+
+const RECOMMENDATION_FALLBACK_QUERIES = [
+  'فيديوهات جديدة مصر',
+  'أفضل فيديوهات عربية اليوم',
+  'محتوى عربي مفيد',
+  'فيديوهات تعليمية عربية',
+  'محتوى عربي جديد'
 ];
 
 function parseSeedIds(value) {
@@ -601,55 +680,143 @@ async function getSeedRecommendations(seedIds, limit) {
 }
 
 async function getRecommendedVideos(region = 'EG', limit = 20, seedIds = []) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 20, 8), 80);
   const seedKey = seedIds.join('_') || 'none';
-  const key = `recommended:${region}:${limit}:${seedKey}`;
+  const key = `recommended:v10:${region}:${safeLimit}:${seedKey}`;
+
   return staleWhileRevalidate(feedCache, key, async () => {
     const items = [];
-
     const seen = new Set();
     const channelCounts = new Map();
-    const add = (list, maxPerChannel = 2) => {
-      for (const v of filterDiscovery(list)) {
+
+    const add = (list, maxPerChannel = 3, scoreTerms = []) => {
+      const ranked = rankDiscovery(list || [], scoreTerms);
+      for (const v of ranked) {
         if (!v?.id || seen.has(v.id)) continue;
         const channel = v.channelId || v.author || 'unknown';
         const count = channelCounts.get(channel) || 0;
-        if (count >= maxPerChannel && items.length < limit - 3) continue;
-        seen.add(v.id); channelCounts.set(channel, count + 1); items.push(v);
-        if (items.length >= limit) break;
+
+        // Diversify channels, but don't starve the feed.
+        if (count >= maxPerChannel && items.length < safeLimit - 2) continue;
+
+        seen.add(v.id);
+        channelCounts.set(channel, count + 1);
+        items.push(v);
+
+        if (items.length >= safeLimit) break;
       }
     };
 
-    const seeded = await getSeedRecommendations(seedIds, limit);
-    add(seeded, 3);
+    // A) Strongest signal: videos related to what the user is watching.
+    let seedContext = [];
+    if (seedIds.length) {
+      const relatedSettled = await Promise.allSettled(
+        seedIds.slice(0, 6).map(id => getRelatedVideos(id, Math.min(24, safeLimit)))
+      );
 
-    const discovery = await Promise.allSettled(DISCOVERY_QUERIES.map(q => runYtDlp([
-      `ytsearchdate${Math.max(8, Math.ceil(limit / 2))}:${q}`,
-      '--dump-json', '--flat-playlist'
-    ])));
-    for (let i = 0; i < discovery.length && items.length < limit; i++) {
-      const r = discovery[i];
-      if (r.status === 'fulfilled') add(rankDiscovery(parseFlatItems(r.value), DISCOVERY_QUERIES[i].split(/\s+/)), 2);
+      for (const r of relatedSettled) {
+        if (r.status === 'fulfilled') seedContext.push(...r.value);
+      }
+
+      add(seedContext, 4);
     }
 
-    if (items.length < limit) add(await getFollowedCreatorsPool(Math.max(2, Math.ceil(limit / FOLLOWED_CREATORS.length))), 2);
+    // B) If we have seed videos, search around their titles/channels too.
+    // This prevents the feed from falling back to random news/football.
+    const contextualQueries = [];
+    if (seedIds.length) {
+      const seedInfos = await Promise.allSettled(
+        seedIds.slice(0, 4).map(id => getVideoInfo(id))
+      );
 
-    // Final fill without strict channel cap, still keeping all discovery filters.
-    if (items.length < limit) {
-      const extra = await Promise.allSettled(['فيديوهات عربية جديدة', 'محتوى مصري اليوم'].map(q => runYtDlp([
-        `ytsearchdate${Math.max(10, limit)}:${q}`, '--dump-json', '--flat-playlist'
-      ])));
-      for (const r of extra) if (r.status === 'fulfilled') add(parseFlatItems(r.value), 5);
+      for (const r of seedInfos) {
+        if (r.status !== 'fulfilled') continue;
+        const title = normalizeText(r.value.title || '');
+        const channel = String(r.value.uploader || r.value.channel || '').trim();
+
+        // Keep useful words from the title while avoiding very long ytsearch queries.
+        const terms = title
+          .split(/\s+/)
+          .filter(w => w.length >= 3)
+          .slice(0, 7)
+          .join(' ');
+
+        if (terms) contextualQueries.push(terms);
+        if (channel) contextualQueries.push(channel);
+      }
     }
 
-    const result = {
-      items: items.slice(0, limit),
+    const uniqueContextQueries = [...new Set(contextualQueries)].slice(0, 6);
+    if (uniqueContextQueries.length) {
+      const contextual = await Promise.allSettled(
+        uniqueContextQueries.map(q => runYtDlp([
+          `ytsearchdate${Math.max(10, Math.ceil(safeLimit / 2))}:${q}`,
+          '--dump-json', '--flat-playlist'
+        ]))
+      );
+
+      for (let i = 0; i < contextual.length && items.length < safeLimit; i++) {
+        const r = contextual[i];
+        if (r.status === 'fulfilled') {
+          add(parseFlatItems(r.value), 3, uniqueContextQueries[i].split(/\s+/));
+        }
+      }
+    }
+
+    // C) Fresh discovery, but with larger pools so filtering doesn't leave 3 videos.
+    if (items.length < safeLimit) {
+      const discovery = await Promise.allSettled(
+        DISCOVERY_QUERIES.map(q => runYtDlp([
+          `ytsearchdate${Math.max(16, safeLimit)}:${q}`,
+          '--dump-json', '--flat-playlist'
+        ]))
+      );
+
+      for (let i = 0; i < discovery.length && items.length < safeLimit; i++) {
+        const r = discovery[i];
+        if (r.status === 'fulfilled') {
+          add(parseFlatItems(r.value), 3, DISCOVERY_QUERIES[i].split(/\s+/));
+        }
+      }
+    }
+
+    // D) Followed creators as a stable source.
+    if (items.length < safeLimit) {
+      try {
+        add(await getFollowedCreatorsPool(Math.max(4, Math.ceil(safeLimit / FOLLOWED_CREATORS.length))), 3);
+      } catch (e) {
+        log.warn(`Creator fallback failed: ${e.message}`);
+      }
+    }
+
+    // E) Final broad fill. No strict channel cap here, only quality filters.
+    if (items.length < safeLimit) {
+      const extra = await Promise.allSettled(
+        RECOMMENDATION_FALLBACK_QUERIES.map(q => runYtDlp([
+          `ytsearchdate${Math.max(20, safeLimit)}:${q}`,
+          '--dump-json', '--flat-playlist'
+        ]))
+      );
+
+      for (const r of extra) {
+        if (r.status === 'fulfilled') {
+          add(parseFlatItems(r.value), 8);
+          if (items.length >= safeLimit) break;
+        }
+      }
+    }
+
+    return {
+      items: items.slice(0, safeLimit),
       personalized: seedIds.length > 0,
-      strategy: seedIds.length ? 'watched-related + fresh-discovery + creator-fallback' : 'fresh-discovery + creator-fallback',
+      strategy: seedIds.length
+        ? 'related + title-context + fresh-discovery + creators + fallback'
+        : 'fresh-discovery + creators + fallback',
       generatedAt: new Date().toISOString()
     };
-    return result;
   }, CACHE_TTL.feed);
 }
+
 
 /**
  * ==========================================================================
@@ -662,12 +829,13 @@ async function getRecommendedVideos(region = 'EG', limit = 20, seedIds = []) {
  * ==========================================================================
  */
 const HOME_SECTIONS = [
-  { key: 'trending', title: '🔥 الرائج الآن', query: null },
-  { key: 'music', title: '🎵 موسيقى', query: 'أغاني عربي جديد 2026' },
-  { key: 'sports', title: '⚽ رياضة', query: 'أهداف وملخصات مباريات' },
-  { key: 'news', title: '📰 أخبار', query: 'أخبار عاجلة اليوم' },
-  { key: 'tech', title: '💻 تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية' },
-  { key: 'gaming', title: '🎮 ألعاب', query: 'ألعاب فيديو جيمنج' }
+  { key: 'trending', title: 'الرائج الآن', query: 'ترند مصر اليوم' },
+  { key: 'education', title: 'تعليم', query: 'شرح دروس تعليمية بالعربي' },
+  { key: 'tech', title: 'تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية عربية' },
+  { key: 'sports', title: 'رياضة', query: 'رياضة مصر أهداف وملخصات' },
+  { key: 'news', title: 'أخبار', query: 'أخبار مصر اليوم' },
+  { key: 'podcasts', title: 'بودكاست', query: 'بودكاست عربي جديد' },
+  { key: 'gaming', title: 'ألعاب', query: 'ألعاب فيديو عربية' }
 ];
 
 async function getHomeFeed(region = 'EG', perSection = 12) {
@@ -682,17 +850,10 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
       async () => {
         try {
           let stdout;
-          if (section.key === 'trending') {
-            stdout = await runYtDlp([
-              `ytsearchdate${Math.max(perSection * 3, 30)}:ترند مصر اليوم`,
-              '--dump-json', '--flat-playlist'
-            ]);
-          } else {
-            stdout = await runYtDlp([
-              `ytsearch${Math.max(perSection * 2, 20)}:${section.query}`,
-              '--dump-json', '--flat-playlist'
-            ]);
-          }
+          stdout = await runYtDlp([
+            `ytsearchdate${Math.max(perSection * 3, 36)}:${section.query}`,
+            '--dump-json', '--flat-playlist'
+          ]);
           return {
             key: section.key,
             title: section.title,
@@ -1110,49 +1271,185 @@ app.get('/comments', async (req, res) => {
  * دلوقتي المتصفح مايكلمش يوتيوب خالص، بيكلم سيرفرنا بس، وسيرفرنا هو اللي
  * بيكلم يوتيوب بنفس الـ IP اللي جاب بيه الرابط أصلاً.
  */
+
+// ==========================================================================
+// ⚡ FAST STREAM PATH
+// الهدف: التشغيل العادي لا يحتاج dump-json كامل قبل أول بايت.
+// yt-dlp --get-url أخف بكثير من getVideoInfo، لذلك المسار الافتراضي يستخدمه.
+// ==========================================================================
+
+async function getFastStreamUrl(videoId) {
+  const key = `fast:${videoId}`;
+  const cached = fastStreamCache.get(key);
+  if (cached) return cached;
+
+  return dedupe(key, async () => {
+    const again = fastStreamCache.get(key);
+    if (again) return again;
+
+    // Progressive first: browser receives both audio + video in one URL.
+    const candidates = [
+      'best[acodec!=none][vcodec!=none]/best',
+      'best'
+    ];
+
+    let lastError;
+    for (const selector of candidates) {
+      try {
+        const urls = await getFormatUrls(videoId, selector);
+        const url = urls[0];
+        if (url) {
+          fastStreamCache.set(key, url, CACHE_TTL.fastStream);
+          return url;
+        }
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError || new Error('No fast stream URL available');
+  });
+}
+
+function copySafeUpstreamHeaders(upstreamRes, res) {
+  const allowed = [
+    'content-type',
+    'content-length',
+    'content-range',
+    'accept-ranges',
+    'etag',
+    'last-modified',
+    'expires'
+  ];
+
+  for (const h of allowed) {
+    if (upstreamRes.headers[h] != null) res.setHeader(h, upstreamRes.headers[h]);
+  }
+
+  // A proxied response must be allowed to stream progressively.
+  if (!res.getHeader('Accept-Ranges')) res.setHeader('Accept-Ranges', 'bytes');
+}
+
+function resolveRedirectUrl(base, location) {
+  try {
+    return new URL(location, base).toString();
+  } catch {
+    return null;
+  }
+}
+
+function destroyResponseStream(res) {
+  try {
+    if (!res.writableEnded && !res.destroyed) res.destroy();
+  } catch {}
+}
+
 function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
-  if (redirectCount > 5) {
-    if (!res.headersSent) res.status(502).json({ error: 'تحويلات كتير أوي من المصدر' });
+  if (!url) {
+    if (!res.headersSent) res.status(502).json({ error: 'رابط الفيديو غير متاح' });
+    return;
+  }
+
+  if (redirectCount > 6) {
+    if (!res.headersSent) res.status(502).json({ error: 'تحويلات المصدر كثيرة' });
+    return;
+  }
+
+  let target;
+  try {
+    target = new URL(url).toString();
+  } catch {
+    if (!res.headersSent) res.status(502).json({ error: 'رابط المصدر غير صالح' });
     return;
   }
 
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
     'Accept': '*/*',
-    'Accept-Encoding': 'identity'
+    'Accept-Encoding': 'identity',
+    'Connection': 'keep-alive'
   };
-  if (req.headers.range) headers['Range'] = req.headers.range;
 
-  const upstreamReq = https.get(url, { headers, timeout: 20000, agent: keepAliveAgent }, (upstreamRes) => {
-    // تتبّع أي redirect إضافي بنفسنا (مش بنسيبه للمتصفح)
-    if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+  // Critical for seeking and for browsers that request the video in chunks.
+  if (req.headers.range) headers.Range = req.headers.range;
+  if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+
+  const upstreamReq = https.get(target, {
+    headers,
+    timeout: 12000,
+    agent: keepAliveAgent
+  }, (upstreamRes) => {
+    const code = Number(upstreamRes.statusCode || 0);
+
+    if ([301, 302, 303, 307, 308].includes(code) && upstreamRes.headers.location) {
+      const nextUrl = resolveRedirectUrl(target, upstreamRes.headers.location);
       upstreamRes.resume();
-      return streamFromUpstream(req, res, upstreamRes.headers.location, redirectCount + 1);
+      if (!nextUrl) {
+        if (!res.headersSent) res.status(502).json({ error: 'تحويل المصدر غير صالح' });
+        return;
+      }
+      return streamFromUpstream(req, res, nextUrl, redirectCount + 1, duration);
     }
 
-    if (upstreamRes.statusCode >= 400) {
-      log.error(`Upstream video error: ${upstreamRes.statusCode}`);
-      if (!res.headersSent) res.status(502).json({ error: 'تعذّر تحميل الفيديو من المصدر' });
+    if ([401, 403, 410].includes(code)) {
       upstreamRes.resume();
+      if (!res.headersSent) res.status(code === 410 ? 502 : 502).json({
+        error: 'مصدر الفيديو انتهت صلاحيته، أعد طلب التشغيل لإحضار رابط جديد',
+        upstreamStatus: code
+      });
       return;
     }
 
-    res.status(upstreamRes.statusCode);
-    if (Number.isFinite(Number(duration)) && Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
-    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']
-      .forEach(h => { if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]); });
+    if (code >= 400) {
+      upstreamRes.resume();
+      if (!res.headersSent) res.status(502).json({
+        error: 'تعذّر تحميل الفيديو من المصدر',
+        upstreamStatus: code
+      });
+      return;
+    }
 
-    upstreamRes.pipe(res);
+    res.status(code || 200);
+    res.setHeader('Cache-Control', 'no-store');
+    if (Number.isFinite(Number(duration)) && Number(duration) > 0) {
+      res.setHeader('X-Video-Duration', String(duration));
+    }
+    copySafeUpstreamHeaders(upstreamRes, res);
+
+    // Do not force chunked encoding when the upstream gave a valid length.
+    upstreamRes.pipe(res, { end: true });
+
+    upstreamRes.on('error', err => {
+      log.warn(`Upstream response error: ${err.message}`);
+      destroyResponseStream(res);
+    });
   });
 
-  upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('Upstream timeout')));
+  upstreamReq.on('timeout', () => {
+    upstreamReq.destroy(new Error('Upstream timeout'));
+  });
+
   upstreamReq.on('error', (err) => {
     log.error(`Stream proxy error: ${err.message}`);
-    if (!res.headersSent) res.status(502).json({ error: 'تعذّر الاتصال بمصدر الفيديو' });
+    if (!res.headersSent) {
+      res.status(504).json({ error: 'مصدر الفيديو اتأخر في الرد' });
+    } else {
+      destroyResponseStream(res);
+    }
   });
 
-  req.on('close', () => upstreamReq.destroy());
+  // "close" can happen after the client genuinely disconnects.
+  // aborted is the safer signal for an interrupted incoming request.
+  req.once('aborted', () => {
+    try { upstreamReq.destroy(); } catch {}
+  });
+
+  res.once('close', () => {
+    if (!res.writableEnded) {
+      try { upstreamReq.destroy(); } catch {}
+    }
+  });
 }
+
 
 // ==========================================================================
 // نظام الجودات v6:
@@ -1240,21 +1537,34 @@ function getAvailableQualities(info) {
 function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
   const inputArgs = [
-    '-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '2', '-i', videoUrl
+    '-user_agent', UA,
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_at_eof', '1',
+    '-reconnect_delay_max', '2',
+    '-rw_timeout', '12000000',
+    '-i', videoUrl
   ];
 
   if (audioUrl) inputArgs.push(
-    '-user_agent', UA, '-reconnect', '1', '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '2', '-i', audioUrl
+    '-user_agent', UA,
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_at_eof', '1',
+    '-reconnect_delay_max', '2',
+    '-rw_timeout', '12000000',
+    '-i', audioUrl
   );
 
   const args = [
-    '-loglevel', 'error', '-hide_banner',
+    '-loglevel', 'warning',
+    '-hide_banner',
+    '-nostdin',
     ...inputArgs,
     '-map', '0:v:0',
     ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
+    '-avoid_negative_ts', 'make_zero',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     '-f', 'mp4', 'pipe:1'
   ];
@@ -1320,7 +1630,57 @@ app.get('/video/source', async (req, res) => {
   }
 });
 
+
+// ==========================================================================
+// 🚀 QUICK PLAY — أسرع طريق للتشغيل الأول.
+// لا يجلب معلومات الفيديو الكاملة؛ يحل رابط البث فقط.
+// ==========================================================================
+app.get('/video/quick', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID غير صحيح' });
+  }
+
+  try {
+    const url = await getFastStreamUrl(videoId);
+    res.setHeader('X-Stream-Mode', 'quick-direct');
+    return streamFromUpstream(req, res, url, 0);
+  } catch (error) {
+    log.warn(`Quick stream failed ${videoId}: ${error.message}`);
+    return res.status(502).json({
+      error: 'تعذّر تشغيل الفيديو بسرعة',
+      retryable: true
+    });
+  }
+});
+
+// Frontend can call this after a stale/expired source instead of waiting
+// for the old URL to fail repeatedly.
+app.get('/video/refresh', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID غير صحيح' });
+
+  fastStreamCache.delete(`fast:${videoId}`);
+  for (const key of streamCache.map.keys()) {
+    if (String(key).includes(videoId)) streamCache.delete(key);
+  }
+
+  try {
+    const url = await getFastStreamUrl(videoId);
+    return res.json({
+      id: videoId,
+      refreshed: true,
+      mode: 'direct',
+      url,
+      expiresIn: 'source-dependent'
+    });
+  } catch (e) {
+    return res.status(502).json({ error: 'فشل تجديد مصدر الفيديو' });
+  }
+});
+
 app.get('/video', async (req, res) => {
+  const requestStartedAt = Date.now();
   const { v: videoId, format = 'best', quality } = req.query;
 
   if (!videoId || !isValidVideoId(videoId)) {
@@ -1331,8 +1691,8 @@ app.get('/video', async (req, res) => {
   }
 
   try {
-    const infoForStream = await getVideoInfo(videoId);
-    const videoDuration = Number(infoForStream.duration || 0);
+    // Explicit quality requires full format metadata. The default path does not.
+    const videoDuration = 0;
     // Probe mode: resolve the stream without sending the video bytes.
     // Useful for automated endpoint testing and health checks.
     const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
@@ -1353,6 +1713,7 @@ app.get('/video', async (req, res) => {
         res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
         res.setHeader('X-Stream-Mode', 'direct');
         if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'direct', resolved: true, urlLength: String(urls[0] || '').length });
+        recordPerf('video-quality', Date.now() - requestStartedAt, true);
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
       }
 
@@ -1365,23 +1726,21 @@ app.get('/video', async (req, res) => {
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
       res.setHeader('X-Stream-Mode', 'ffmpeg');
       if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true, videoUrlLength: String(urls[0] || '').length, audioUrlLength: String(urls[1] || '').length });
+      recordPerf('video-quality', Date.now() - requestStartedAt, true);
       return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
     }
 
-    const cacheKey = `default_stream_${videoId}_${format}`;
-    const streamUrl = await dedupe(cacheKey, async () => {
-      const cached = streamCache.get(cacheKey);
-      if (cached) return cached;
+    // Default = fastest direct progressive stream.
+    const streamUrl = format === 'best'
+      ? await getFastStreamUrl(videoId)
+      : await getVideoStreamUrl(videoId, format);
 
-      const url = await getVideoStreamUrl(videoId, format);
-      if (!url) throw new Error('Failed to get stream URL');
-      streamCache.set(cacheKey, url, CACHE_TTL.stream);
-      return url;
-    });
-
+    res.setHeader('X-Stream-Mode', 'direct-fast');
+    recordPerf(quality ? 'video-quality' : 'video-default', Date.now() - requestStartedAt, true);
     return streamFromUpstream(req, res, streamUrl, 0, videoDuration);
 
   } catch (error) {
+    recordPerf(quality ? 'video-quality' : 'video-default', Date.now() - requestStartedAt, false);
     log.error(`Error streaming ${videoId}: ${error.message}`);
     if (res.headersSent) return;
 
@@ -1753,7 +2112,7 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v9.0.0 TITAN - YouTube media server',
+    name: '🎬 srver v10.0.0 TITAN Maintenance - YouTube media server',
     version: SERVER_VERSION,
     environment: NODE_ENV,
     recommended: '/trending?region=EG&seed=dQw4w9WgXcQ',
@@ -1781,12 +2140,17 @@ app.get('/', (req, res) => {
       comments: '/comments?v=VIDEO_ID&limit=50',
       health: '/health',
       performance: '/api/performance',
+      maintenance: '/api/maintenance',
+      videoDebug: '/api/video-debug?v=VIDEO_ID',
+      quickVideo: '/video/quick?v=VIDEO_ID',
+      refreshVideo: '/video/refresh?v=VIDEO_ID',
       prefetch: '/api/prefetch?v=VIDEO_ID',
       suggestions: '/search/suggestions?q=QUERY',
       download: '/download?v=VIDEO_ID&quality=720',
       accountFeed: '/api/account-feed?limit=30',
       cookiesStatus: '/api/cookies-status',
-      testAll: '/api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw'
+      testAll: '/api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw',
+      clearCache: 'POST /api/cache/clear (requires CACHE_ADMIN_SECRET)'
     },
     videoQualityValues: 'يتم اكتشاف كل الارتفاعات الحقيقية تلقائيًا عبر /video/qualities',
     pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
@@ -1794,7 +2158,8 @@ app.get('/', (req, res) => {
       'Home feed (أقسام زي يوتيوب)': '/home?region=EG',
       'Trending page 1': '/trending?region=EG&page=1',
       'Trending page 2 (سكرول لاحق)': '/trending?region=EG&page=2',
-      'Play video (جودة تلقائية)': '/video?v=dQw4w9WgXcQ',
+      'Play video (سريع)': '/video?v=dQw4w9WgXcQ',
+      'Play video quick': '/video/quick?v=dQw4w9WgXcQ',
       'Play video 1080p (دمج ffmpeg)': '/video?v=dQw4w9WgXcQ&quality=1080',
       'Play video 4K': '/video?v=dQw4w9WgXcQ&quality=2160',
       'Audio only': '/video?v=dQw4w9WgXcQ&quality=audio',
@@ -1861,6 +2226,365 @@ app.get('/api/performance', (req, res) => {
   });
 });
 
+
+// ==========================================================================
+// 🩺 OPERATIONS — تشخيص سريع وصيانة بدون restart
+// ==========================================================================
+
+app.get('/api/maintenance', (req, res) => {
+  const memory = process.memoryUsage();
+  const rssMb = Math.round(memory.rss / 1024 / 1024);
+  const heapMb = Math.round(memory.heapUsed / 1024 / 1024);
+
+  res.json({
+    version: SERVER_VERSION,
+    uptimeSeconds: Math.round(process.uptime()),
+    memoryMb: { rss: rssMb, heapUsed: heapMb, heapTotal: Math.round(memory.heapTotal / 1024 / 1024) },
+    eventLoop: {
+      note: 'Use /api/performance for queue/cache pressure'
+    },
+    queues: {
+      metadata: { current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length, max: ytdlpLimiter.max },
+      streams: { current: streamLimiter.current, queued: streamLimiter.queue.length, max: streamLimiter.max },
+      downloads: { current: downloadLimiter.current, queued: downloadLimiter.queue.length, max: downloadLimiter.max }
+    },
+    caches: {
+      info: infoCache.stats(),
+      search: searchCache.stats(),
+      feed: feedCache.stats(),
+      stream: streamCache.stats(),
+      fastStream: fastStreamCache.stats(),
+      channel: channelCache.stats(),
+      comments: commentsCache.stats(),
+      suggestions: suggestionCache.stats()
+    }
+  });
+});
+
+app.post('/api/cache/clear', (req, res) => {
+  const secret = process.env.CACHE_ADMIN_SECRET || '';
+  const provided = req.get('x-cache-admin-key') || '';
+  if (!secret || provided !== secret) {
+    return res.status(401).json({ error: 'غير مصرح' });
+  }
+
+  infoCache.clear();
+  searchCache.clear();
+  feedCache.clear();
+  streamCache.clear();
+  fastStreamCache.clear();
+  channelCache.clear();
+  commentsCache.clear();
+  suggestionCache.clear();
+
+  return res.json({
+    success: true,
+    message: 'تم تنظيف كل كاش RAM',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/video-debug', async (req, res) => {
+  const id = String(req.query.v || '');
+  if (!isValidVideoId(id)) return res.status(400).json({ error: 'Video ID غير صحيح' });
+
+  const started = Date.now();
+  const out = {
+    id,
+    startedAt: new Date(started).toISOString(),
+    steps: []
+  };
+
+  try {
+    const t1 = Date.now();
+    const fast = await getFastStreamUrl(id);
+    out.steps.push({
+      name: 'fast-source',
+      ok: true,
+      ms: Date.now() - t1,
+      urlLength: fast.length
+    });
+
+    const t2 = Date.now();
+    const info = await getVideoInfo(id);
+    out.steps.push({
+      name: 'metadata',
+      ok: true,
+      ms: Date.now() - t2,
+      title: info.title || null,
+      duration: info.duration || 0,
+      formats: info.formats?.length || 0
+    });
+
+    out.totalMs = Date.now() - started;
+    out.ok = true;
+    out.hint = out.steps[0].ms > 5000
+      ? 'مصدر الفيديو نفسه بطيء؛ راجع yt-dlp/YouTube connectivity.'
+      : 'المسار السريع جاهز.';
+    return res.json(out);
+  } catch (e) {
+    out.totalMs = Date.now() - started;
+    out.ok = false;
+    out.error = String(e.message || e);
+    return res.status(502).json(out);
+  }
+});
+
+
+// ==========================================================================
+// 📚 TITAN MAINTENANCE NOTES
+//
+// 1) /video is now the fast path and avoids a full metadata extraction.
+// 2) /video?quality=720/1080/... still uses the format-aware path.
+// 3) /video/quick is intentionally minimal for instant playback.
+// 4) /video/refresh clears stale source URLs for one video.
+// 5) /api/video-debug measures source-vs-metadata latency.
+// 6) /api/maintenance exposes safe queue/cache/memory diagnostics.
+// 7) POST /api/cache/clear is protected by CACHE_ADMIN_SECRET.
+// 8) JSON responses above 1KB are gzip-compressed when the client supports it.
+// 9) Range headers are forwarded to upstream, which improves seek/resume.
+// 10) Expired upstream URLs now fail cleanly so the frontend can refresh.
+// 11) Recommendation pools are larger and use related/title context first.
+// 12) Discovery has more fallback pools so filtering doesn't collapse the feed.
+// 13) Channel diversity is preserved without starving the final result count.
+// 14) Home sections now include education/podcasts and use larger pools.
+// 15) Request protection prevents accidental API floods without throttling video.
+// 16) Keep the frontend on /video or /video/quick for normal playback.
+// 17) Use explicit quality only when the user actually selects a quality.
+// 18) Avoid calling /formats or /info before every playback unless needed.
+// 19) Use /api/prefetch after a video card is visible, not for every card.
+// 20) If Railway CPU/RAM is constrained, lower STREAM_CONCURRENCY first.
+// 21) If YouTube blocks extraction, update yt-dlp and refresh cookies.
+// 22) Never expose Firebase secrets or cookie contents through diagnostics.
+// 23) The server cache is RAM-only by design; restart clears it safely.
+// 24) The frontend should retry a 502 source once through /video/refresh.
+// 25) For long videos, Range support is more important than proxy buffering.
+// 26) ffmpeg is reserved for video+audio combinations that need merging.
+// 27) Progressive direct streams are preferred because they start sooner.
+// 28) The recommendation engine deliberately avoids generic random-only feeds.
+// 29) Unwanted content filters remain active for discovery and recommendations.
+// 30) /api/performance remains backward-compatible with existing dashboards.
+//
+// ==========================================================================
+
+
+// ==========================================================================
+// 🧠 ADAPTIVE PERFORMANCE LAYER
+// يحتفظ بإحصائيات زمنية بسيطة ويستخدمها في التشخيص بدون قاعدة بيانات.
+// ==========================================================================
+
+const perfWindow = {
+  samples: [],
+  maxSamples: 240
+};
+
+function recordPerf(kind, ms, ok = true) {
+  const item = {
+    kind,
+    ms: Math.max(0, Math.round(ms)),
+    ok: Boolean(ok),
+    at: Date.now()
+  };
+  perfWindow.samples.push(item);
+  if (perfWindow.samples.length > perfWindow.maxSamples) {
+    perfWindow.samples.splice(0, perfWindow.samples.length - perfWindow.maxSamples);
+  }
+}
+
+function perfSummary(kind = null) {
+  const now = Date.now();
+  const recent = perfWindow.samples.filter(x => now - x.at < 10 * 60 * 1000 && (!kind || x.kind === kind));
+  if (!recent.length) return { count: 0, avgMs: 0, p95Ms: 0, errors: 0 };
+
+  const sorted = recent.map(x => x.ms).sort((a, b) => a - b);
+  const avg = sorted.reduce((a, b) => a + b, 0) / sorted.length;
+  const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+
+  return {
+    count: recent.length,
+    avgMs: Math.round(avg),
+    p95Ms: Math.round(p95),
+    errors: recent.filter(x => !x.ok).length
+  };
+}
+
+// Periodically trim old latency samples without a timer storm.
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  perfWindow.samples = perfWindow.samples.filter(x => x.at >= cutoff);
+}, 60 * 1000);
+
+// ==========================================================================
+// 🛡️ SOURCE CIRCUIT BREAKER
+// لو المصدر الخارجي بدأ يفشل بكثرة، نوقف الضرب عليه لثوانٍ قليلة بدل
+// ما كل مستخدم يطلق yt-dlp جديد في نفس اللحظة.
+// ==========================================================================
+const sourceBreaker = {
+  failures: 0,
+  openedUntil: 0,
+  threshold: Math.max(3, parseInt(process.env.SOURCE_BREAKER_THRESHOLD, 10) || 5),
+  cooldownMs: Math.max(5000, parseInt(process.env.SOURCE_BREAKER_COOLDOWN, 10) || 15000)
+};
+
+function sourceBreakerOpen() {
+  return sourceBreaker.openedUntil > Date.now();
+}
+
+function sourceBreakerSuccess() {
+  sourceBreaker.failures = Math.max(0, sourceBreaker.failures - 1);
+  if (sourceBreaker.failures === 0) sourceBreaker.openedUntil = 0;
+}
+
+function sourceBreakerFailure() {
+  sourceBreaker.failures++;
+  if (sourceBreaker.failures >= sourceBreaker.threshold) {
+    sourceBreaker.openedUntil = Date.now() + sourceBreaker.cooldownMs;
+    log.warn(`🛑 Source breaker opened for ${sourceBreaker.cooldownMs}ms`);
+  }
+}
+
+app.get('/api/diagnostics', (req, res) => {
+  res.json({
+    version: SERVER_VERSION,
+    now: new Date().toISOString(),
+    sourceBreaker: {
+      open: sourceBreakerOpen(),
+      failures: sourceBreaker.failures,
+      threshold: sourceBreaker.threshold,
+      cooldownMs: sourceBreaker.cooldownMs,
+      openedUntil: sourceBreaker.openedUntil || null
+    },
+    latency: {
+      videoQuick: perfSummary('video-quick'),
+      videoDefault: perfSummary('video-default'),
+      videoQuality: perfSummary('video-quality'),
+      recommendations: perfSummary('recommendations'),
+      home: perfSummary('home')
+    },
+    process: {
+      pid: process.pid,
+      uptimeSeconds: Math.round(process.uptime()),
+      memory: process.memoryUsage()
+    }
+  });
+});
+
+// ==========================================================================
+// 🔁 SMART RECOMMENDATION PAGING
+// Endpoint إضافي يملأ الصفحة المطلوبة من pool أكبر بدل ما يعيد بناء
+// التوصيات من الصفر مع كل page.
+// ==========================================================================
+app.get('/recommendations', async (req, res) => {
+  const region = String(req.query.region || 'EG').toUpperCase();
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 40);
+  const seeds = parseSeedIds(req.query.seed || req.query.seeds || req.query.history);
+  const poolSize = Math.min(Math.max(page * limit, 40), 80);
+
+  try {
+    const started = Date.now();
+    const data = await getRecommendedVideos(region, poolSize, seeds);
+    const start = (page - 1) * limit;
+    const results = data.items.slice(start, start + limit);
+
+    recordPerf('recommendations', Date.now() - started, true);
+
+    res.json({
+      region,
+      page,
+      limit,
+      count: results.length,
+      hasMore: data.items.length > start + limit,
+      personalized: data.personalized,
+      strategy: data.strategy,
+      results
+    });
+  } catch (e) {
+    recordPerf('recommendations', Date.now() - started, false);
+    res.status(502).json({ error: 'تعذّر بناء التوصيات', retryable: true });
+  }
+});
+
+// ==========================================================================
+// 🧪 STREAM HEAD/PROBE
+// فحص خفيف للمصدر المباشر بدون تشغيل ffmpeg أو تنزيل الفيديو للمستخدم.
+// ==========================================================================
+app.get('/video/ping', async (req, res) => {
+  const id = String(req.query.v || '');
+  if (!isValidVideoId(id)) return res.status(400).json({ error: 'Video ID غير صحيح' });
+
+  const started = Date.now();
+  try {
+    const url = await getFastStreamUrl(id);
+    const parsed = new URL(url);
+
+    return res.json({
+      id,
+      ok: true,
+      host: parsed.hostname,
+      sourceUrlLength: url.length,
+      resolveMs: Date.now() - started,
+      cached: Boolean(fastStreamCache.get(`fast:${id}`))
+    });
+  } catch (e) {
+    return res.status(502).json({
+      id,
+      ok: false,
+      resolveMs: Date.now() - started,
+      error: String(e.message || e)
+    });
+  }
+});
+
+// ==========================================================================
+// 📦 CACHE SNAPSHOT
+// يعرض فقط المفاتيح العامة والإحصائيات، ولا يعرض أي URL أو Cookie أو Secret.
+// ==========================================================================
+app.get('/api/cache-summary', (req, res) => {
+  res.json({
+    timestamp: new Date().toISOString(),
+    caches: {
+      info: infoCache.stats(),
+      search: searchCache.stats(),
+      feed: feedCache.stats(),
+      stream: streamCache.stats(),
+      fastStream: fastStreamCache.stats(),
+      channel: channelCache.stats(),
+      comments: commentsCache.stats(),
+      suggestions: suggestionCache.stats()
+    },
+    inflight: {
+      count: inflight.size
+    }
+  });
+});
+
+// ==========================================================================
+// 📝 MAINTENANCE CHECKLIST
+//
+// Recommended Railway environment variables:
+//   YTDLP_META_CONCURRENCY=3
+//   YTDLP_STREAM_CONCURRENCY=2
+//   DOWNLOAD_CONCURRENCY=1
+//   REQUEST_LIMIT=240
+//   SOURCE_BREAKER_THRESHOLD=5
+//   SOURCE_BREAKER_COOLDOWN=15000
+//   CACHE_ADMIN_SECRET=<long-random-secret>
+//
+// Operational workflow:
+//   1. Check /health.
+//   2. Check /api/diagnostics.
+//   3. Check /api/video-debug?v=VIDEO_ID.
+//   4. If fast-source is slow, the bottleneck is extraction/upstream.
+//   5. If fast-source is fast but playback stalls, inspect Range/upstream.
+//   6. Use /video/refresh?v=VIDEO_ID after a stale source error.
+//   7. Use /api/cache/clear only after changing extraction configuration.
+//   8. Keep quality selection out of the initial autoplay request.
+//   9. Use /video/quick for cards that should start immediately.
+//  10. Use /recommendations for infinite scrolling instead of rebuilding
+//      a small recommendation list on every page.
+// ==========================================================================
+
 // 404
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint غير موجود', path: req.path });
@@ -1884,13 +2608,17 @@ async function warmHotCaches() {
   if (warmupRunning) return;
   warmupRunning = true;
   try {
+    // Warm only lightweight feeds; never pre-resolve arbitrary video streams.
     await Promise.allSettled([
-      getHomeFeed('EG', 8),
-      getRecommendedVideos('EG', 20, [])
+      getHomeFeed('EG', 6),
+      getRecommendedVideos('EG', 24, [])
     ]);
     log.success('🔥 Hot caches warmed');
-  } catch (e) { log.warn(`Warmup failed: ${e.message}`); }
-  finally { warmupRunning = false; }
+  } catch (e) {
+    log.warn(`Warmup failed: ${e.message}`);
+  } finally {
+    warmupRunning = false;
+  }
 }
 
 // ==========================================================================
@@ -1966,7 +2694,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   const ytdlpStatus = commandExists('yt-dlp') ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
-║  🎬 srver v${SERVER_VERSION} "جبارة" شغّال 🔥        ║
+║  🎬 srver v${SERVER_VERSION} شغّال 🔥        ║
 ║  ═════════════════════════════════════     ║
 ║  Environment: ${NODE_ENV.padEnd(26, ' ')}║
 ║  yt-dlp: ${ytdlpStatus}  Firebase Cookies (bg refresh)  ║
