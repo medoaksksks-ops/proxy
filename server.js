@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '10.1.0-TITAN-ACCOUNT';
+const SERVER_VERSION = '10.2.1-TITAN-FAST';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -115,12 +115,15 @@ app.use((req, res, next) => {
 
     // Only gzip reasonably-sized JSON responses; never touch video streams.
     if (raw.length >= 1024 && /\bgzip\b/i.test(accept) && !res.getHeader('Content-Encoding')) {
-      const gz = zlib.gzipSync(raw, { level: 5 });
-      res.setHeader('Content-Encoding', 'gzip');
-      res.setHeader('Vary', 'Accept-Encoding');
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.setHeader('Content-Length', gz.length);
-      return res.end(gz);
+      zlib.gzip(raw, { level: 1 }, (err, gz) => {
+        if (err || res.headersSent) return originalJson(body);
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Length', gz.length);
+        res.end(gz);
+      });
+      return res;
     }
 
     return originalJson(body);
@@ -171,7 +174,7 @@ class MemoryTTLCache {
   }
 }
 
-const infoCache = new MemoryTTLCache(1200);
+const infoCache = new MemoryTTLCache(200);
 const searchCache = new MemoryTTLCache(500);
 const feedCache = new MemoryTTLCache(300);
 const streamCache = new MemoryTTLCache(1000);
@@ -302,7 +305,7 @@ function saveCookiesLocally(content) {
   fs.writeFileSync(COOKIES_PATH, content);
   lastCookiesContent = content;
   cookiesReady = true;
-  feedCache.clear();
+  feedCache.clear(); accountListCache.clear(); botWallUntil = 0;
 }
 async function refreshCookies() {
   try {
@@ -311,7 +314,7 @@ async function refreshCookies() {
       fs.writeFileSync(COOKIES_PATH, content);
       lastCookiesContent = content;
       cookiesReady = true;
-      feedCache.clear();
+      feedCache.clear(); accountListCache.clear(); botWallUntil = 0;
       log.success(`🍪 Cookies refreshed (${content.length} bytes)`);
     } else if (!content) {
       log.warn('⚠️  No cookies available in Firebase yet');
@@ -340,6 +343,16 @@ function sanitizeFilename(name) {
  * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
+
+// نسخة yt-dlp بتتقرا مرة واحدة في الخلفية (كانت execFileSync في كل /health وبتجمّد السيرفر كله ثواني)
+let ytdlpVersion = null;
+execFile('yt-dlp', ['--version'], { encoding: 'utf8' }, (err, out) => { if (!err) ytdlpVersion = String(out).trim(); });
+
+// قياس تأخّر الـ event loop — لو الرقم كبير يبقى حاجة بتجمّد السيرفر
+let loopLagMs = 0;
+let _lagLast = Date.now();
+setInterval(() => { const now = Date.now(); loopLagMs = Math.max(0, now - _lagLast - 500); _lagLast = now; }, 500).unref();
+
 const commandCache = new Map();
 function commandExists(command) {
   if (commandCache.has(command)) return commandCache.get(command);
@@ -352,9 +365,175 @@ function isRetryableYoutubeError(error) {
   return /page needs to be reloaded|sign in to confirm|confirm you’re not a bot|confirm you're not a bot|http error 403|requested format is not available|video unavailable|not available in your country/.test(text);
 }
 
+
+// ==========================================================================
+// ⚡ InnerTube مباشر — بحث يوتيوب بدون تشغيل yt-dlp (أسرع بكتير: ~0.3 ثانية بدل 3-5)
+// لو فشل لأي سبب بنرجع تلقائيًا لـ yt-dlp زي الأول.
+// ==========================================================================
+const YT_WEB_VERSION = process.env.YT_WEB_CLIENT_VERSION || '2.20260901.00.00';
+const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+const YT_CONTEXT = { client: { clientName: 'WEB', clientVersion: YT_WEB_VERSION, hl: 'ar', gl: 'EG' } };
+
+function innertubePost(endpoint, body, timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = https.request({
+      hostname: 'www.youtube.com',
+      path: `/youtubei/v1/${endpoint}?prettyPrint=false`,
+      method: 'POST',
+      agent: keepAliveAgent,
+      timeout,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'User-Agent': YT_UA,
+        'Accept-Language': 'ar-EG,ar;q=0.9,en;q=0.8',
+        'Origin': 'https://www.youtube.com',
+        'X-Youtube-Client-Name': '1',
+        'X-Youtube-Client-Version': YT_WEB_VERSION
+      }
+    }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`innertube HTTP ${res.statusCode}`));
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('innertube timeout')));
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+function itText(node) {
+  if (!node) return '';
+  if (typeof node === 'string') return node;
+  if (node.simpleText) return node.simpleText;
+  if (Array.isArray(node.runs)) return node.runs.map(r => r.text).join('');
+  if (node.content) return node.content;
+  return '';
+}
+function arDigits(t) { return String(t || '').replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/٫/g, '.').replace(/[٬,]/g, ''); }
+function parseDurationText(t) {
+  const parts = arDigits(t).match(/\d+/g);
+  if (!parts) return 0;
+  return parts.map(Number).reduce((acc, n) => acc * 60 + n, 0);
+}
+function parseViewText(t) {
+  const m = arDigits(t).match(/([\d.]+)\s*(K|M|B|ألف|الف|مليون|مليار)?/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1]); if (!isFinite(n)) return 0;
+  const u = (m[2] || '').toLowerCase();
+  const mult = (u === 'k' || u === 'ألف' || u === 'الف') ? 1e3 : (u === 'm' || u === 'مليون') ? 1e6 : (u === 'b' || u === 'مليار') ? 1e9 : 1;
+  return Math.round(n * mult);
+}
+
+function videoRendererToItem(v) {
+  const id = v.videoId; if (!id) return null;
+  const owner = (v.ownerText || v.longBylineText || v.shortBylineText || {});
+  const run = owner.runs && owner.runs[0];
+  const channelId = run?.navigationEndpoint?.browseEndpoint?.browseId || '';
+  const live = (v.badges || []).some(b => /LIVE_NOW/.test(b?.metadataBadgeRenderer?.style || ''))
+    || (v.thumbnailOverlays || []).some(o => o?.thumbnailOverlayTimeStatusRenderer?.style === 'LIVE');
+  const upcoming = !!v.upcomingEventData;
+  return {
+    id,
+    title: itText(v.title) || 'بدون عنوان',
+    uploader: itText(owner),
+    channel: itText(owner),
+    channel_id: channelId,
+    duration: live ? 0 : parseDurationText(itText(v.lengthText)),
+    thumbnails: (v.thumbnail?.thumbnails || []).map(t => ({ url: t.url })),
+    view_count: parseViewText(itText(v.viewCountText)),
+    is_live: live,
+    live_status: live ? 'is_live' : (upcoming ? 'is_upcoming' : 'not_live')
+  };
+}
+
+function lockupToItem(l) {
+  if (!l || l.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO' || !l.contentId) return null;
+  const md = l.metadata?.lockupMetadataViewModel;
+  const rows = md?.metadata?.contentMetadataViewModel?.metadataRows || [];
+  const channel = itText(rows[0]?.metadataParts?.[0]?.text);
+  const views = itText(rows[1]?.metadataParts?.[0]?.text);
+  const thumbs = l.contentImage?.thumbnailViewModel?.image?.sources || [];
+  return {
+    id: l.contentId,
+    title: itText(md?.title) || 'بدون عنوان',
+    uploader: channel, channel,
+    channel_id: '',
+    duration: 0,
+    thumbnails: thumbs.map(t => ({ url: t.url })),
+    view_count: parseViewText(views),
+    is_live: false,
+    live_status: 'not_live'
+  };
+}
+
+function extractInnertubeVideos(root) {
+  const videos = [];
+  let token = null;
+  const walk = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
+    if (n.videoRenderer) { const it = videoRendererToItem(n.videoRenderer); if (it) videos.push(it); }
+    else if (n.lockupViewModel) { const it = lockupToItem(n.lockupViewModel); if (it) videos.push(it); }
+    if (!token && n.continuationCommand?.token) token = n.continuationCommand.token;
+    for (const k of Object.keys(n)) {
+      if (k === 'videoRenderer' || k === 'lockupViewModel') continue;
+      walk(n[k]);
+    }
+  };
+  walk(root);
+  return { videos, token };
+}
+
+async function innertubeSearch(query, limit = 20, sp = '') {
+  const out = []; const seen = new Set();
+  let data = await innertubePost('search', { context: YT_CONTEXT, query, ...(sp ? { params: sp } : {}) });
+  for (let page = 0; page < 6; page++) {
+    const { videos, token } = extractInnertubeVideos(data);
+    for (const v of videos) if (!seen.has(v.id)) { seen.add(v.id); out.push(v); }
+    if (out.length >= limit || !token) break;
+    data = await innertubePost('search', { context: YT_CONTEXT, continuation: token });
+  }
+  return out.slice(0, limit);
+}
+
+/** بيتعرّف على أوامر البحث اللي بتتبعت لـ runYtDlp ويحوّلها لـ InnerTube */
+function parseFastSearchArgs(args) {
+  if (!args.includes('--dump-json') || !args.includes('--flat-playlist')) return null;
+  for (const a of args) {
+    if (typeof a !== 'string') continue;
+    let m = a.match(/^ytsearch(date)?(\d+):([\s\S]+)$/);
+    if (m) return { limit: parseInt(m[2], 10), query: m[3], sp: m[1] ? 'CAISAhAB' : '' };
+    if (a.startsWith('https://www.youtube.com/results?')) {
+      try {
+        const u = new URL(a);
+        const endIdx = args.indexOf('--playlist-end');
+        return { limit: endIdx >= 0 ? parseInt(args[endIdx + 1], 10) || 20 : 20, query: u.searchParams.get('search_query') || '', sp: u.searchParams.get('sp') || '' };
+      } catch { return null; }
+    }
+  }
+  return null;
+}
+
+let botWallUntil = 0; // لما يوتيوب يطلب "confirm you're not a bot" نبدأ بالكوكيز على طول بدل ما نضيّع محاولات فاشلة
+
 async function runYtDlp(args, opts = {}) {
   // yt-dlp الحديث مبقاش بيعرف البريفكس ytsearchdateN: → بنحوّله تلقائيًا
   // لرابط بحث يوتيوب مرتّب بتاريخ الرفع (sp=CAI%3D)، ولو فشل نرجع لـ ytsearchN.
+  const fast = !opts.useCookies ? parseFastSearchArgs(args) : null;
+  if (fast && fast.query) {
+    try {
+      const items = await innertubeSearch(fast.query, fast.limit, fast.sp);
+      if (items.length) return items.map(i => JSON.stringify(i)).join('\n');
+    } catch (e) {
+      log.warn(`innertube search failed, using yt-dlp: ${String(e.message || e).split('\n')[0]}`);
+    }
+  }
   const dateIdx = args.findIndex(a => typeof a === 'string' && /^ytsearchdate\d+:/.test(a));
   if (dateIdx !== -1) {
     const m = args[dateIdx].match(/^ytsearchdate(\d+):([\s\S]*)$/);
@@ -381,7 +560,7 @@ async function runYtDlp(args, opts = {}) {
   const limiter = lane === 'stream' ? streamLimiter : ytdlpLimiter;
   await limiter.acquire();
   try {
-    const base = ['--no-warnings', '--geo-bypass'];
+    const base = ['--no-warnings', '--geo-bypass', '--socket-timeout', '20', '--extractor-retries', '2'];
     if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
 
     const attempts = [];
@@ -389,12 +568,19 @@ async function runYtDlp(args, opts = {}) {
       attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
     };
 
-    // Fast public attempt first. Cookies are used only when requested or as fallback.
-    pushAttempt([], useCookies);
-    if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
-    if (allowCookieFallback && cookiesReady && !useCookies) {
+    if (allowCookieFallback && cookiesReady && !useCookies && botWallUntil > Date.now()) {
+      // يوتيوب حاظر الـ IP العام → ابدأ بالكوكيز على طول (يوفّر محاولتين فاشلتين لكل طلب)
       pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
       pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
+      pushAttempt([]);
+    } else {
+      // Fast public attempt first. Cookies are used only when requested or as fallback.
+      pushAttempt([], useCookies);
+      if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
+      if (allowCookieFallback && cookiesReady && !useCookies) {
+        pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
+        pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
+      }
     }
 
     let lastError;
@@ -404,6 +590,7 @@ async function runYtDlp(args, opts = {}) {
         return stdout;
       } catch (error) {
         lastError = error;
+        if (/sign in to confirm|not a bot/i.test(String(error?.message || error))) botWallUntil = Date.now() + 15 * 60 * 1000;
         if (!isRetryableYoutubeError(error) && i === 0) throw error;
         if (i < attempts.length - 1) log.warn(`yt-dlp fallback ${i + 1}: ${String(error.message || error).split('\n')[0]}`);
       }
@@ -1020,7 +1207,16 @@ function dedupeById(items) {
   return (items || []).filter(v => v?.id && !seen.has(v.id) && seen.add(v.id));
 }
 
+const accountListCache = new Map();
 async function fetchAccountList(kind, limit = 40) {
+  const hit = accountListCache.get(kind);
+  if (hit && hit.items.length && hit.n >= limit && Date.now() - hit.at < 60 * 1000) return hit.items.slice(0, limit);
+  const n = Math.max(limit, 60);
+  const items = await dedupe(`acct:${kind}:${n}`, () => fetchAccountListRaw(kind, n));
+  accountListCache.set(kind, { items, n, at: Date.now() });
+  return items.slice(0, limit);
+}
+async function fetchAccountListRaw(kind, limit = 40) {
   const src = ACCOUNT_SOURCES[kind];
   if (!src) throw new Error(`unknown account source: ${kind}`);
   const stdout = await runYtDlp([
@@ -1377,34 +1573,9 @@ app.get('/playlist', async (req, res) => {
 /**
  * GET /comments?v=VIDEO_ID&limit=50
  */
-app.get('/comments', async (req, res) => {
-  const videoId = req.query.v;
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-
-  if (!videoId || !isValidVideoId(videoId)) {
-    return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  const cacheKey = `comments_${videoId}_${limit}`;
-  const cached = commentsCache.get(cacheKey);
-  if (cached) {
-    log.info(`📦 Comments from cache: ${videoId}`);
-    return res.json(cached);
-  }
-
-  try {
-    const comments = await getVideoComments(videoId, limit);
-    const response = { id: videoId, count: comments.length, results: comments };
-    commentsCache.set(cacheKey, response, CACHE_TTL.comments);
-    log.success(`✅ Comments done: ${videoId} (${comments.length} تعليق)`);
-    res.json(response);
-  } catch (error) {
-    log.error(`Error fetching comments: ${error.message}`);
-    res.status(500).json({
-      error: 'تعذّر جلب التعليقات (ممكن تكون التعليقات مقفولة على الفيديو ده)',
-      details: NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
+app.get('/comments', (req, res) => {
+  // التعليقات متقفلة عمداً لتسريع السيرفر (كانت بتشغّل yt-dlp تقيل لكل فيديو)
+  res.json({ id: String(req.query.v || ''), count: 0, results: [], disabled: true });
 });
 
 /**
@@ -1431,6 +1602,24 @@ async function getFastStreamUrl(videoId) {
   return dedupe(key, async () => {
     const again = fastStreamCache.get(key);
     if (again) return again;
+
+    // استخدم نفس استخراج yt-dlp المشترك (getVideoInfo) بدل تشغيل yt-dlp تاني — بيوفّر عملية كاملة
+    try {
+      const info = await getVideoInfo(videoId);
+      const prog = (info.formats || [])
+        .filter(f => f.url && f.acodec && f.acodec !== 'none' && f.vcodec && f.vcodec !== 'none' && /^https?$/.test(f.protocol || 'https'))
+        .sort((a, b) => {
+          const ah = (a.height || 0) <= 720 ? (a.height || 0) : -1;
+          const bh = (b.height || 0) <= 720 ? (b.height || 0) : -1;
+          return bh - ah || (b.ext === 'mp4') - (a.ext === 'mp4');
+        })[0];
+      if (prog?.url) {
+        fastStreamCache.set(key, prog.url, CACHE_TTL.fastStream);
+        return prog.url;
+      }
+    } catch (e) {
+      log.warn(`fast stream via info failed, using --get-url: ${String(e.message || e).split('\n')[0]}`);
+    }
 
     // Progressive first: browser receives both audio + video in one URL.
     const candidates = [
@@ -2151,7 +2340,8 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: commandExists('yt-dlp'),
-    ytdlpVersion: (() => { try { return require('child_process').execFileSync('yt-dlp', ['--version'], { encoding: 'utf8' }).trim(); } catch { return null; } })(),
+    ytdlpVersion,
+    eventLoopLagMs: loopLagMs,
     nodeVersion: process.version,
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: commandExists('ffmpeg'),
@@ -2347,7 +2537,7 @@ app.get('/', (req, res) => {
       channelPlaylists: '/channel/playlists?id=CHANNEL_ID&limit=30&page=1',
       channelStreams: '/channel/streams?id=CHANNEL_ID&limit=30&page=1',
       playlist: '/playlist?id=PLAYLIST_ID&limit=30&page=1',
-      comments: '/comments?v=VIDEO_ID&limit=50',
+      comments: '/comments (معطّل — بيرجّع فاضي فوراً)',
       health: '/health',
       performance: '/api/performance',
       maintenance: '/api/maintenance',
@@ -2953,7 +3143,6 @@ app.get('/api/test-all', async (req, res) => {
     ['formats', `/formats?v=${encodeURIComponent(videoId)}`],
     ['video-qualities', `/video/qualities?v=${encodeURIComponent(videoId)}`],
     ['related', `/related?v=${encodeURIComponent(videoId)}&limit=3&page=1`],
-    ['comments', `/comments?v=${encodeURIComponent(videoId)}&limit=3`],
     ['channel', `/channel?id=${encodeURIComponent(channelId)}&limit=3&page=1`],
     ['video-probe', `/video?v=${encodeURIComponent(videoId)}&format=best&probe=1`],
     ['video-1080-probe', `/video?v=${encodeURIComponent(videoId)}&quality=1080&probe=1`],
@@ -3017,7 +3206,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 
 setTimeout(warmHotCaches, 8000);
-setInterval(warmHotCaches, 120000);
+setInterval(warmHotCaches, 240000);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
