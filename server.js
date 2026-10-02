@@ -16,11 +16,11 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '10.2.1-TITAN-FAST';
+const SERVER_VERSION = '11.0.0-ULTRA-SPEED';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64, keepAliveMsecs: 30000, timeout: 15000 });
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +30,7 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 app.disable('x-powered-by');
 app.set('etag', false);
 app.set('trust proxy', true);
+app.set('query parser', 'simple');
 
 // ==========================================================================
 // 🌐 CORS — السماح للـ Frontend من أي دومين بالاتصال بالسيرفر
@@ -74,7 +75,7 @@ const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 // لا نضغط الفيديو نفسه؛ الضغط مخصص لردود JSON الصغيرة فقط.
 // ==========================================================================
 const REQUEST_WINDOW_MS = 60 * 1000;
-const REQUEST_LIMIT = Math.max(60, parseInt(process.env.REQUEST_LIMIT, 10) || 240);
+const REQUEST_LIMIT = Math.max(300, parseInt(process.env.REQUEST_LIMIT, 10) || 1200);
 const requestBuckets = new Map();
 
 app.use((req, res, next) => {
@@ -97,7 +98,7 @@ app.use((req, res, next) => {
   }
 
   // Cleanup old buckets occasionally so a busy server does not grow forever.
-  if (requestBuckets.size > 5000 && Math.random() < 0.02) {
+  if (requestBuckets.size > 5000 && now % 30000 < 20) {
     for (const [k, v] of requestBuckets) {
       if (v.resetAt <= now) requestBuckets.delete(k);
     }
@@ -105,35 +106,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-  const originalJson = res.json.bind(res);
-
-  res.json = (body) => {
-    if (res.headersSent) return res;
-    const accept = String(req.headers.acceptEncoding || req.headers['accept-encoding'] || '');
-    const raw = Buffer.from(JSON.stringify(body));
-
-    // Only gzip reasonably-sized JSON responses; never touch video streams.
-    if (raw.length >= 1024 && /\bgzip\b/i.test(accept) && !res.getHeader('Content-Encoding')) {
-      zlib.gzip(raw, { level: 1 }, (err, gz) => {
-        if (err || res.headersSent) return originalJson(body);
-        res.setHeader('Content-Encoding', 'gzip');
-        res.setHeader('Vary', 'Accept-Encoding');
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Content-Length', gz.length);
-        res.end(gz);
-      });
-      return res;
-    }
-
-    return originalJson(body);
-  };
-
-  next();
-});
-
-app.use(express.json({ limit: '2mb' }));
-app.use(express.text({ limit: '10mb' }));
+app.use(express.json({ limit: '512kb' }));
 
 
 // ==========================================================================
@@ -174,26 +147,27 @@ class MemoryTTLCache {
   }
 }
 
-const infoCache = new MemoryTTLCache(200);
+const infoCache = new MemoryTTLCache(1200);
 const searchCache = new MemoryTTLCache(500);
 const feedCache = new MemoryTTLCache(300);
 const streamCache = new MemoryTTLCache(1000);
 const fastStreamCache = new MemoryTTLCache(600);
 const channelCache = new MemoryTTLCache(250);
-const commentsCache = new MemoryTTLCache(250);
 const suggestionCache = new MemoryTTLCache(150);
 
 const CACHE_TTL = {
-  info: 30 * 60 * 1000, search: 2 * 60 * 1000, feed: 5 * 60 * 1000,
-  related: 10 * 60 * 1000, channel: 10 * 60 * 1000, stream: 4 * 60 * 1000, fastStream: 90 * 1000,
-  comments: 5 * 60 * 1000, suggestions: 45 * 1000
+  info: 60 * 60 * 1000, search: 15 * 60 * 1000, feed: 15 * 60 * 1000,
+  related: 30 * 60 * 1000, channel: 30 * 60 * 1000, stream: 10 * 60 * 1000, fastStream: 5 * 60 * 1000,
+  suggestions: 5 * 60 * 1000
 };
 
 // Never make the browser/CDN serve an old API response; only our RAM cache is used.
 app.use((req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
+  if (req.path.startsWith('/video') || req.path.startsWith('/download') || req.path.startsWith('/api/me') || req.path === '/api/account-feed') {
+    res.setHeader('Cache-Control', 'no-store');
+  } else if (req.method === 'GET') {
+    res.setHeader('Cache-Control', 'public, max-age=3, stale-while-revalidate=30');
+  }
   next();
 });
 
@@ -224,8 +198,8 @@ class Semaphore {
     if (next) { this.current++; next(); }
   }
 }
-const META_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_META_CONCURRENCY, 10) || 4);
-const STREAM_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_STREAM_CONCURRENCY, 10) || 2);
+const META_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_META_CONCURRENCY, 10) || 10);
+const STREAM_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_STREAM_CONCURRENCY, 10) || 4);
 const ytdlpLimiter = new Semaphore(META_CONCURRENCY);
 const streamLimiter = new Semaphore(STREAM_CONCURRENCY);
 
@@ -305,7 +279,7 @@ function saveCookiesLocally(content) {
   fs.writeFileSync(COOKIES_PATH, content);
   lastCookiesContent = content;
   cookiesReady = true;
-  feedCache.clear(); accountListCache.clear(); botWallUntil = 0;
+  feedCache.clear();
 }
 async function refreshCookies() {
   try {
@@ -314,7 +288,7 @@ async function refreshCookies() {
       fs.writeFileSync(COOKIES_PATH, content);
       lastCookiesContent = content;
       cookiesReady = true;
-      feedCache.clear(); accountListCache.clear(); botWallUntil = 0;
+      feedCache.clear();
       log.success(`🍪 Cookies refreshed (${content.length} bytes)`);
     } else if (!content) {
       log.warn('⚠️  No cookies available in Firebase yet');
@@ -324,7 +298,7 @@ async function refreshCookies() {
   }
 }
 refreshCookies();
-setInterval(refreshCookies, 5 * 60 * 1000);
+
 
 // Check if yt-dlp is installed
 function checkYtDlp() { return commandExists('yt-dlp'); }
@@ -343,16 +317,6 @@ function sanitizeFilename(name) {
  * عشان محدّش يقدر يحقن أوامر شل حتى لو query البحث فيه رموز غريبة، وكمان
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
-
-// نسخة yt-dlp بتتقرا مرة واحدة في الخلفية (كانت execFileSync في كل /health وبتجمّد السيرفر كله ثواني)
-let ytdlpVersion = null;
-execFile('yt-dlp', ['--version'], { encoding: 'utf8' }, (err, out) => { if (!err) ytdlpVersion = String(out).trim(); });
-
-// قياس تأخّر الـ event loop — لو الرقم كبير يبقى حاجة بتجمّد السيرفر
-let loopLagMs = 0;
-let _lagLast = Date.now();
-setInterval(() => { const now = Date.now(); loopLagMs = Math.max(0, now - _lagLast - 500); _lagLast = now; }, 500).unref();
-
 const commandCache = new Map();
 function commandExists(command) {
   if (commandCache.has(command)) return commandCache.get(command);
@@ -365,175 +329,9 @@ function isRetryableYoutubeError(error) {
   return /page needs to be reloaded|sign in to confirm|confirm you’re not a bot|confirm you're not a bot|http error 403|requested format is not available|video unavailable|not available in your country/.test(text);
 }
 
-
-// ==========================================================================
-// ⚡ InnerTube مباشر — بحث يوتيوب بدون تشغيل yt-dlp (أسرع بكتير: ~0.3 ثانية بدل 3-5)
-// لو فشل لأي سبب بنرجع تلقائيًا لـ yt-dlp زي الأول.
-// ==========================================================================
-const YT_WEB_VERSION = process.env.YT_WEB_CLIENT_VERSION || '2.20260901.00.00';
-const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
-const YT_CONTEXT = { client: { clientName: 'WEB', clientVersion: YT_WEB_VERSION, hl: 'ar', gl: 'EG' } };
-
-function innertubePost(endpoint, body, timeout = 8000) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const req = https.request({
-      hostname: 'www.youtube.com',
-      path: `/youtubei/v1/${endpoint}?prettyPrint=false`,
-      method: 'POST',
-      agent: keepAliveAgent,
-      timeout,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'User-Agent': YT_UA,
-        'Accept-Language': 'ar-EG,ar;q=0.9,en;q=0.8',
-        'Origin': 'https://www.youtube.com',
-        'X-Youtube-Client-Name': '1',
-        'X-Youtube-Client-Version': YT_WEB_VERSION
-      }
-    }, (res) => {
-      let data = '';
-      res.setEncoding('utf8');
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        if (res.statusCode !== 200) return reject(new Error(`innertube HTTP ${res.statusCode}`));
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
-    });
-    req.on('timeout', () => req.destroy(new Error('innertube timeout')));
-    req.on('error', reject);
-    req.end(payload);
-  });
-}
-
-function itText(node) {
-  if (!node) return '';
-  if (typeof node === 'string') return node;
-  if (node.simpleText) return node.simpleText;
-  if (Array.isArray(node.runs)) return node.runs.map(r => r.text).join('');
-  if (node.content) return node.content;
-  return '';
-}
-function arDigits(t) { return String(t || '').replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/٫/g, '.').replace(/[٬,]/g, ''); }
-function parseDurationText(t) {
-  const parts = arDigits(t).match(/\d+/g);
-  if (!parts) return 0;
-  return parts.map(Number).reduce((acc, n) => acc * 60 + n, 0);
-}
-function parseViewText(t) {
-  const m = arDigits(t).match(/([\d.]+)\s*(K|M|B|ألف|الف|مليون|مليار)?/i);
-  if (!m) return 0;
-  const n = parseFloat(m[1]); if (!isFinite(n)) return 0;
-  const u = (m[2] || '').toLowerCase();
-  const mult = (u === 'k' || u === 'ألف' || u === 'الف') ? 1e3 : (u === 'm' || u === 'مليون') ? 1e6 : (u === 'b' || u === 'مليار') ? 1e9 : 1;
-  return Math.round(n * mult);
-}
-
-function videoRendererToItem(v) {
-  const id = v.videoId; if (!id) return null;
-  const owner = (v.ownerText || v.longBylineText || v.shortBylineText || {});
-  const run = owner.runs && owner.runs[0];
-  const channelId = run?.navigationEndpoint?.browseEndpoint?.browseId || '';
-  const live = (v.badges || []).some(b => /LIVE_NOW/.test(b?.metadataBadgeRenderer?.style || ''))
-    || (v.thumbnailOverlays || []).some(o => o?.thumbnailOverlayTimeStatusRenderer?.style === 'LIVE');
-  const upcoming = !!v.upcomingEventData;
-  return {
-    id,
-    title: itText(v.title) || 'بدون عنوان',
-    uploader: itText(owner),
-    channel: itText(owner),
-    channel_id: channelId,
-    duration: live ? 0 : parseDurationText(itText(v.lengthText)),
-    thumbnails: (v.thumbnail?.thumbnails || []).map(t => ({ url: t.url })),
-    view_count: parseViewText(itText(v.viewCountText)),
-    is_live: live,
-    live_status: live ? 'is_live' : (upcoming ? 'is_upcoming' : 'not_live')
-  };
-}
-
-function lockupToItem(l) {
-  if (!l || l.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO' || !l.contentId) return null;
-  const md = l.metadata?.lockupMetadataViewModel;
-  const rows = md?.metadata?.contentMetadataViewModel?.metadataRows || [];
-  const channel = itText(rows[0]?.metadataParts?.[0]?.text);
-  const views = itText(rows[1]?.metadataParts?.[0]?.text);
-  const thumbs = l.contentImage?.thumbnailViewModel?.image?.sources || [];
-  return {
-    id: l.contentId,
-    title: itText(md?.title) || 'بدون عنوان',
-    uploader: channel, channel,
-    channel_id: '',
-    duration: 0,
-    thumbnails: thumbs.map(t => ({ url: t.url })),
-    view_count: parseViewText(views),
-    is_live: false,
-    live_status: 'not_live'
-  };
-}
-
-function extractInnertubeVideos(root) {
-  const videos = [];
-  let token = null;
-  const walk = (n) => {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { for (const x of n) walk(x); return; }
-    if (n.videoRenderer) { const it = videoRendererToItem(n.videoRenderer); if (it) videos.push(it); }
-    else if (n.lockupViewModel) { const it = lockupToItem(n.lockupViewModel); if (it) videos.push(it); }
-    if (!token && n.continuationCommand?.token) token = n.continuationCommand.token;
-    for (const k of Object.keys(n)) {
-      if (k === 'videoRenderer' || k === 'lockupViewModel') continue;
-      walk(n[k]);
-    }
-  };
-  walk(root);
-  return { videos, token };
-}
-
-async function innertubeSearch(query, limit = 20, sp = '') {
-  const out = []; const seen = new Set();
-  let data = await innertubePost('search', { context: YT_CONTEXT, query, ...(sp ? { params: sp } : {}) });
-  for (let page = 0; page < 6; page++) {
-    const { videos, token } = extractInnertubeVideos(data);
-    for (const v of videos) if (!seen.has(v.id)) { seen.add(v.id); out.push(v); }
-    if (out.length >= limit || !token) break;
-    data = await innertubePost('search', { context: YT_CONTEXT, continuation: token });
-  }
-  return out.slice(0, limit);
-}
-
-/** بيتعرّف على أوامر البحث اللي بتتبعت لـ runYtDlp ويحوّلها لـ InnerTube */
-function parseFastSearchArgs(args) {
-  if (!args.includes('--dump-json') || !args.includes('--flat-playlist')) return null;
-  for (const a of args) {
-    if (typeof a !== 'string') continue;
-    let m = a.match(/^ytsearch(date)?(\d+):([\s\S]+)$/);
-    if (m) return { limit: parseInt(m[2], 10), query: m[3], sp: m[1] ? 'CAISAhAB' : '' };
-    if (a.startsWith('https://www.youtube.com/results?')) {
-      try {
-        const u = new URL(a);
-        const endIdx = args.indexOf('--playlist-end');
-        return { limit: endIdx >= 0 ? parseInt(args[endIdx + 1], 10) || 20 : 20, query: u.searchParams.get('search_query') || '', sp: u.searchParams.get('sp') || '' };
-      } catch { return null; }
-    }
-  }
-  return null;
-}
-
-let botWallUntil = 0; // لما يوتيوب يطلب "confirm you're not a bot" نبدأ بالكوكيز على طول بدل ما نضيّع محاولات فاشلة
-
 async function runYtDlp(args, opts = {}) {
   // yt-dlp الحديث مبقاش بيعرف البريفكس ytsearchdateN: → بنحوّله تلقائيًا
   // لرابط بحث يوتيوب مرتّب بتاريخ الرفع (sp=CAI%3D)، ولو فشل نرجع لـ ytsearchN.
-  const fast = !opts.useCookies ? parseFastSearchArgs(args) : null;
-  if (fast && fast.query) {
-    try {
-      const items = await innertubeSearch(fast.query, fast.limit, fast.sp);
-      if (items.length) return items.map(i => JSON.stringify(i)).join('\n');
-    } catch (e) {
-      log.warn(`innertube search failed, using yt-dlp: ${String(e.message || e).split('\n')[0]}`);
-    }
-  }
   const dateIdx = args.findIndex(a => typeof a === 'string' && /^ytsearchdate\d+:/.test(a));
   if (dateIdx !== -1) {
     const m = args[dateIdx].match(/^ytsearchdate(\d+):([\s\S]*)$/);
@@ -560,7 +358,7 @@ async function runYtDlp(args, opts = {}) {
   const limiter = lane === 'stream' ? streamLimiter : ytdlpLimiter;
   await limiter.acquire();
   try {
-    const base = ['--no-warnings', '--geo-bypass', '--socket-timeout', '20', '--extractor-retries', '2'];
+    const base = ['--no-warnings', '--geo-bypass'];
     if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
 
     const attempts = [];
@@ -568,19 +366,12 @@ async function runYtDlp(args, opts = {}) {
       attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
     };
 
-    if (allowCookieFallback && cookiesReady && !useCookies && botWallUntil > Date.now()) {
-      // يوتيوب حاظر الـ IP العام → ابدأ بالكوكيز على طول (يوفّر محاولتين فاشلتين لكل طلب)
+    // Fast public attempt first. Cookies are used only when requested or as fallback.
+    pushAttempt([], useCookies);
+    if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
+    if (allowCookieFallback && cookiesReady && !useCookies) {
       pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
       pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
-      pushAttempt([]);
-    } else {
-      // Fast public attempt first. Cookies are used only when requested or as fallback.
-      pushAttempt([], useCookies);
-      if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
-      if (allowCookieFallback && cookiesReady && !useCookies) {
-        pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
-        pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
-      }
     }
 
     let lastError;
@@ -590,7 +381,6 @@ async function runYtDlp(args, opts = {}) {
         return stdout;
       } catch (error) {
         lastError = error;
-        if (/sign in to confirm|not a bot/i.test(String(error?.message || error))) botWallUntil = Date.now() + 15 * 60 * 1000;
         if (!isRetryableYoutubeError(error) && i === 0) throw error;
         if (i < attempts.length - 1) log.warn(`yt-dlp fallback ${i + 1}: ${String(error.message || error).split('\n')[0]}`);
       }
@@ -842,7 +632,7 @@ async function getFollowedCreatorsPool(perCreator = 3) {
   const key = `creators:${perCreator}`;
   const cached = feedCache.get(key); if (cached) return cached;
   const settled = await Promise.allSettled(
-    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearchdate${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
+    FOLLOWED_CREATORS.slice(0, 4).map(name => runYtDlp([`ytsearchdate${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
   );
   const pool = [];
   settled.forEach((r, i) => {
@@ -855,20 +645,12 @@ async function getFollowedCreatorsPool(perCreator = 3) {
 
 const DISCOVERY_QUERIES = [
   'محتوى مصري جديد اليوم',
-  'فيديوهات تعليمية مصر',
-  'علوم وتكنولوجيا بالعربي',
-  'رياضة مصر اليوم',
-  'أخبار مصر اليوم',
   'مراجعات تقنية عربية',
-  'بودكاست عربي جديد',
-  'ترند عربي اليوم'
+  'فيديوهات تعليمية عربية'
 ];
 
 const RECOMMENDATION_FALLBACK_QUERIES = [
   'فيديوهات جديدة مصر',
-  'أفضل فيديوهات عربية اليوم',
-  'محتوى عربي مفيد',
-  'فيديوهات تعليمية عربية',
   'محتوى عربي جديد'
 ];
 
@@ -1063,10 +845,7 @@ const HOME_SECTIONS = [
   { key: 'trending', title: 'الرائج الآن', query: 'ترند مصر اليوم' },
   { key: 'education', title: 'تعليم', query: 'شرح دروس تعليمية بالعربي' },
   { key: 'tech', title: 'تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية عربية' },
-  { key: 'sports', title: 'رياضة', query: 'رياضة مصر أهداف وملخصات' },
-  { key: 'news', title: 'أخبار', query: 'أخبار مصر اليوم' },
-  { key: 'podcasts', title: 'بودكاست', query: 'بودكاست عربي جديد' },
-  { key: 'gaming', title: 'ألعاب', query: 'ألعاب فيديو عربية' }
+  { key: 'sports', title: 'رياضة', query: 'رياضة مصر أهداف وملخصات' }
 ];
 
 async function getHomeFeed(region = 'EG', perSection = 12) {
@@ -1082,7 +861,7 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
         try {
           let stdout;
           stdout = await runYtDlp([
-            `ytsearchdate${Math.max(perSection * 3, 36)}:${section.query}`,
+            `ytsearchdate${Math.max(perSection * 2, 18)}:${section.query}`,
             '--dump-json', '--flat-playlist'
           ]);
           return {
@@ -1103,9 +882,7 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
             .then(items => ({ key: 'for_you', title: 'مقترح لك', items: items.slice(0, perSection * 3) }))
             .catch(e => { log.warn(`home for_you failed: ${String(e.message || e).split('\n')[0]}`); return null; })
         : null,
-      searchLive('بث مباشر', perSection)
-        .then(items => ({ key: 'live', title: 'بث مباشر الآن', items: items.slice(0, perSection) }))
-        .catch(e => { log.warn(`home live failed: ${String(e.message || e).split('\n')[0]}`); return null; })
+      Promise.resolve(null)
     ]);
     const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
     const seen = new Set();
@@ -1207,16 +984,7 @@ function dedupeById(items) {
   return (items || []).filter(v => v?.id && !seen.has(v.id) && seen.add(v.id));
 }
 
-const accountListCache = new Map();
 async function fetchAccountList(kind, limit = 40) {
-  const hit = accountListCache.get(kind);
-  if (hit && hit.items.length && hit.n >= limit && Date.now() - hit.at < 60 * 1000) return hit.items.slice(0, limit);
-  const n = Math.max(limit, 60);
-  const items = await dedupe(`acct:${kind}:${n}`, () => fetchAccountListRaw(kind, n));
-  accountListCache.set(kind, { items, n, at: Date.now() });
-  return items.slice(0, limit);
-}
-async function fetchAccountListRaw(kind, limit = 40) {
   const src = ACCOUNT_SOURCES[kind];
   if (!src) throw new Error(`unknown account source: ${kind}`);
   const stdout = await runYtDlp([
@@ -1340,11 +1108,7 @@ app.get('/trending', async (req, res) => {
 
     const seedIds = parseSeedIds(req.query.seed || req.query.seeds || req.query.history);
     const cacheKey = `recommended:${region}:${poolSize}:${seedIds.join('_') || 'none'}`;
-    let cached = feedCache.get(cacheKey);
-    if (!cached) {
-      cached = await getRecommendedVideos(region, poolSize, seedIds);
-      feedCache.set(cacheKey, cached, CACHE_TTL.feed);
-    }
+    const cached = await getRecommendedVideos(region, poolSize, seedIds);
 
     const start = (pageNum - 1) * pageSize;
     const results = cached.items.slice(start, start + pageSize);
@@ -1372,11 +1136,7 @@ app.get('/home', async (req, res) => {
 
   const cacheKey = `home_${region}_${perSection}`;
   try {
-    let data = feedCache.get(cacheKey);
-    if (!data) {
-      data = await getHomeFeed(region, perSection);
-      feedCache.set(cacheKey, data, CACHE_TTL.feed);
-    }
+    const data = await getHomeFeed(region, perSection);
     log.success(`✅ Home feed done: ${region} (${data.sections.length} قسم, ${data.mixed.length} فيديو)`);
     res.json(data);
   } catch (error) {
@@ -1571,14 +1331,6 @@ app.get('/playlist', async (req, res) => {
 });
 
 /**
- * GET /comments?v=VIDEO_ID&limit=50
- */
-app.get('/comments', (req, res) => {
-  // التعليقات متقفلة عمداً لتسريع السيرفر (كانت بتشغّل yt-dlp تقيل لكل فيديو)
-  res.json({ id: String(req.query.v || ''), count: 0, results: [], disabled: true });
-});
-
-/**
  * GET /video?v=VIDEO_ID
  */
 /**
@@ -1602,24 +1354,6 @@ async function getFastStreamUrl(videoId) {
   return dedupe(key, async () => {
     const again = fastStreamCache.get(key);
     if (again) return again;
-
-    // استخدم نفس استخراج yt-dlp المشترك (getVideoInfo) بدل تشغيل yt-dlp تاني — بيوفّر عملية كاملة
-    try {
-      const info = await getVideoInfo(videoId);
-      const prog = (info.formats || [])
-        .filter(f => f.url && f.acodec && f.acodec !== 'none' && f.vcodec && f.vcodec !== 'none' && /^https?$/.test(f.protocol || 'https'))
-        .sort((a, b) => {
-          const ah = (a.height || 0) <= 720 ? (a.height || 0) : -1;
-          const bh = (b.height || 0) <= 720 ? (b.height || 0) : -1;
-          return bh - ah || (b.ext === 'mp4') - (a.ext === 'mp4');
-        })[0];
-      if (prog?.url) {
-        fastStreamCache.set(key, prog.url, CACHE_TTL.fastStream);
-        return prog.url;
-      }
-    } catch (e) {
-      log.warn(`fast stream via info failed, using --get-url: ${String(e.message || e).split('\n')[0]}`);
-    }
 
     // Progressive first: browser receives both audio + video in one URL.
     const candidates = [
@@ -1709,7 +1443,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
 
   const upstreamReq = https.get(target, {
     headers,
-    timeout: 12000,
+    timeout: 20000,
     agent: keepAliveAgent
   }, (upstreamRes) => {
     const code = Number(upstreamRes.statusCode || 0);
@@ -1749,7 +1483,9 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
     }
     copySafeUpstreamHeaders(upstreamRes, res);
 
-    // Do not force chunked encoding when the upstream gave a valid length.
+    // Send headers immediately, then stream bytes without buffering.
+    try { res.flushHeaders(); } catch {}
+    try { upstreamRes.socket?.setNoDelay(true); } catch {}
     upstreamRes.pipe(res, { end: true });
 
     upstreamRes.on('error', err => {
@@ -2340,8 +2076,7 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     ytdlpReady: commandExists('yt-dlp'),
-    ytdlpVersion,
-    eventLoopLagMs: loopLagMs,
+    ytdlpVersion: (() => { try { return require('child_process').execFileSync('yt-dlp', ['--version'], { encoding: 'utf8' }).trim(); } catch { return null; } })(),
     nodeVersion: process.version,
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: commandExists('ffmpeg'),
@@ -2537,7 +2272,6 @@ app.get('/', (req, res) => {
       channelPlaylists: '/channel/playlists?id=CHANNEL_ID&limit=30&page=1',
       channelStreams: '/channel/streams?id=CHANNEL_ID&limit=30&page=1',
       playlist: '/playlist?id=PLAYLIST_ID&limit=30&page=1',
-      comments: '/comments (معطّل — بيرجّع فاضي فوراً)',
       health: '/health',
       performance: '/api/performance',
       maintenance: '/api/maintenance',
@@ -2580,7 +2314,6 @@ app.get('/', (req, res) => {
       'Channel videos': '/channel?id=UCuAXFkgsw1L7xaCfnd5JJOw',
       'Channel playlists': '/channel/playlists?id=UCuAXFkgsw1L7xaCfnd5JJOw',
       'Channel live streams': '/channel/streams?id=UCuAXFkgsw1L7xaCfnd5JJOw',
-      'Video comments': '/comments?v=dQw4w9WgXcQ',
       'Check cookies': '/api/cookies-status'
     }
   });
@@ -2626,7 +2359,7 @@ app.get('/api/performance', (req, res) => {
     memory: process.memoryUsage(),
     cache: {
       info: infoCache.stats(), search: searchCache.stats(), feed: feedCache.stats(),
-      stream: streamCache.stats(), channel: channelCache.stats(), comments: commentsCache.stats(),
+      stream: streamCache.stats(), channel: channelCache.stats(),
       suggestions: suggestionCache.stats(), accountFeed: feedCache.stats()
     },
     queues: {
@@ -2666,7 +2399,6 @@ app.get('/api/maintenance', (req, res) => {
       stream: streamCache.stats(),
       fastStream: fastStreamCache.stats(),
       channel: channelCache.stats(),
-      comments: commentsCache.stats(),
       suggestions: suggestionCache.stats()
     }
   });
@@ -2685,7 +2417,6 @@ app.post('/api/cache/clear', (req, res) => {
   streamCache.clear();
   fastStreamCache.clear();
   channelCache.clear();
-  commentsCache.clear();
   suggestionCache.clear();
 
   return res.json({
@@ -2961,7 +2692,6 @@ app.get('/api/cache-summary', (req, res) => {
       stream: streamCache.stats(),
       fastStream: fastStreamCache.stats(),
       channel: channelCache.stats(),
-      comments: commentsCache.stats(),
       suggestions: suggestionCache.stats()
     },
     inflight: {
@@ -3099,28 +2829,6 @@ app.use((err, req, res, next) => {
 });
 
 // ==========================================================================
-// 🔥 Background warm-up: makes the first user hit a warm RAM cache.
-// Failures are intentionally swallowed; the site still works normally.
-// ==========================================================================
-let warmupRunning = false;
-async function warmHotCaches() {
-  if (warmupRunning) return;
-  warmupRunning = true;
-  try {
-    // Warm only lightweight feeds; never pre-resolve arbitrary video streams.
-    await Promise.allSettled([
-      getHomeFeed('EG', 6),
-      getRecommendedVideos('EG', 24, [])
-    ]);
-    log.success('🔥 Hot caches warmed');
-  } catch (e) {
-    log.warn(`Warmup failed: ${e.message}`);
-  } finally {
-    warmupRunning = false;
-  }
-}
-
-// ==========================================================================
 // 🧪 TITAN ENDPOINT TEST SUITE
 // GET /api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw
 // Runs safe probes for every API route. Streaming/download are tested in
@@ -3189,6 +2897,10 @@ function summarizeTestBody(body) {
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.requestTimeout = 0;
+  server.maxConnections = 2000;
   const ytdlpStatus = commandExists('yt-dlp') ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
@@ -3205,8 +2917,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   log.info(`📍 Firebase: ${FIREBASE_URL}`);
 });
 
-setTimeout(warmHotCaches, 8000);
-setInterval(warmHotCaches, 240000);
+
 
 // Graceful shutdown
 process.on('SIGINT', () => {
