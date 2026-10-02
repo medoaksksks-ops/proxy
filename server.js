@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '10.0.0-TITAN-MAINTENANCE';
+const SERVER_VERSION = '10.0.1-TITAN-MAINTENANCE';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -343,17 +343,36 @@ function isRetryableYoutubeError(error) {
   return /page needs to be reloaded|sign in to confirm|confirm you’re not a bot|confirm you're not a bot|http error 403|requested format is not available|video unavailable|not available in your country/.test(text);
 }
 
-async function runYtDlp(args, {
-  timeout = TIMEOUT,
-  maxBuffer = 1024 * 1024 * 12,
-  useCookies = false,
-  allowCookieFallback = true,
-  lane = 'meta'
-} = {}) {
+async function runYtDlp(args, opts = {}) {
+  // yt-dlp الحديث مبقاش بيعرف البريفكس ytsearchdateN: → بنحوّله تلقائيًا
+  // لرابط بحث يوتيوب مرتّب بتاريخ الرفع (sp=CAI%3D)، ولو فشل نرجع لـ ytsearchN.
+  const dateIdx = args.findIndex(a => typeof a === 'string' && /^ytsearchdate\d+:/.test(a));
+  if (dateIdx !== -1) {
+    const m = args[dateIdx].match(/^ytsearchdate(\d+):([\s\S]*)$/);
+    const n = m[1], q = m[2];
+    const urlArgs = [...args];
+    urlArgs[dateIdx] = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&sp=CAI%3D`;
+    urlArgs.push('--playlist-end', n);
+    try {
+      return await runYtDlp(urlArgs, opts);
+    } catch (e) {
+      log.warn(`date-sorted search failed, falling back to ytsearch: ${String(e.message || e).split('\n')[0]}`);
+      const plain = [...args];
+      plain[dateIdx] = `ytsearch${n}:${q}`;
+      return runYtDlp(plain, opts);
+    }
+  }
+  const {
+    timeout = TIMEOUT,
+    maxBuffer = 1024 * 1024 * 12,
+    useCookies = false,
+    allowCookieFallback = true,
+    lane = 'meta'
+  } = opts;
   const limiter = lane === 'stream' ? streamLimiter : ytdlpLimiter;
   await limiter.acquire();
   try {
-    const base = ['--no-warnings', '--no-call-home', '--geo-bypass'];
+    const base = ['--no-warnings', '--geo-bypass'];
     if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
 
     const attempts = [];
@@ -2011,7 +2030,7 @@ app.get('/health', (req, res) => {
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: commandExists('ffmpeg'),
     cookiesReady,
-    cookieUpdateProtected: Boolean(process.env.COOKIE_UPDATE_SECRET),
+    cookieUpdateProtected: false,
     concurrency: { metaMax: META_CONCURRENCY, metaCurrent: ytdlpLimiter.current, metaQueued: ytdlpLimiter.queue.length, streamMax: STREAM_CONCURRENCY, streamCurrent: streamLimiter.current, streamQueued: streamLimiter.queue.length }
   });
 });
@@ -2021,14 +2040,11 @@ app.get('/health', (req, res) => {
  */
 app.post('/api/update-cookies', async (req, res) => {
   try {
-    const secret = process.env.COOKIE_UPDATE_SECRET || '';
-    const provided = req.get('x-cookie-update-key') || String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-    if (!secret) return res.status(503).json({ error: 'COOKIE_UPDATE_SECRET غير مضبوط على السيرفر' });
-    if (!provided || provided !== secret) return res.status(401).json({ error: 'غير مصرح' });
+    // بدون أي تحقق (باسورد/مفتاح) — بناءً على طلب صاحب المشروع
+    let cookies = req.body;
+    if (cookies && typeof cookies === 'object') cookies = cookies.cookies || cookies.value || '';
 
-    const cookies = req.body;
-
-    if (!cookies || !cookies.trim()) {
+    if (typeof cookies !== 'string' || !cookies.trim()) {
       log.error('Empty cookies received');
       return res.status(400).json({ error: 'الكوكيز فارغة' });
     }
@@ -2094,6 +2110,63 @@ app.post('/api/update-cookies', async (req, res) => {
       details: error.message
     });
   }
+});
+
+
+/**
+ * GET /cookies  — لوحة تحكم تحديث الكوكيز (بدون باسورد)
+ */
+app.get(['/cookies', '/cookies-panel'], (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>لوحة تحديث الكوكيز</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,'Segoe UI',Tahoma,sans-serif;background:#0f1115;color:#e8e8e8;padding:16px}
+.card{max-width:720px;margin:0 auto;background:#181b22;border:1px solid #2a2f3a;border-radius:14px;padding:18px}
+h1{font-size:20px;margin:0 0 12px}
+.status{padding:10px 12px;border-radius:10px;background:#20242d;margin-bottom:12px;font-size:14px}
+textarea{width:100%;height:260px;background:#0f1115;color:#e8e8e8;border:1px solid #2a2f3a;border-radius:10px;padding:10px;font-family:monospace;font-size:12px;direction:ltr;resize:vertical}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+button,label.btn{flex:1;min-width:120px;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;text-align:center}
+#save{background:#e11d48;color:#fff}#file{display:none}label.btn{background:#2a2f3a;color:#fff}
+#clear{background:#20242d;color:#e8e8e8}
+#msg{margin-top:12px;font-size:14px;min-height:20px}
+.ok{color:#4ade80}.err{color:#f87171}
+</style></head><body><div class="card">
+<h1>🍪 لوحة تحديث كوكيز يوتيوب</h1>
+<div class="status" id="status">جاري فحص الحالة...</div>
+<textarea id="ta" placeholder="الصق محتوى cookies.txt (صيغة Netscape) هنا..."></textarea>
+<div class="row">
+<button id="save">💾 حفظ وتحديث</button>
+<label class="btn" for="file">📂 اختيار ملف</label><input type="file" id="file" accept=".txt,text/plain">
+<button id="clear">مسح</button>
+</div>
+<div id="msg"></div></div>
+<script>
+const $=id=>document.getElementById(id);
+async function status(){
+  try{const r=await fetch('/api/cookies-status');const d=await r.json();
+    $('status').textContent=d.status+(d.length?' — '+d.length+' بايت':'');
+  }catch(e){$('status').textContent='❌ تعذر فحص الحالة'}
+}
+$('file').onchange=async e=>{const f=e.target.files[0];if(f)$('ta').value=await f.text()};
+$('clear').onclick=()=>{$('ta').value='';$('msg').textContent=''};
+$('save').onclick=async()=>{
+  const v=$('ta').value.trim();
+  if(!v){$('msg').className='err';$('msg').textContent='الصق الكوكيز الأول';return}
+  $('save').disabled=true;$('msg').className='';$('msg').textContent='جاري الحفظ...';
+  try{
+    const r=await fetch('/api/update-cookies',{method:'POST',headers:{'Content-Type':'text/plain'},body:v});
+    const d=await r.json();
+    if(r.ok){$('msg').className='ok';$('msg').textContent=d.message||'تم ✅'}
+    else{$('msg').className='err';$('msg').textContent=d.error||'فشل'}
+  }catch(e){$('msg').className='err';$('msg').textContent='خطأ اتصال: '+e.message}
+  $('save').disabled=false;status();
+};
+status();
+</script></body></html>`);
 });
 
 /**
