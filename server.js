@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '10.0.1-TITAN-MAINTENANCE';
+const SERVER_VERSION = '10.1.0-TITAN-ACCOUNT';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -296,6 +296,14 @@ function fetchCookiesFromFirebase() {
 }
 
 let lastCookiesContent = '';
+
+// حفظ محلي على السيرفر — احتياطي لو Firebase رفض الكتابة (Permission denied)
+function saveCookiesLocally(content) {
+  fs.writeFileSync(COOKIES_PATH, content);
+  lastCookiesContent = content;
+  cookiesReady = true;
+  feedCache.clear();
+}
 async function refreshCookies() {
   try {
     const content = await fetchCookiesFromFirebase();
@@ -303,6 +311,7 @@ async function refreshCookies() {
       fs.writeFileSync(COOKIES_PATH, content);
       lastCookiesContent = content;
       cookiesReady = true;
+      feedCache.clear();
       log.success(`🍪 Cookies refreshed (${content.length} bytes)`);
     } else if (!content) {
       log.warn('⚠️  No cookies available in Firebase yet');
@@ -701,9 +710,25 @@ async function getSeedRecommendations(seedIds, limit) {
 async function getRecommendedVideos(region = 'EG', limit = 20, seedIds = []) {
   const safeLimit = Math.min(Math.max(Number(limit) || 20, 8), 80);
   const seedKey = seedIds.join('_') || 'none';
-  const key = `recommended:v10:${region}:${safeLimit}:${seedKey}`;
+  const key = `recommended:v11:${cookiesReady ? 'ck' : 'pub'}:${region}:${safeLimit}:${seedKey}`;
 
   return staleWhileRevalidate(feedCache, key, async () => {
+    // لو الكوكيز جاهزة: المقترح هو هوم حسابك الحقيقي على يوتيوب بالظبط
+    if (cookiesReady) {
+      try {
+        const personal = await fetchAccountList('recommended', Math.max(safeLimit, 40));
+        if (personal.length >= 5) {
+          return {
+            items: personal.slice(0, safeLimit),
+            personalized: true,
+            strategy: 'youtube-account-home (:ytrec)',
+            generatedAt: new Date().toISOString()
+          };
+        }
+      } catch (e) {
+        log.warn(`Account recommendations failed, using fallback: ${String(e.message || e).split('\n')[0]}`);
+      }
+    }
     const items = [];
     const seen = new Set();
     const channelCounts = new Map();
@@ -858,7 +883,7 @@ const HOME_SECTIONS = [
 ];
 
 async function getHomeFeed(region = 'EG', perSection = 12) {
-  const key = `home_v9_${region}_${perSection}`;
+  const key = `home_v10_${cookiesReady ? 'ck' : 'pub'}_${region}_${perSection}`;
   return staleWhileRevalidate(feedCache, key, async () => {
     return dedupe(`build:${key}`, async () => {
       const again = feedCache.get(key);
@@ -885,6 +910,16 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
       }
     ));
 
+    const extraP = Promise.all([
+      cookiesReady
+        ? fetchAccountList('recommended', Math.max(perSection * 3, 36))
+            .then(items => ({ key: 'for_you', title: 'مقترح لك', items: items.slice(0, perSection * 3) }))
+            .catch(e => { log.warn(`home for_you failed: ${String(e.message || e).split('\n')[0]}`); return null; })
+        : null,
+      searchLive('بث مباشر', perSection)
+        .then(items => ({ key: 'live', title: 'بث مباشر الآن', items: items.slice(0, perSection) }))
+        .catch(e => { log.warn(`home live failed: ${String(e.message || e).split('\n')[0]}`); return null; })
+    ]);
     const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
     const seen = new Set();
     const mixed = [];
@@ -900,7 +935,15 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
       }
     }
 
-    const result = { region, sections, mixed, generatedAt: new Date().toISOString() };
+    const [forYou, liveSection] = await extraP;
+    const finalSections = [
+      ...(forYou && forYou.items.length ? [forYou] : []),
+      ...sections,
+      ...(liveSection && liveSection.items.length ? [liveSection] : [])
+    ];
+    const personalMixed = forYou ? forYou.items.map(v => ({ ...v, section: 'for_you' })) : [];
+    const finalMixed = dedupeById([...personalMixed, ...mixed]);
+    const result = { region, personalized: Boolean(forYou && forYou.items.length), sections: finalSections, mixed: finalMixed, generatedAt: new Date().toISOString() };
       return result;
     });
   }, CACHE_TTL.feed);
@@ -956,6 +999,89 @@ async function getChannelVideos(channelId, limit = 20) {
     },
     videos
   };
+}
+
+
+/**
+ * ==========================================================================
+ * 👤 بيانات الحساب (بالكوكيز) — المقترح، الاشتراكات، السجل، قوائم التشغيل، البث المباشر
+ * ==========================================================================
+ */
+const ACCOUNT_SOURCES = {
+  recommended: ':ytrec',                                   // الصفحة الرئيسية الحقيقية لحسابك
+  subscriptions: 'https://www.youtube.com/feed/subscriptions',
+  history: ':ythistory',
+  liked: 'https://www.youtube.com/playlist?list=LL',
+  watchlater: 'https://www.youtube.com/playlist?list=WL'
+};
+
+function dedupeById(items) {
+  const seen = new Set();
+  return (items || []).filter(v => v?.id && !seen.has(v.id) && seen.add(v.id));
+}
+
+async function fetchAccountList(kind, limit = 40) {
+  const src = ACCOUNT_SOURCES[kind];
+  if (!src) throw new Error(`unknown account source: ${kind}`);
+  const stdout = await runYtDlp([
+    '--flat-playlist', '--dump-json', '--playlist-end', String(Math.min(Math.max(limit, 1), 150)), src
+  ], { useCookies: true, allowCookieFallback: false, timeout: 70000 });
+  return dedupeById(parseFlatItems(stdout));
+}
+
+function mapPlaylistEntry(e) {
+  const id = e.id || (String(e.url || '').match(/[?&]list=([\w-]+)/) || [])[1];
+  if (!id) return null;
+  const thumbs = e.thumbnails || [];
+  return {
+    playlistId: id,
+    title: e.title || 'قائمة تشغيل',
+    author: e.uploader || e.channel || '',
+    itemCount: e.playlist_count || e.n_entries || null,
+    thumbnail: thumbs.length ? thumbs[thumbs.length - 1].url : null
+  };
+}
+
+async function fetchAccountPlaylists(limit = 60) {
+  const builtin = [
+    { playlistId: 'LL', title: 'الفيديوهات التي أعجبتني', builtin: true, itemCount: null, thumbnail: null, author: '' },
+    { playlistId: 'WL', title: 'المشاهدة لاحقًا', builtin: true, itemCount: null, thumbnail: null, author: '' }
+  ];
+  const candidates = ['https://www.youtube.com/feed/playlists', 'https://www.youtube.com/feed/library'];
+  let found = [];
+  for (const url of candidates) {
+    try {
+      const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url],
+        { useCookies: true, allowCookieFallback: false, timeout: 60000 });
+      const data = JSON.parse(stdout);
+      found = (data.entries || []).map(mapPlaylistEntry).filter(x => x && x.playlistId !== 'LL' && x.playlistId !== 'WL');
+      if (found.length) break;
+    } catch (e) { log.warn(`account playlists via ${url} failed: ${String(e.message || e).split('\n')[0]}`); }
+  }
+  const seen = new Set();
+  return [...builtin, ...found].filter(x => !seen.has(x.playlistId) && seen.add(x.playlistId));
+}
+
+async function fetchAccountChannels(limit = 100) {
+  const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), 'https://www.youtube.com/feed/channels'],
+    { useCookies: true, allowCookieFallback: false, timeout: 60000 });
+  const data = JSON.parse(stdout);
+  return (data.entries || []).map(e => {
+    const id = e.channel_id || e.id;
+    if (!id) return null;
+    const thumbs = e.thumbnails || [];
+    return { id, title: e.title || e.channel || 'قناة', avatar: thumbs.length ? thumbs[thumbs.length - 1].url : null, url: e.url || `https://www.youtube.com/channel/${id}` };
+  }).filter(Boolean);
+}
+
+/** بحث البث المباشر الحالي (فلتر "Live" بتاع يوتيوب) */
+async function searchLive(query = 'بث مباشر', limit = 30) {
+  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgJAAQ%3D%3D`;
+  const stdout = await runYtDlp(['--flat-playlist', '--dump-json', '--playlist-end', String(Math.min(Math.max(limit, 1), 100)), url]);
+  return dedupeById(parseFlatItems(stdout).map(v => ({
+    ...v,
+    isLive: v.liveStatus ? v.liveStatus === 'is_live' : true
+  })));
 }
 
 /**
@@ -2085,20 +2211,31 @@ app.post('/api/update-cookies', async (req, res) => {
           });
         } else {
           log.error(`Firebase returned ${res_fb.statusCode}: ${response}`);
-          res.status(500).json({
-            error: 'فشل في تحديث الكوكيز',
-            details: response
-          });
+          try {
+            saveCookiesLocally(cookies);
+            log.warn('⚠️ Cookies saved locally only (Firebase write denied) — set FIREBASE_SECRET to persist');
+            res.json({
+              success: true,
+              localOnly: true,
+              message: 'تم الحفظ على السيرفر فقط ✅ (Firebase رفض الكتابة — هتضيع بعد أي Redeploy)',
+              timestamp: new Date().toISOString(),
+              size: cookies.length
+            });
+          } catch (e) {
+            res.status(500).json({ error: 'فشل في تحديث الكوكيز', details: response });
+          }
         }
       });
     });
 
     req_firebase.on('error', (err) => {
       log.error(`Firebase update error: ${err.message}`);
-      res.status(500).json({
-        error: 'فشل الاتصال بـ Firebase',
-        details: err.message
-      });
+      try {
+        saveCookiesLocally(cookies);
+        res.json({ success: true, localOnly: true, message: 'تم الحفظ على السيرفر فقط ✅ (تعذر الاتصال بـ Firebase)', size: cookies.length });
+      } catch (e) {
+        res.status(500).json({ error: 'فشل الاتصال بـ Firebase', details: err.message });
+      }
     });
 
     req_firebase.end(payloadData);
@@ -2221,6 +2358,17 @@ app.get('/', (req, res) => {
       suggestions: '/search/suggestions?q=QUERY',
       download: '/download?v=VIDEO_ID&quality=720',
       accountFeed: '/api/account-feed?limit=30',
+      meRecommended: '/api/me/recommended?limit=20&page=1',
+      meSubscriptions: '/api/me/subscriptions?limit=20&page=1',
+      meHistory: '/api/me/history',
+      meLiked: '/api/me/liked',
+      meWatchLater: '/api/me/watchlater',
+      mePlaylists: '/api/me/playlists',
+      mePlaylist: '/api/me/playlist?id=PLAYLIST_ID',
+      meChannels: '/api/me/channels',
+      meLive: '/api/me/live',
+      liveNow: '/api/live?q=QUERY&limit=20&page=1',
+      cookiesPanel: '/cookies',
       cookiesStatus: '/api/cookies-status',
       testAll: '/api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw',
       clearCache: 'POST /api/cache/clear (requires CACHE_ADMIN_SECRET)'
@@ -2657,6 +2805,94 @@ app.get('/api/cache-summary', (req, res) => {
 //  10. Use /recommendations for infinite scrolling instead of rebuilding
 //      a small recommendation list on every page.
 // ==========================================================================
+
+
+// ==========================================================================
+// 👤 /api/me/* — كل حاجة من حسابك بالكوكيز (زي يوتيوب بالظبط)
+// ==========================================================================
+function requireCookies(req, res, next) {
+  if (cookiesReady) return next();
+  res.status(503).json({ error: 'كوكيز يوتيوب غير جاهزة على السيرفر — حدّثها من /cookies', cookiesReady: false });
+}
+
+const ME_TTL = { recommended: 90 * 1000, subscriptions: 60 * 1000, history: 45 * 1000, liked: 90 * 1000, watchlater: 60 * 1000 };
+
+Object.keys(ACCOUNT_SOURCES).forEach(kind => {
+  app.get(`/api/me/${kind}`, requireCookies, async (req, res) => {
+    try {
+      const out = await getPaginatedPool(feedCache, `me_${kind}`, (n) => fetchAccountList(kind, n), req.query.page, req.query.limit, 150, ME_TTL[kind]);
+      res.json({ personalized: true, source: kind, count: out.results.length, ...out });
+    } catch (e) {
+      log.warn(`/api/me/${kind} failed: ${String(e.message || e).split('\n')[0]}`);
+      res.status(502).json({ error: 'تعذّر جلب البيانات من يوتيوب (غالباً الكوكيز انتهت)', source: kind });
+    }
+  });
+});
+
+/** قوائم التشغيل بتاعتي (+ الإعجابات والمشاهدة لاحقًا) */
+app.get('/api/me/playlists', requireCookies, async (req, res) => {
+  try {
+    const data = await staleWhileRevalidate(feedCache, 'me_playlists', () => fetchAccountPlaylists(80), 120 * 1000);
+    res.json({ personalized: true, count: data.length, results: data });
+  } catch (e) {
+    res.status(502).json({ error: 'تعذّر جلب قوائم التشغيل' });
+  }
+});
+
+/** محتوى قائمة تشغيل (يشتغل مع الخاصة والخصوصية "غير مدرجة" بفضل الكوكيز) */
+app.get('/api/me/playlist', requireCookies, async (req, res) => {
+  const id = String(req.query.id || '');
+  if (!/^[\w-]{2,64}$/.test(id)) return res.status(400).json({ error: 'id قائمة التشغيل غير صحيح' });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 150);
+  try {
+    const data = await staleWhileRevalidate(feedCache, `me_playlist:${id}:${limit}`, async () => {
+      const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), `https://www.youtube.com/playlist?list=${id}`],
+        { useCookies: true, allowCookieFallback: false, timeout: 70000 });
+      const d = JSON.parse(stdout);
+      return {
+        playlist: { id, title: d.title || 'قائمة تشغيل', author: d.uploader || d.channel || '', itemCount: d.playlist_count || (d.entries || []).length },
+        results: dedupeById((d.entries || []).map(e => mapFlatEntry(e)).filter(Boolean))
+      };
+    }, 90 * 1000);
+    res.json({ personalized: true, ...data });
+  } catch (e) {
+    res.status(502).json({ error: 'تعذّر جلب القائمة' });
+  }
+});
+
+/** القنوات المشترك فيها */
+app.get('/api/me/channels', requireCookies, async (req, res) => {
+  try {
+    const data = await staleWhileRevalidate(feedCache, 'me_channels', () => fetchAccountChannels(150), 300 * 1000);
+    res.json({ personalized: true, count: data.length, results: data });
+  } catch (e) {
+    res.status(502).json({ error: 'تعذّر جلب القنوات المشترك فيها' });
+  }
+});
+
+/** البثوث المباشرة (والقادمة) من القنوات اللي مشترك فيها */
+app.get('/api/me/live', requireCookies, async (req, res) => {
+  try {
+    const pool = await staleWhileRevalidate(feedCache, 'me_live_pool', () => fetchAccountList('subscriptions', 100), 60 * 1000);
+    const live = pool.filter(v => v.isLive || v.liveStatus === 'is_live');
+    const upcoming = pool.filter(v => v.liveStatus === 'is_upcoming');
+    res.json({ personalized: true, liveCount: live.length, live, upcoming });
+  } catch (e) {
+    res.status(502).json({ error: 'تعذّر جلب البثوث المباشرة' });
+  }
+});
+
+/** البث المباشر العام الآن (بحث بفلتر Live) */
+app.get('/api/live', async (req, res) => {
+  const q = String(req.query.q || 'بث مباشر').trim().slice(0, 100) || 'بث مباشر';
+  try {
+    const out = await getPaginatedPool(searchCache, `live_${q}`, (n) => searchLive(q, n), req.query.page, req.query.limit, 100, 60 * 1000);
+    res.json({ query: q, count: out.results.length, ...out });
+  } catch (e) {
+    log.warn(`/api/live failed: ${String(e.message || e).split('\n')[0]}`);
+    res.status(502).json({ error: 'تعذّر جلب البث المباشر' });
+  }
+});
 
 // 404
 app.use((req, res) => {
