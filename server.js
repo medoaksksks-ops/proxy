@@ -632,7 +632,7 @@ async function getFollowedCreatorsPool(perCreator = 3) {
   const key = `creators:${perCreator}`;
   const cached = feedCache.get(key); if (cached) return cached;
   const settled = await Promise.allSettled(
-    FOLLOWED_CREATORS.slice(0, 4).map(name => runYtDlp([`ytsearchdate${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
+    FOLLOWED_CREATORS.map(name => runYtDlp([`ytsearchdate${perCreator}:${name}`, '--dump-json', '--flat-playlist']))
   );
   const pool = [];
   settled.forEach((r, i) => {
@@ -645,12 +645,20 @@ async function getFollowedCreatorsPool(perCreator = 3) {
 
 const DISCOVERY_QUERIES = [
   'محتوى مصري جديد اليوم',
+  'فيديوهات تعليمية مصر',
+  'علوم وتكنولوجيا بالعربي',
+  'رياضة مصر اليوم',
+  'أخبار مصر اليوم',
   'مراجعات تقنية عربية',
-  'فيديوهات تعليمية عربية'
+  'بودكاست عربي جديد',
+  'ترند عربي اليوم'
 ];
 
 const RECOMMENDATION_FALLBACK_QUERIES = [
   'فيديوهات جديدة مصر',
+  'أفضل فيديوهات عربية اليوم',
+  'محتوى عربي مفيد',
+  'فيديوهات تعليمية عربية',
   'محتوى عربي جديد'
 ];
 
@@ -845,7 +853,10 @@ const HOME_SECTIONS = [
   { key: 'trending', title: 'الرائج الآن', query: 'ترند مصر اليوم' },
   { key: 'education', title: 'تعليم', query: 'شرح دروس تعليمية بالعربي' },
   { key: 'tech', title: 'تكنولوجيا', query: 'تكنولوجيا مراجعات تقنية عربية' },
-  { key: 'sports', title: 'رياضة', query: 'رياضة مصر أهداف وملخصات' }
+  { key: 'sports', title: 'رياضة', query: 'رياضة مصر أهداف وملخصات' },
+  { key: 'news', title: 'أخبار', query: 'أخبار مصر اليوم' },
+  { key: 'podcasts', title: 'بودكاست', query: 'بودكاست عربي جديد' },
+  { key: 'gaming', title: 'ألعاب', query: 'ألعاب فيديو عربية' }
 ];
 
 async function getHomeFeed(region = 'EG', perSection = 12) {
@@ -861,7 +872,7 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
         try {
           let stdout;
           stdout = await runYtDlp([
-            `ytsearchdate${Math.max(perSection * 2, 18)}:${section.query}`,
+            `ytsearchdate${Math.max(perSection * 3, 36)}:${section.query}`,
             '--dump-json', '--flat-playlist'
           ]);
           return {
@@ -882,7 +893,9 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
             .then(items => ({ key: 'for_you', title: 'مقترح لك', items: items.slice(0, perSection * 3) }))
             .catch(e => { log.warn(`home for_you failed: ${String(e.message || e).split('\n')[0]}`); return null; })
         : null,
-      Promise.resolve(null)
+      searchLive('بث مباشر', perSection)
+        .then(items => ({ key: 'live', title: 'بث مباشر الآن', items: items.slice(0, perSection) }))
+        .catch(e => { log.warn(`home live failed: ${String(e.message || e).split('\n')[0]}`); return null; })
     ]);
     const sections = (await Promise.all(fetchers)).filter(s => s.items.length > 0);
     const seen = new Set();
@@ -1346,6 +1359,21 @@ app.get('/playlist', async (req, res) => {
 // yt-dlp --get-url أخف بكثير من getVideoInfo، لذلك المسار الافتراضي يستخدمه.
 // ==========================================================================
 
+async function getDirectStreamRedirect(req, res, videoId) {
+  try {
+    const url = await getFastStreamUrl(videoId);
+    // Let the browser pull bytes directly from YouTube's CDN. This removes
+    // the server from the video data path and is the fastest/lowest-latency
+    // mode when the googlevideo URL is usable from the client network.
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Stream-Mode', 'direct-cdn');
+    return res.redirect(302, url);
+  } catch (e) {
+    log.warn(`Direct CDN redirect failed: ${String(e.message || e).split('\n')[0]}`);
+    if (!res.headersSent) return res.status(502).json({ error: 'تعذر الحصول على مصدر الفيديو' });
+  }
+}
+
 async function getFastStreamUrl(videoId) {
   const key = `fast:${videoId}`;
   const cached = fastStreamCache.get(key);
@@ -1443,7 +1471,7 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
 
   const upstreamReq = https.get(target, {
     headers,
-    timeout: 20000,
+    timeout: 45000,
     agent: keepAliveAgent
   }, (upstreamRes) => {
     const code = Number(upstreamRes.statusCode || 0);
@@ -1712,6 +1740,9 @@ app.get('/video/quick', async (req, res) => {
   }
 
   try {
+    if (!['1','true','yes'].includes(String(req.query.proxy || '').toLowerCase())) {
+      return getDirectStreamRedirect(req, res, videoId);
+    }
     const url = await getFastStreamUrl(videoId);
     res.setHeader('X-Stream-Mode', 'quick-direct');
     return streamFromUpstream(req, res, url, 0);
@@ -1766,7 +1797,14 @@ app.get('/video', async (req, res) => {
     // Probe mode: resolve the stream without sending the video bytes.
     // Useful for automated endpoint testing and health checks.
     const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
+    const useProxy = ['1', 'true', 'yes'].includes(String(req.query.proxy || '').toLowerCase());
     const resolved = resolveQuality(quality);
+
+    // Fastest mode: browser downloads directly from YouTube CDN.
+    // Add ?proxy=1 when you specifically need the server to proxy the bytes.
+    if (!probe && !quality && !useProxy) {
+      return getDirectStreamRedirect(req, res, videoId);
+    }
 
     if (resolved?.type === 'audio') {
       const urls = await getFormatUrls(videoId, 'bestaudio/best');
