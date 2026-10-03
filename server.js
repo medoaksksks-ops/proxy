@@ -1363,15 +1363,20 @@ app.get('/playlist', async (req, res) => {
 // yt-dlp --get-url أخف بكثير من getVideoInfo، لذلك المسار الافتراضي يستخدمه.
 // ==========================================================================
 
-async function getDirectStreamRedirect(req, res, videoId) {
+// تحويل مباشر (302) لرابط جوجل — السيرفر مبيمرّرش أي بايت فيديو.
+function redirectToCdn(res, url, { mode = 'direct-cdn', quality = null } = {}) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Stream-Mode', mode);
+  if (quality) res.setHeader('X-Video-Quality', typeof quality === 'number' ? `${quality}p` : String(quality));
+  return res.redirect(302, url);
+}
+
+async function getDirectStreamRedirect(req, res, videoId, format = 'best') {
   try {
-    const url = await getFastStreamUrl(videoId);
-    // Let the browser pull bytes directly from YouTube's CDN. This removes
-    // the server from the video data path and is the fastest/lowest-latency
-    // mode when the googlevideo URL is usable from the client network.
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Stream-Mode', 'direct-cdn');
-    return res.redirect(302, url);
+    const url = format === 'best'
+      ? await getFastStreamUrl(videoId)
+      : await getVideoStreamUrl(videoId, format);
+    return redirectToCdn(res, url, { mode: 'direct-cdn' });
   } catch (e) {
     log.warn(`Direct CDN redirect failed: ${String(e.message || e).split('\n')[0]}`);
     if (!res.headersSent) return res.status(502).json({ error: 'تعذر الحصول على مصدر الفيديو' });
@@ -1387,9 +1392,13 @@ async function getFastStreamUrl(videoId) {
     const again = fastStreamCache.get(key);
     if (again) return again;
 
-    // Progressive first: browser receives both audio + video in one URL.
+    // 🔒 جودة ثابتة لكل الفيديوهات: 360p (صوت+فيديو في ملف واحد)،
+    // لو مش موجودة 240p، ولو مش موجودة أقرب progressive متاح.
     const candidates = [
-      'best[acodec!=none][vcodec!=none]/best',
+      'best[height<=360][height>=360][acodec!=none][vcodec!=none]',
+      'best[height<=360][acodec!=none][vcodec!=none]',
+      'best[height<=240][acodec!=none][vcodec!=none]',
+      'worst[acodec!=none][vcodec!=none]',
       'best'
     ];
 
@@ -1630,6 +1639,18 @@ function chooseQualityFormats(info, requestedHeight) {
   };
 }
 
+// أعلى جودة فيها صوت+فيديو في ملف واحد (يعني ينفع redirect مباشر) <= الجودة المطلوبة
+function chooseProgressiveFormat(info, requestedHeight) {
+  const prog = (info.formats || []).filter(f =>
+    f && f.height && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none'
+  );
+  if (!prog.length) return null;
+  const below = prog.filter(f => Number(f.height) <= requestedHeight)
+    .sort((a, b) => Number(b.height) - Number(a.height) || (b.tbr || 0) - (a.tbr || 0));
+  const pick = below[0] || prog.sort((a, b) => Number(a.height) - Number(b.height))[0];
+  return { actualHeight: Number(pick.height), formatId: String(pick.format_id) };
+}
+
 function getAvailableQualities(info) {
   return [...new Set(
     getVideoFormats(info).map(f => Number(f.height)).filter(Number.isFinite)
@@ -1744,12 +1765,7 @@ app.get('/video/quick', async (req, res) => {
   }
 
   try {
-    if (!['1','true','yes'].includes(String(req.query.proxy || '').toLowerCase())) {
-      return getDirectStreamRedirect(req, res, videoId);
-    }
-    const url = await getFastStreamUrl(videoId);
-    res.setHeader('X-Stream-Mode', 'quick-direct');
-    return streamFromUpstream(req, res, url, 0);
+    return getDirectStreamRedirect(req, res, videoId);
   } catch (error) {
     log.warn(`Quick stream failed ${videoId}: ${error.message}`);
     return res.status(502).json({
@@ -1806,13 +1822,16 @@ app.get('/video', async (req, res) => {
 
     // Fastest mode: browser downloads directly from YouTube CDN.
     // Add ?proxy=1 when you specifically need the server to proxy the bytes.
-    if (!probe && !quality && !useProxy) {
+    // 🔒 كل التشغيل تحويل مباشر لجوجل بجودة ثابتة (360p/240p)،
+    // وبيتجاهل quality / proxy / merge — السيرفر مبيمرّرش فيديو أبدًا.
+    if (!probe) {
       return getDirectStreamRedirect(req, res, videoId);
     }
 
     if (resolved?.type === 'audio') {
       const urls = await getFormatUrls(videoId, 'bestaudio/best');
       if (probe) return res.json({ probe: true, id: videoId, type: 'audio', resolved: true, urlLength: String(urls[0] || '').length });
+      if (!useProxy) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: 'audio' });
       return streamFromUpstream(req, res, urls[0], 0, videoDuration);
     }
 
@@ -1826,7 +1845,23 @@ app.get('/video', async (req, res) => {
         res.setHeader('X-Stream-Mode', 'direct');
         if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'direct', resolved: true, urlLength: String(urls[0] || '').length });
         recordPerf('video-quality', Date.now() - requestStartedAt, true);
+        if (!useProxy) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: selected.actualHeight });
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
+      }
+
+      // الجودة دي محتاجة دمج فيديو+صوت (1080p وفوق غالبًا).
+      // الافتراضي: تحويل مباشر لأعلى جودة progressive متاحة بدون ما السيرفر يتدخل.
+      // ?merge=1 بس هو اللي بيشغّل ffmpeg ويدمج على السيرفر.
+      const forceMerge = ['1', 'true', 'yes'].includes(String(req.query.merge || '').toLowerCase());
+      if (!probe && !useProxy && !forceMerge) {
+        const prog = chooseProgressiveFormat(info, resolved.height);
+        if (prog) {
+          const urls = await getFormatUrls(videoId, prog.formatId);
+          if (urls[0]) {
+            recordPerf('video-quality', Date.now() - requestStartedAt, true);
+            return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: prog.actualHeight });
+          }
+        }
       }
 
       const urls = await getFormatUrls(
