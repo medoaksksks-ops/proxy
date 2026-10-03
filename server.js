@@ -106,7 +106,11 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '512kb' }));
+// Accept both the JSON API payloads and raw Netscape cookies.txt uploads.
+// The cookies panel sends text/plain, so express.json() alone would leave
+// req.body undefined and the server would incorrectly report "الكوكيز فارغة".
+app.use(express.text({ type: ['text/plain', 'text/*'], limit: '1mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 
 // ==========================================================================
@@ -2258,7 +2262,7 @@ $('save').onclick=async()=>{
   if(!v){$('msg').className='err';$('msg').textContent='الصق الكوكيز الأول';return}
   $('save').disabled=true;$('msg').className='';$('msg').textContent='جاري الحفظ...';
   try{
-    const r=await fetch('/api/update-cookies',{method:'POST',headers:{'Content-Type':'text/plain'},body:v});
+    const r=await fetch('/api/update-cookies',{method:'POST',headers:{'Content-Type':'text/plain; charset=utf-8'},body:v});
     const d=await r.json();
     if(r.ok){$('msg').className='ok';$('msg').textContent=d.message||'تم ✅'}
     else{$('msg').className='err';$('msg').textContent=d.error||'فشل'}
