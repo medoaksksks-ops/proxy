@@ -519,7 +519,7 @@ async function getFormatUrls(videoId, formatSelector) {
     const stdout = await runYtDlp([
       '--get-url', '--no-playlist', '-f', formatSelector,
       `https://www.youtube.com/watch?v=${videoId}`
-    ], { timeout: 45000, lane: 'stream' });
+    ], { timeout: 45000, lane: 'stream', useCookies: cookiesReady, allowCookieFallback: true });
 
     const urls = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
     if (!urls.length) throw new Error('No stream URL returned');
