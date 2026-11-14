@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.3.0-DYNAMIC-QUALITIES-CHANNEL-STREAMS';
+const SERVER_VERSION = '13.3.0-REAL-FMT-STREAMS';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -1055,56 +1055,33 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
  */
 async function getChannelTab(channelId, tab, limit = 30) {
   const safeTab = ['playlists', 'streams', 'live'].includes(tab) ? (tab === 'live' ? 'streams' : tab) : 'videos';
+  // يدعم UC... أو @handle
   const base = String(channelId).startsWith('UC')
     ? `https://www.youtube.com/channel/${channelId}`
     : (String(channelId).startsWith('@')
       ? `https://www.youtube.com/${channelId}`
       : `https://www.youtube.com/channel/${channelId}`);
-
-  const maxItems = Math.min(Math.max(Number(limit) || 30, 1), 100);
-  // بعض القنوات لا تُرجع أرشيف البث من /streams وحده؛ نجرب تبويبات يوتيوب البديلة.
-  const urls = safeTab === 'streams'
-    ? [`${base}/streams`, `${base}/live`, `${base}/videos?view=2&live_view=502&shelf_id=3`]
-    : [`${base}/${safeTab}`];
-
-  const collected = [];
-  let primaryData = null;
-  const failures = [];
-
-  for (const url of urls) {
-    try {
-      const stdout = await runYtDlp([
-        '--flat-playlist', '--dump-single-json',
-        '--playlist-end', String(maxItems),
-        url
-      ], { useCookies: cookiesReady, allowCookieFallback: true, timeout: 60000 });
-      const data = JSON.parse(stdout);
-      if (!primaryData || (data.entries || []).length > (primaryData.entries || []).length) primaryData = data;
-      for (const e of (data.entries || [])) {
-        const mapped = mapFlatEntry(e);
-        if (!mapped) continue;
-        const liveStatus = e.live_status || (e.is_live ? 'is_live' : (e.was_live ? 'was_live' : null));
-        collected.push({
-          ...mapped,
-          playlistId: e.id || null,
-          playlistTitle: e.title || null,
-          itemCount: e.playlist_count || e.n_entries || null,
-          isLive: !!e.is_live || liveStatus === 'is_live',
-          wasLive: !!e.was_live || liveStatus === 'was_live',
-          liveStatus,
-          concurrentViewers: e.concurrent_view_count || e.view_count || null
-        });
-      }
-      if (safeTab !== 'streams' || collected.length >= maxItems) break;
-    } catch (e) {
-      failures.push(`${url}: ${String(e.message || e).split('\n')[0]}`);
-      log.warn(`Channel tab fallback failed: ${failures[failures.length - 1]}`);
-    }
-  }
-
-  if (!primaryData && !collected.length) throw new Error(failures.join(' | ') || 'Channel tab unavailable');
-  const entries = dedupeById(collected).slice(0, maxItems);
-  const data = primaryData || {};
+  const url = `${base}/${safeTab}`;
+  const stdout = await runYtDlp([
+    '--flat-playlist', '--dump-single-json',
+    '--playlist-end', String(Math.min(Math.max(limit, 1), 100)),
+    url
+  ], { useCookies: cookiesReady, allowCookieFallback: true, timeout: 60000 });
+  const data = JSON.parse(stdout);
+  const entries = (data.entries || []).map(e => {
+    const mapped = mapFlatEntry(e);
+    if (!mapped) return null;
+    return {
+      ...mapped,
+      playlistId: e.id || null,
+      playlistTitle: e.title || null,
+      itemCount: e.playlist_count || e.n_entries || null,
+      isLive: !!e.is_live || e.live_status === 'is_live',
+      wasLive: !!e.was_live || e.live_status === 'was_live',
+      liveStatus: e.live_status || (e.is_live ? 'is_live' : null),
+      concurrentViewers: e.concurrent_view_count || e.view_count || null
+    };
+  }).filter(Boolean);
   return {
     channel: {
       id: data.channel_id || channelId,
@@ -1119,20 +1096,11 @@ async function getChannelTab(channelId, tab, limit = 30) {
 }
 
 async function getChannelVideos(channelId, limit = 20) {
-  const url = `https://www.youtube.com/channel/${channelId}/videos`;
-  log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
-  const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
-  const data = JSON.parse(stdout);
-  const videos = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
+  // نستخدم getChannelTab عشان يدعم UC و @handle + كوكيز
+  const data = await getChannelTab(channelId, 'videos', limit);
   return {
-    channel: {
-      id: data.channel_id || channelId,
-      title: data.channel || data.uploader || 'قناة',
-      followers: data.channel_follower_count || null,
-      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
-      description: data.description || ''
-    },
-    videos
+    channel: data.channel,
+    videos: data.entries || []
   };
 }
 
@@ -1693,45 +1661,81 @@ app.get('/channel/playlists', async (req, res) => {
 
 /**
  * GET /channel/streams?id=CHANNEL_ID&limit=30&page=1&status=all|live|upcoming|past
- * بثوث القناة: مباشر الآن / قادم / سابق
+ * بثوث القناة: من تبويب /streams + فيديوهات was_live من /videos
  */
 app.get('/channel/streams', async (req, res) => {
   const channelId = String(req.query.id || '');
   if (!channelId) {
     return res.status(400).json({
       error: 'channel id مطلوب',
-      example: '/channel/streams?id=UCxxxxx&status=live'
+      example: '/channel/streams?id=UCxxxxx&status=all|live|upcoming|past'
     });
   }
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
   const status = String(req.query.status || 'all').toLowerCase();
-  const key = `channel-streams:${channelId}:${page}:${limit}:${status}`;
+  const key = `channel-streams-v2:${channelId}:${page}:${limit}:${status}`;
   const cached = channelCache.get(key);
   if (cached) return res.json(cached);
   try {
-    const data = await getChannelTab(channelId, 'streams', Math.min(Math.max(page * limit, 40), 100));
-    let list = data.entries || [];
+    const pool = Math.min(Math.max(page * limit * 2, 50), 100);
+
+    // 1) تبويب البثوث الرسمي
+    // 2) فيديوهات القناة اللي كانت لايف (was_live) — عشان البثوث القديمة تظهر
+    const [streamsTab, videosTab] = await Promise.allSettled([
+      getChannelTab(channelId, 'streams', pool),
+      getChannelTab(channelId, 'videos', pool)
+    ]);
+
+    const channel = (streamsTab.status === 'fulfilled' && streamsTab.value.channel)
+      || (videosTab.status === 'fulfilled' && videosTab.value.channel)
+      || { id: channelId, title: 'قناة' };
+
+    const fromStreams = streamsTab.status === 'fulfilled' ? (streamsTab.value.entries || []) : [];
+    const fromVideos = videosTab.status === 'fulfilled' ? (videosTab.value.entries || []) : [];
+
+    // أي فيديو عليه علامة لايف / كان لايف / upcoming
+    const liveRelatedFromVideos = fromVideos.filter(v =>
+      v.isLive || v.wasLive || v.liveStatus === 'is_live' ||
+      v.liveStatus === 'was_live' || v.liveStatus === 'is_upcoming'
+    );
+
+    let list = dedupeById([...fromStreams, ...liveRelatedFromVideos]);
+
+    // لو تبويب streams فاضي بالكامل، رجّع فيديوهات القناة كـ "بثوث محتملة" مش فارغ
+    if (!list.length && fromVideos.length) {
+      list = fromVideos;
+    }
+
     if (status === 'live') {
       list = list.filter(v => v.isLive || v.liveStatus === 'is_live');
     } else if (status === 'upcoming') {
       list = list.filter(v => v.liveStatus === 'is_upcoming');
     } else if (status === 'past') {
-      list = list.filter(v => v.wasLive || v.liveStatus === 'was_live' || (!v.isLive && v.liveStatus !== 'is_upcoming'));
+      list = list.filter(v =>
+        v.wasLive || v.liveStatus === 'was_live' ||
+        (!v.isLive && v.liveStatus !== 'is_upcoming' && v.liveStatus !== 'is_live')
+      );
     }
+
     const start = (page - 1) * limit;
     const results = list.slice(start, start + limit);
     const out = {
-      channel: data.channel,
+      channel,
       page,
       limit,
       status,
       count: results.length,
       liveNow: list.filter(v => v.isLive || v.liveStatus === 'is_live').length,
+      pastCount: list.filter(v => v.wasLive || v.liveStatus === 'was_live').length,
       hasMore: list.length > start + limit,
-      streams: results
+      streams: results,
+      sources: {
+        streamsTab: fromStreams.length,
+        videosLiveRelated: liveRelatedFromVideos.length
+      }
     };
-    channelCache.set(key, out, 60 * 1000); // لايفات: كاش دقيقة
+    channelCache.set(key, out, 90 * 1000);
     res.json(out);
   } catch (error) {
     log.error(`Error fetching channel streams: ${error.message}`);
@@ -1822,13 +1826,49 @@ async function getFastStreamUrl(videoId) {
   });
 }
 
+/** خريطة الارتفاعات progressive الحقيقية (صوت+صورة في ملف واحد) */
+function buildProgressiveMap(info) {
+  const map = new Map();
+  for (const f of info.formats || []) {
+    if (!f || !f.format_id) continue;
+    if (!f.height || !Number.isFinite(Number(f.height))) continue;
+    if (!f.vcodec || f.vcodec === 'none') continue;
+    if (!f.acodec || f.acodec === 'none') continue;
+    const h = Number(f.height);
+    const prev = map.get(h);
+    const score = (f.tbr || f.vbr || 0) + (String(f.ext || '') === 'mp4' ? 50 : 0);
+    const prevScore = prev ? (prev.tbr || prev.vbr || 0) + (String(prev.ext || '') === 'mp4' ? 50 : 0) : -1;
+    if (!prev || score > prevScore) map.set(h, f);
+  }
+  return map;
+}
+
+/** أفضل progressive <= الارتفاع المطلوب */
+function pickProgressiveForHeight(info, requestedHeight) {
+  const map = buildProgressiveMap(info);
+  if (!map.size) return null;
+  const heights = [...map.keys()].sort((a, b) => b - a);
+  if (map.has(requestedHeight)) {
+    const f = map.get(requestedHeight);
+    return { actualHeight: requestedHeight, formatId: String(f.format_id), format: f };
+  }
+  const below = heights.filter(h => h <= requestedHeight);
+  if (below.length) {
+    const hh = below[0];
+    const f = map.get(hh);
+    return { actualHeight: hh, formatId: String(f.format_id), format: f };
+  }
+  const hh = heights[heights.length - 1];
+  const f = map.get(hh);
+  return { actualHeight: hh, formatId: String(f.format_id), format: f };
+}
+
 /**
- * رابط بث لجودة محددة — progressive أولًا (صوت+صورة)،
- * ولو مفيش: نختار format_id من الميتاداتا لنفس الارتفاع.
+ * رابط بث من format_id الحقيقي فقط — 144≠240≠360≠720 لما يكونوا progressive
  */
 async function getQualityStreamUrl(videoId, height) {
   const h = clampQualityHeight(height);
-  const key = `qurl:${videoId}:${h}`;
+  const key = `qurl_v2:${videoId}:${h}`;
   const cached = streamCache.get(key);
   if (cached) return cached;
 
@@ -1836,43 +1876,23 @@ async function getQualityStreamUrl(videoId, height) {
     const again = streamCache.get(key);
     if (again) return again;
 
-    // 1) من الميتاداتا: format_id progressive الدقيق لنفس الارتفاع
-    try {
-      const info = await getVideoInfo(videoId);
-      const prog = chooseProgressiveFormat(info, h);
-      if (prog?.formatId) {
-        const urls = await getFormatUrls(videoId, prog.formatId);
-        if (urls[0]) {
-          const out = {
-            url: urls[0],
-            actualHeight: prog.actualHeight,
-            requestedHeight: h,
-            mode: 'progressive',
-            formatId: prog.formatId
-          };
-          streamCache.set(key, out, CACHE_TTL.stream);
-          return out;
-        }
-      }
-    } catch (e) {
-      log.warn(`quality meta ${h}p: ${String(e.message || e).split('\n')[0]}`);
-    }
+    const info = await getVideoInfo(videoId);
+    const pick = pickProgressiveForHeight(info, h);
+    if (!pick?.formatId) throw new Error(`No progressive format for ${h}p`);
 
-    // 2) selector yt-dlp مربوط بالارتفاع (كل جودة string مختلف)
-    const lo = Math.max(144, h - 40);
-    const selector = [
-      `best[height=${h}][acodec!=none][vcodec!=none]`,
-      `best[height<=${h}][height>=${lo}][acodec!=none][vcodec!=none]`,
-      `best[height<=${h}][acodec!=none][vcodec!=none]`,
-      `b[height<=${h}]/w`
-    ].join('/');
+    const urls = await getFormatUrls(videoId, pick.formatId);
+    if (!urls[0]) throw new Error(`No URL for format ${pick.formatId}`);
 
-    const urls = await getFormatUrls(videoId, selector);
-    const url = urls[0];
-    if (!url) throw new Error(`No stream for ${h}p`);
-
-    const out = { url, actualHeight: h, requestedHeight: h, mode: 'progressive-selector' };
+    const out = {
+      url: urls[0],
+      actualHeight: pick.actualHeight,
+      requestedHeight: h,
+      mode: 'progressive',
+      formatId: pick.formatId,
+      ext: pick.format?.ext || null
+    };
     streamCache.set(key, out, CACHE_TTL.stream);
+    log.success(`🎬 quality ${h}p → ${pick.actualHeight}p (fmt ${pick.formatId})`);
     return out;
   });
 }
@@ -2030,10 +2050,10 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
 // - video-only + audio = ffmpeg فقط عند الحاجة.
 // ==========================================================================
 // كل الجودات الشائعة — التشغيل الحقيقي يعتمد على اللي متاح progressive أو ffmpeg
-const SUPPORTED_QUALITIES = [144, 240, 360, 480, 720, 1080, 1440, 2160];
+const SUPPORTED_QUALITIES = [144, 240, 360, 480, 720, 1080];
 const QUALITY_ALIASES = {
   '144': 144, '240': 240, '360': 360, '480': 480, '720': 720, '1080': 1080,
-  '1440': 1440, '2k': 1440, '2160': 2160, '4k': 2160,
+  '2160': 1080, '4k': 1080, '1440': 1080, '2k': 1080,
   'low': 240, 'medium': 360, 'high': 720, 'hd': 720, 'fullhd': 1080
 };
 
@@ -2047,8 +2067,8 @@ function clampQualityHeight(height) {
     const d = Math.abs(h - q);
     if (d < bestDiff) { best = q; bestDiff = d; }
   }
-  // دعم 1440p و2160p بدل إجبار كل الطلبات العالية على 1080p.
-  if (h >= 2160) return 2160;
+  // لو أعلى من 1080 قفل على 1080
+  if (h >= 1080) return 1080;
   return best;
 }
 
@@ -2116,16 +2136,11 @@ function chooseQualityFormats(info, requestedHeight) {
   };
 }
 
-// أعلى جودة فيها صوت+فيديو في ملف واحد (يعني ينفع redirect مباشر) <= الجودة المطلوبة
+// أعلى جودة progressive <= المطلوب
 function chooseProgressiveFormat(info, requestedHeight) {
-  const prog = (info.formats || []).filter(f =>
-    f && f.height && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none'
-  );
-  if (!prog.length) return null;
-  const below = prog.filter(f => Number(f.height) <= requestedHeight)
-    .sort((a, b) => Number(b.height) - Number(a.height) || (b.tbr || 0) - (a.tbr || 0));
-  const pick = below[0] || prog.sort((a, b) => Number(a.height) - Number(b.height))[0];
-  return { actualHeight: Number(pick.height), formatId: String(pick.format_id) };
+  const pick = pickProgressiveForHeight(info, requestedHeight);
+  if (!pick) return null;
+  return { actualHeight: pick.actualHeight, formatId: pick.formatId };
 }
 
 function getAvailableQualities(info) {
@@ -2240,13 +2255,6 @@ app.get('/video/quick', async (req, res) => {
   const videoId = String(req.query.v || '');
   if (!isValidVideoId(videoId)) {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
-  }
-
-  // عند اختيار جودة من الواجهة، مرّر الطلب للمسار الذي ينفّذ الجودة فعليًا.
-  // بدون quality يظل المسار السريع الافتراضي كما هو.
-  if (req.query.quality) {
-    const target = `/video?v=${encodeURIComponent(videoId)}&quality=${encodeURIComponent(String(req.query.quality))}`;
-    return res.redirect(307, target);
   }
 
   try {
@@ -2666,8 +2674,8 @@ app.get('/formats', async (req, res) => {
  * كل جودة معاها رابط تشغيل جاهز من نفس السيرفر (/video?v=..&quality=..)
  */
 app.get('/video/qualities', async (req, res) => {
-  const videoId = String(req.query.v || '');
-  if (!isValidVideoId(videoId)) {
+  const videoId = req.query.v;
+  if (!videoId || !isValidVideoId(videoId)) {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
@@ -2677,27 +2685,45 @@ app.get('/video/qualities', async (req, res) => {
 
   try {
     const info = await getVideoInfo(videoId);
+    const progMap = buildProgressiveMap(info);
+    const progressiveHeights = [...progMap.keys()].sort((a, b) => b - a);
     const allHeights = getAvailableQualities(info);
-    const progressiveHeights = [...new Set(
-      (info.formats || [])
-        .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
-        .map(f => Number(f.height))
-        .filter(Number.isFinite)
-    )].sort((a, b) => b - a);
     const hasFfmpeg = commandExists('ffmpeg');
 
-    const qualities = allHeights.map(height => {
-      const progressive = progressiveHeights.includes(height);
+    // نعرض الجودات اللي ليها ملف progressive مختلف فعليًا
+    const qualities = progressiveHeights.map(h => {
+      const f = progMap.get(h);
       return {
-        label: `${height}p`,
-        quality: String(height),
-        height,
-        type: progressive ? 'progressive' : 'needs-ffmpeg',
-        playable: progressive || hasFfmpeg,
+        label: `${h}p`,
+        quality: String(h),
+        height: h,
+        type: 'progressive',
+        playable: true,
         available: true,
-        url: `/video?v=${encodeURIComponent(videoId)}&quality=${height}`
+        formatId: String(f.format_id),
+        ext: f.ext || null,
+        bitrate: f.tbr || f.vbr || null,
+        url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
     });
+
+    // لو ffmpeg موجود نضيف ارتفاعات adaptive الناقصة
+    if (hasFfmpeg) {
+      for (const h of SUPPORTED_QUALITIES) {
+        if (progressiveHeights.includes(h)) continue;
+        if (!allHeights.includes(h)) continue;
+        qualities.push({
+          label: `${h}p`,
+          quality: String(h),
+          height: h,
+          type: 'merged-ffmpeg',
+          playable: true,
+          available: true,
+          url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}&merge=1`
+        });
+      }
+      qualities.sort((a, b) => b.height - a.height);
+    }
 
     qualities.push({
       label: '🎧 صوت فقط',
@@ -2712,21 +2738,20 @@ app.get('/video/qualities', async (req, res) => {
       id: videoId,
       title: info.title,
       count: qualities.length,
-      supported: allHeights,
       progressiveHeights,
       allHeights,
       ffmpegReady: hasFfmpeg,
       qualities,
-      note: hasFfmpeg
-        ? 'تم إرجاع كل ارتفاعات الفيديو الموجودة فعليًا؛ الجودات المنفصلة تُدمج مع الصوت عبر ffmpeg.'
-        : 'تم إرجاع الجودات الموجودة فعليًا. الجودات التي تحتاج دمج صوت وفيديو تتطلب ffmpeg.'
+      note: progressiveHeights.length
+        ? `جودات progressive حقيقية متاحة: ${progressiveHeights.map(h => h + 'p').join(', ')}`
+        : 'مفيش progressive — فعّل ffmpeg للجودات العالية'
     };
 
     infoCache.set(cacheKey, result, CACHE_TTL.info);
-    return res.json(result);
+    res.json(result);
   } catch (error) {
     log.error(`Error fetching qualities: ${error.message}`);
-    return res.status(500).json({
+    res.status(500).json({
       error: 'تعذّر جلب الجودات المتاحة',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
