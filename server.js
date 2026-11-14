@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.0.0-YOUTUBE-FULL';
+const SERVER_VERSION = '13.1.0-REAL-QUALITY';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -1698,34 +1698,74 @@ async function getDirectStreamRedirect(req, res, videoId, format = 'best') {
 async function getFastStreamUrl(videoId) {
   const key = `fast:${videoId}`;
   const cached = fastStreamCache.get(key);
-  if (cached) return cached;
+  if (cached) return typeof cached === 'string' ? cached : cached.url;
 
   return dedupe(key, async () => {
     const again = fastStreamCache.get(key);
+    if (again) return typeof again === 'string' ? again : again.url;
+
+    // افتراضي 360p progressive — سريع ومستقر
+    const result = await getQualityStreamUrl(videoId, 360);
+    fastStreamCache.set(key, result.url, CACHE_TTL.fastStream);
+    return result.url;
+  });
+}
+
+/**
+ * يجيب رابط بث لجودة محددة: 240 أو 360 أو 480 فقط (progressive).
+ * كل ارتفاع ليه selector مختلف عشان الروابط تبقى مختلفة فعليًا.
+ */
+async function getQualityStreamUrl(videoId, height) {
+  const h = clampQualityHeight(height);
+  const key = `qurl:${videoId}:${h}`;
+  const cached = streamCache.get(key);
+  if (cached) return cached;
+
+  return dedupe(key, async () => {
+    const again = streamCache.get(key);
     if (again) return again;
 
-    // صيغة واحدة مركّبة = طلب yt-dlp واحد أسرع من محاولات متعددة.
-    // يفضّل progressive 360p ثم 240p ثم أي progressive ثم best.
-    const selector =
-      'best[height<=360][acodec!=none][vcodec!=none]/best[height<=480][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best';
-
-    try {
-      const urls = await getFormatUrls(videoId, selector);
-      const url = urls[0];
-      if (!url) throw new Error('No fast stream URL available');
-      fastStreamCache.set(key, url, CACHE_TTL.fastStream);
-      return url;
-    } catch (e) {
-      // fallback أخير بدون cookies لو فشل
-      const urls = await runYtDlp([
-        '--get-url', '--no-playlist', '-f', selector,
-        `https://www.youtube.com/watch?v=${videoId}`
-      ], { timeout: 35000, lane: 'stream', useCookies: false, allowCookieFallback: false });
-      const url = urls.trim().split('\n').map(s => s.trim()).filter(Boolean)[0];
-      if (!url) throw e;
-      fastStreamCache.set(key, url, CACHE_TTL.fastStream);
-      return url;
+    // selectors مفصولة لكل جودة عشان 240 ≠ 360 ≠ 480
+    let selector;
+    if (h === 240) {
+      selector = [
+        'best[height=240][acodec!=none][vcodec!=none]',
+        'best[height<=240][acodec!=none][vcodec!=none]',
+        'worst[acodec!=none][vcodec!=none]'
+      ].join('/');
+    } else if (h === 480) {
+      selector = [
+        'best[height=480][acodec!=none][vcodec!=none]',
+        'best[height<=480][height>=400][acodec!=none][vcodec!=none]',
+        'best[height<=480][acodec!=none][vcodec!=none]',
+        'best[height<=360][acodec!=none][vcodec!=none]'
+      ].join('/');
+    } else {
+      // 360 default
+      selector = [
+        'best[height=360][acodec!=none][vcodec!=none]',
+        'best[height<=360][height>=300][acodec!=none][vcodec!=none]',
+        'best[height<=360][acodec!=none][vcodec!=none]',
+        'best[height<=480][acodec!=none][vcodec!=none]'
+      ].join('/');
     }
+
+    const urls = await getFormatUrls(videoId, selector);
+    const url = urls[0];
+    if (!url) throw new Error(`No stream for ${h}p`);
+
+    let actualHeight = h;
+    try {
+      const info = infoCache.get(`raw_info_${videoId}`);
+      if (info) {
+        const prog = chooseProgressiveFormat(info, h);
+        if (prog) actualHeight = clampQualityHeight(prog.actualHeight);
+      }
+    } catch {}
+
+    const out = { url, actualHeight, requestedHeight: h, mode: 'progressive' };
+    streamCache.set(key, out, CACHE_TTL.stream);
+    return out;
   });
 }
 
@@ -1881,20 +1921,30 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
 // - progressive بنفس الارتفاع = تشغيل مباشر وأسرع.
 // - video-only + audio = ffmpeg فقط عند الحاجة.
 // ==========================================================================
+// الجودات المدعومة فقط: 240 / 360 / 480
+const SUPPORTED_QUALITIES = [240, 360, 480];
 const QUALITY_ALIASES = {
-  '2160': 2160, '4k': 2160,
-  '1440': 1440, '2k': 1440,
-  '1080': 1080, '720': 720, '480': 480,
-  '360': 360, '240': 240, '144': 144
+  '480': 480, '360': 360, '240': 240,
+  '2160': 480, '4k': 480, '1440': 480, '2k': 480,
+  '1080': 480, '720': 480, '144': 240,
+  'low': 240, 'medium': 360, 'high': 480
 };
+
+function clampQualityHeight(height) {
+  const h = Number(height);
+  if (!h || Number.isNaN(h)) return 360;
+  if (h <= 240) return 240;
+  if (h <= 360) return 360;
+  return 480;
+}
 
 function resolveQuality(quality) {
   if (!quality) return null;
   const q = String(quality).toLowerCase().replace(/p$/, '');
   if (q === 'audio') return { type: 'audio' };
-  const height = QUALITY_ALIASES[q] || parseInt(q, 10);
-  if (!height || Number.isNaN(height)) return null;
-  return { type: 'video', height };
+  const raw = QUALITY_ALIASES[q] || parseInt(q, 10);
+  if (!raw || Number.isNaN(raw)) return null;
+  return { type: 'video', height: clampQualityHeight(raw) };
 }
 
 function getVideoFormats(info) {
@@ -2160,42 +2210,61 @@ app.get('/video', async (req, res) => {
     }
 
     if (resolved?.type === 'video') {
+      const forceMerge = ['1', 'true', 'yes'].includes(String(req.query.merge || '').toLowerCase());
+      const hasFfmpeg = commandExists('ffmpeg');
+
+      // 1) المسار الأساسي: progressive بصيغة مربوطة بالارتفاع المطلوب
+      //    ده اللي بيخلي 144p ≠ 360p ≠ 720p فعليًا بدون ffmpeg.
+      if (!forceMerge || !hasFfmpeg) {
+        try {
+          const q = await getQualityStreamUrl(videoId, resolved.height);
+          res.setHeader('X-Video-Quality', `${q.actualHeight}p`);
+          res.setHeader('X-Requested-Quality', `${resolved.height}p`);
+          res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-quality');
+          if (probe) {
+            return res.json({
+              probe: true,
+              id: videoId,
+              type: 'video',
+              requestedQuality: resolved.height,
+              actualQuality: q.actualHeight,
+              mode: 'progressive',
+              resolved: true,
+              urlLength: String(q.url || '').length
+            });
+          }
+          recordPerf('video-quality', Date.now() - requestStartedAt, true);
+          if (wantDirect) return redirectToCdn(res, q.url, { mode: 'direct-cdn', quality: q.actualHeight });
+          return streamFromUpstream(req, res, q.url, 0, videoDuration);
+        } catch (e) {
+          log.warn(`progressive quality ${resolved.height}p failed: ${String(e.message || e).split('\n')[0]}`);
+        }
+      }
+
+      // 2) دمج video+audio عبر ffmpeg للجودات العالية لو متاح ومطلوب
+      if (!hasFfmpeg) {
+        throw new Error('الجودة دي محتاجة ffmpeg مش موجود على السيرفر');
+      }
+
       const info = await getVideoInfo(videoId);
       const selected = chooseQualityFormats(info, resolved.height);
 
       if (selected.mode === 'direct') {
         const urls = await getFormatUrls(videoId, selected.videoFormatId);
         res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
-        res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy');
-        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: selected.mode, resolved: true, urlLength: String(urls[0] || '').length });
+        res.setHeader('X-Requested-Quality', `${resolved.height}p`);
+        res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-quality');
+        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'direct', resolved: true, urlLength: String(urls[0] || '').length });
         recordPerf('video-quality', Date.now() - requestStartedAt, true);
         if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: selected.actualHeight });
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
       }
 
-      // الجودة محتاجة دمج فيديو+صوت. لو مفيش ffmpeg نحاول أعلى progressive متاح.
-      const forceMerge = ['1', 'true', 'yes'].includes(String(req.query.merge || '').toLowerCase());
-      if (!probe && !forceMerge) {
-        const prog = chooseProgressiveFormat(info, resolved.height);
-        if (prog) {
-          const urls = await getFormatUrls(videoId, prog.formatId);
-          if (urls[0]) {
-            res.setHeader('X-Video-Quality', `${prog.actualHeight}p`);
-            res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-progressive');
-            recordPerf('video-quality', Date.now() - requestStartedAt, true);
-            if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: prog.actualHeight });
-            return streamFromUpstream(req, res, urls[0], 0, videoDuration);
-          }
-        }
-      }
-
-      const urls = await getFormatUrls(
-        videoId,
-        `${selected.videoFormatId}+${selected.audioFormatId}`
-      );
+      const urls = await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`);
       if (urls.length < 2) throw new Error('Could not resolve video/audio URLs');
 
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
+      res.setHeader('X-Requested-Quality', `${resolved.height}p`);
       res.setHeader('X-Stream-Mode', 'ffmpeg');
       if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true, videoUrlLength: String(urls[0] || '').length, audioUrlLength: String(urls[1] || '').length });
       recordPerf('video-quality', Date.now() - requestStartedAt, true);
@@ -2481,22 +2550,30 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v6_${videoId}`;
+  const cacheKey = `qualities_v8_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
   try {
     const info = await getVideoInfo(videoId);
-    const heights = getAvailableQualities(info);
+    const progressiveHeights = [...new Set(
+      (info.formats || [])
+        .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+        .map(f => Number(f.height))
+        .filter(Number.isFinite)
+    )];
 
-    const qualities = heights.map(h => {
-      const selected = chooseQualityFormats(info, h);
+    // بس 240 / 360 / 480
+    const qualities = SUPPORTED_QUALITIES.map(h => {
+      const available = progressiveHeights.some(ph => ph === h) ||
+        progressiveHeights.some(ph => ph <= h && ph >= h - 120);
       return {
-        label: h >= 2160 ? '4K' : `${h}p`,
+        label: `${h}p`,
         quality: String(h),
         height: h,
-        type: selected.mode === 'direct' ? 'direct' : 'merged (ffmpeg)',
-        formatId: selected.videoFormatId,
+        type: 'progressive',
+        playable: true,
+        available,
         url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
     });
@@ -2505,6 +2582,7 @@ app.get('/video/qualities', async (req, res) => {
       label: '🎧 صوت فقط',
       quality: 'audio',
       type: 'audio',
+      playable: true,
       url: `/video?v=${encodeURIComponent(videoId)}&quality=audio`
     });
 
@@ -2512,8 +2590,9 @@ app.get('/video/qualities', async (req, res) => {
       id: videoId,
       title: info.title,
       count: qualities.length,
+      supported: SUPPORTED_QUALITIES,
       qualities,
-      note: 'الجودات هنا هي الارتفاعات المتاحة فعليًا للفيديو.'
+      note: 'الجودات المدعومة: 240p و 360p و 480p فقط.'
     };
 
     infoCache.set(cacheKey, result, CACHE_TTL.info);
