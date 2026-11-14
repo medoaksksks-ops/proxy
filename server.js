@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.1.0-REAL-QUALITY';
+const SERVER_VERSION = '13.2.0-UNLISTED-QUALITIES-LIVE';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -424,12 +424,23 @@ async function runYtDlp(args, opts = {}) {
       attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
     };
 
-    // Fast public attempt first. Cookies are used only when requested or as fallback.
-    pushAttempt([], useCookies);
-    if (!useCookies) pushAttempt(['--extractor-args', 'youtube:player_client=default,web_safari']);
+    // ترتيب المحاولات: كوكيز أولًا لو متاحة (مهمة لغير المدرج / العمر / الخاص-بالرابط)،
+    // بعدين clients متعددة عشان unlisted و age-gate يشتغلوا.
+    if (useCookies && cookiesReady) {
+      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web_safari'], true);
+      pushAttempt([], true);
+    } else {
+      pushAttempt([]);
+      pushAttempt(['--extractor-args', 'youtube:player_client=android,web']);
+      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web_safari']);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded']);
+    }
     if (allowCookieFallback && cookiesReady && !useCookies) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=default,-tv_downgraded,web_embedded'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded,web'], true);
+      pushAttempt([], true);
     }
 
     let lastError;
@@ -439,7 +450,18 @@ async function runYtDlp(args, opts = {}) {
         return stdout;
       } catch (error) {
         lastError = error;
-        if (!isRetryableYoutubeError(error) && i === 0) throw error;
+        const msg = String(error.message || error).toLowerCase();
+        // غير المدرج / خاص / عمر → كمّل على المحاولة التالية
+        const keepTrying = isRetryableYoutubeError(error)
+          || msg.includes('private')
+          || msg.includes('unlisted')
+          || msg.includes('sign in')
+          || msg.includes('login required')
+          || msg.includes('confirm your age')
+          || msg.includes('age')
+          || msg.includes('not available')
+          || msg.includes('requested format is not available');
+        if (!keepTrying && i === 0) throw error;
         if (i < attempts.length - 1) log.warn(`yt-dlp fallback ${i + 1}: ${String(error.message || error).split('\n')[0]}`);
       }
     }
@@ -565,11 +587,15 @@ async function getVideoInfo(videoId) {
     const again = infoCache.get(key);
     if (again) return again;
 
+    // كوكيز + clients متعددة → تشتغل مع غير المدرج والعمر
     const stdout = await runYtDlp([
       '--dump-json', '--no-playlist',
-      '--extractor-args', 'youtube:player_client=default,web_safari',
       `https://www.youtube.com/watch?v=${videoId}`
-    ]);
+    ], {
+      timeout: 60000,
+      useCookies: cookiesReady,
+      allowCookieFallback: true
+    });
     const info = JSON.parse(stdout);
     infoCache.set(key, info, CACHE_TTL.info);
     return info;
@@ -588,7 +614,12 @@ async function getFormatUrls(videoId, formatSelector) {
     const stdout = await runYtDlp([
       '--get-url', '--no-playlist', '-f', formatSelector,
       `https://www.youtube.com/watch?v=${videoId}`
-    ], { timeout: 45000, lane: 'stream', useCookies: cookiesReady, allowCookieFallback: true });
+    ], {
+      timeout: 50000,
+      lane: 'stream',
+      useCookies: true, // مهم لغير المدرج
+      allowCookieFallback: true
+    });
 
     const urls = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
     if (!urls.length) throw new Error('No stream URL returned');
@@ -1024,22 +1055,33 @@ async function getHomeFeed(region = 'EG', perSection = 12) {
  */
 async function getChannelTab(channelId, tab, limit = 30) {
   const safeTab = ['playlists', 'streams', 'live'].includes(tab) ? (tab === 'live' ? 'streams' : tab) : 'videos';
-  const url = `https://www.youtube.com/channel/${channelId}/${safeTab}`;
+  // يدعم UC... أو @handle
+  const base = String(channelId).startsWith('UC')
+    ? `https://www.youtube.com/channel/${channelId}`
+    : (String(channelId).startsWith('@')
+      ? `https://www.youtube.com/${channelId}`
+      : `https://www.youtube.com/channel/${channelId}`);
+  const url = `${base}/${safeTab}`;
   const stdout = await runYtDlp([
     '--flat-playlist', '--dump-single-json',
     '--playlist-end', String(Math.min(Math.max(limit, 1), 100)),
     url
-  ]);
+  ], { useCookies: cookiesReady, allowCookieFallback: true, timeout: 60000 });
   const data = JSON.parse(stdout);
-  const entries = (data.entries || []).map(e => ({
-    ...mapFlatEntry(e),
-    playlistId: e.id || null,
-    playlistTitle: e.title || null,
-    itemCount: e.playlist_count || e.n_entries || null,
-    isLive: !!e.is_live,
-    wasLive: !!e.was_live,
-    liveStatus: e.live_status || null
-  })).filter(Boolean);
+  const entries = (data.entries || []).map(e => {
+    const mapped = mapFlatEntry(e);
+    if (!mapped) return null;
+    return {
+      ...mapped,
+      playlistId: e.id || null,
+      playlistTitle: e.title || null,
+      itemCount: e.playlist_count || e.n_entries || null,
+      isLive: !!e.is_live || e.live_status === 'is_live',
+      wasLive: !!e.was_live || e.live_status === 'was_live',
+      liveStatus: e.live_status || (e.is_live ? 'is_live' : null),
+      concurrentViewers: e.concurrent_view_count || e.view_count || null
+    };
+  }).filter(Boolean);
   return {
     channel: {
       id: data.channel_id || channelId,
@@ -1546,15 +1588,38 @@ app.get('/channel', async (req, res) => {
   if (!channelId) {
     return res.status(400).json({
       error: 'channel id مطلوب',
-      example: '/channel?id=UCxxxxxxxx&limit=20&page=1'
+      example: '/channel?id=UCxxxxxxxx&limit=20&page=1&tab=videos|streams|playlists'
     });
   }
 
   try {
     const pageNum = Math.max(1, parseInt(req.query.page, 10) || 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+    const tab = String(req.query.tab || 'videos').toLowerCase();
     const needed = pageNum * pageSize;
     const poolSize = Math.min(Math.max(needed, pageSize * 2), 100);
+
+    // تبويب البث المباشر / القوائم
+    if (tab === 'streams' || tab === 'live' || tab === 'playlists') {
+      const dataCacheKey = `channel_tab_${channelId}_${tab}_${poolSize}`;
+      let data = channelCache.get(dataCacheKey);
+      if (!data) {
+        data = await getChannelTab(channelId, tab === 'live' ? 'streams' : tab, poolSize);
+        channelCache.set(dataCacheKey, data, tab === 'streams' || tab === 'live' ? 60 * 1000 : CACHE_TTL.channel);
+      }
+      const start = (pageNum - 1) * pageSize;
+      const items = (data.entries || []).slice(start, start + pageSize);
+      return res.json({
+        channel: data.channel,
+        tab: tab === 'live' ? 'streams' : tab,
+        page: pageNum,
+        limit: pageSize,
+        count: items.length,
+        hasMore: (data.entries || []).length > start + pageSize,
+        videos: items,
+        streams: tab === 'streams' || tab === 'live' ? items : undefined
+      });
+    }
 
     const dataCacheKey = `channel_${channelId}_${poolSize}`;
     let data = channelCache.get(dataCacheKey);
@@ -1568,7 +1633,7 @@ app.get('/channel', async (req, res) => {
     const hasMore = data.videos.length > start + pageSize;
 
     log.success(`✅ Channel done: ${channelId} page ${pageNum} (${videos.length} نتيجة)`);
-    res.json({ channel: data.channel, page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
+    res.json({ channel: data.channel, tab: 'videos', page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
   } catch (error) {
     log.error(`Error fetching channel: ${error.message}`);
     res.status(500).json({
@@ -1604,23 +1669,46 @@ app.get('/channel/playlists', async (req, res) => {
 });
 
 /**
- * GET /channel/streams?id=CHANNEL_ID&limit=30&page=1
- * Returns live streams and past/upcoming live broadcasts from the channel.
+ * GET /channel/streams?id=CHANNEL_ID&limit=30&page=1&status=all|live|upcoming|past
+ * بثوث القناة: مباشر الآن / قادم / سابق
  */
 app.get('/channel/streams', async (req, res) => {
   const channelId = String(req.query.id || '');
-  if (!channelId) return res.status(400).json({ error: 'channel id مطلوب' });
+  if (!channelId) {
+    return res.status(400).json({
+      error: 'channel id مطلوب',
+      example: '/channel/streams?id=UCxxxxx&status=live'
+    });
+  }
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 50);
-  const key = `channel-streams:${channelId}:${page}:${limit}`;
+  const status = String(req.query.status || 'all').toLowerCase();
+  const key = `channel-streams:${channelId}:${page}:${limit}:${status}`;
   const cached = channelCache.get(key);
   if (cached) return res.json(cached);
   try {
-    const data = await getChannelTab(channelId, 'streams', Math.min(page * limit, 100));
+    const data = await getChannelTab(channelId, 'streams', Math.min(Math.max(page * limit, 40), 100));
+    let list = data.entries || [];
+    if (status === 'live') {
+      list = list.filter(v => v.isLive || v.liveStatus === 'is_live');
+    } else if (status === 'upcoming') {
+      list = list.filter(v => v.liveStatus === 'is_upcoming');
+    } else if (status === 'past') {
+      list = list.filter(v => v.wasLive || v.liveStatus === 'was_live' || (!v.isLive && v.liveStatus !== 'is_upcoming'));
+    }
     const start = (page - 1) * limit;
-    const results = data.entries.slice(start, start + limit);
-    const out = { channel: data.channel, page, limit, count: results.length, hasMore: data.entries.length > start + limit, streams: results };
-    channelCache.set(key, out, CACHE_TTL.channel);
+    const results = list.slice(start, start + limit);
+    const out = {
+      channel: data.channel,
+      page,
+      limit,
+      status,
+      count: results.length,
+      liveNow: list.filter(v => v.isLive || v.liveStatus === 'is_live').length,
+      hasMore: list.length > start + limit,
+      streams: results
+    };
+    channelCache.set(key, out, 60 * 1000); // لايفات: كاش دقيقة
     res.json(out);
   } catch (error) {
     log.error(`Error fetching channel streams: ${error.message}`);
@@ -1712,8 +1800,8 @@ async function getFastStreamUrl(videoId) {
 }
 
 /**
- * يجيب رابط بث لجودة محددة: 240 أو 360 أو 480 فقط (progressive).
- * كل ارتفاع ليه selector مختلف عشان الروابط تبقى مختلفة فعليًا.
+ * رابط بث لجودة محددة — progressive أولًا (صوت+صورة)،
+ * ولو مفيش: نختار format_id من الميتاداتا لنفس الارتفاع.
  */
 async function getQualityStreamUrl(videoId, height) {
   const h = clampQualityHeight(height);
@@ -1725,45 +1813,42 @@ async function getQualityStreamUrl(videoId, height) {
     const again = streamCache.get(key);
     if (again) return again;
 
-    // selectors مفصولة لكل جودة عشان 240 ≠ 360 ≠ 480
-    let selector;
-    if (h === 240) {
-      selector = [
-        'best[height=240][acodec!=none][vcodec!=none]',
-        'best[height<=240][acodec!=none][vcodec!=none]',
-        'worst[acodec!=none][vcodec!=none]'
-      ].join('/');
-    } else if (h === 480) {
-      selector = [
-        'best[height=480][acodec!=none][vcodec!=none]',
-        'best[height<=480][height>=400][acodec!=none][vcodec!=none]',
-        'best[height<=480][acodec!=none][vcodec!=none]',
-        'best[height<=360][acodec!=none][vcodec!=none]'
-      ].join('/');
-    } else {
-      // 360 default
-      selector = [
-        'best[height=360][acodec!=none][vcodec!=none]',
-        'best[height<=360][height>=300][acodec!=none][vcodec!=none]',
-        'best[height<=360][acodec!=none][vcodec!=none]',
-        'best[height<=480][acodec!=none][vcodec!=none]'
-      ].join('/');
+    // 1) من الميتاداتا: format_id progressive الدقيق لنفس الارتفاع
+    try {
+      const info = await getVideoInfo(videoId);
+      const prog = chooseProgressiveFormat(info, h);
+      if (prog?.formatId) {
+        const urls = await getFormatUrls(videoId, prog.formatId);
+        if (urls[0]) {
+          const out = {
+            url: urls[0],
+            actualHeight: prog.actualHeight,
+            requestedHeight: h,
+            mode: 'progressive',
+            formatId: prog.formatId
+          };
+          streamCache.set(key, out, CACHE_TTL.stream);
+          return out;
+        }
+      }
+    } catch (e) {
+      log.warn(`quality meta ${h}p: ${String(e.message || e).split('\n')[0]}`);
     }
+
+    // 2) selector yt-dlp مربوط بالارتفاع (كل جودة string مختلف)
+    const lo = Math.max(144, h - 40);
+    const selector = [
+      `best[height=${h}][acodec!=none][vcodec!=none]`,
+      `best[height<=${h}][height>=${lo}][acodec!=none][vcodec!=none]`,
+      `best[height<=${h}][acodec!=none][vcodec!=none]`,
+      `b[height<=${h}]/w`
+    ].join('/');
 
     const urls = await getFormatUrls(videoId, selector);
     const url = urls[0];
     if (!url) throw new Error(`No stream for ${h}p`);
 
-    let actualHeight = h;
-    try {
-      const info = infoCache.get(`raw_info_${videoId}`);
-      if (info) {
-        const prog = chooseProgressiveFormat(info, h);
-        if (prog) actualHeight = clampQualityHeight(prog.actualHeight);
-      }
-    } catch {}
-
-    const out = { url, actualHeight, requestedHeight: h, mode: 'progressive' };
+    const out = { url, actualHeight: h, requestedHeight: h, mode: 'progressive-selector' };
     streamCache.set(key, out, CACHE_TTL.stream);
     return out;
   });
@@ -1921,21 +2006,27 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
 // - progressive بنفس الارتفاع = تشغيل مباشر وأسرع.
 // - video-only + audio = ffmpeg فقط عند الحاجة.
 // ==========================================================================
-// الجودات المدعومة فقط: 240 / 360 / 480
-const SUPPORTED_QUALITIES = [240, 360, 480];
+// كل الجودات الشائعة — التشغيل الحقيقي يعتمد على اللي متاح progressive أو ffmpeg
+const SUPPORTED_QUALITIES = [144, 240, 360, 480, 720, 1080];
 const QUALITY_ALIASES = {
-  '480': 480, '360': 360, '240': 240,
-  '2160': 480, '4k': 480, '1440': 480, '2k': 480,
-  '1080': 480, '720': 480, '144': 240,
-  'low': 240, 'medium': 360, 'high': 480
+  '144': 144, '240': 240, '360': 360, '480': 480, '720': 720, '1080': 1080,
+  '2160': 1080, '4k': 1080, '1440': 1080, '2k': 1080,
+  'low': 240, 'medium': 360, 'high': 720, 'hd': 720, 'fullhd': 1080
 };
 
 function clampQualityHeight(height) {
   const h = Number(height);
   if (!h || Number.isNaN(h)) return 360;
-  if (h <= 240) return 240;
-  if (h <= 360) return 360;
-  return 480;
+  // قرّب لأقرب جودة مدعومة
+  let best = SUPPORTED_QUALITIES[0];
+  let bestDiff = Math.abs(h - best);
+  for (const q of SUPPORTED_QUALITIES) {
+    const d = Math.abs(h - q);
+    if (d < bestDiff) { best = q; bestDiff = d; }
+  }
+  // لو أعلى من 1080 قفل على 1080
+  if (h >= 1080) return 1080;
+  return best;
 }
 
 function resolveQuality(quality) {
@@ -2550,7 +2641,7 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v8_${videoId}`;
+  const cacheKey = `qualities_v9_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -2561,19 +2652,23 @@ app.get('/video/qualities', async (req, res) => {
         .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
         .map(f => Number(f.height))
         .filter(Number.isFinite)
-    )];
+    )].sort((a, b) => b - a);
+    const allHeights = getAvailableQualities(info);
+    const hasFfmpeg = commandExists('ffmpeg');
 
-    // بس 240 / 360 / 480
     const qualities = SUPPORTED_QUALITIES.map(h => {
-      const available = progressiveHeights.some(ph => ph === h) ||
-        progressiveHeights.some(ph => ph <= h && ph >= h - 120);
+      const exactProg = progressiveHeights.includes(h);
+      const nearProg = progressiveHeights.find(ph => ph <= h && ph >= h - 80);
+      const hasAny = allHeights.includes(h) || exactProg || nearProg;
+      const playable = exactProg || !!nearProg || hasFfmpeg;
       return {
         label: `${h}p`,
         quality: String(h),
         height: h,
-        type: 'progressive',
-        playable: true,
-        available,
+        type: exactProg || nearProg ? 'progressive' : 'needs-ffmpeg',
+        playable,
+        available: !!hasAny,
+        actualProgressive: nearProg || (exactProg ? h : null),
         url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
     });
@@ -2583,6 +2678,7 @@ app.get('/video/qualities', async (req, res) => {
       quality: 'audio',
       type: 'audio',
       playable: true,
+      available: true,
       url: `/video?v=${encodeURIComponent(videoId)}&quality=audio`
     });
 
@@ -2591,8 +2687,13 @@ app.get('/video/qualities', async (req, res) => {
       title: info.title,
       count: qualities.length,
       supported: SUPPORTED_QUALITIES,
+      progressiveHeights,
+      allHeights,
+      ffmpegReady: hasFfmpeg,
       qualities,
-      note: 'الجودات المدعومة: 240p و 360p و 480p فقط.'
+      note: hasFfmpeg
+        ? 'كل الجودات قابلة للتشغيل (progressive أو دمج ffmpeg).'
+        : 'الجودات progressive تشتغل فورًا بارتفاعات مختلفة. الجودات الأعلى من غير progressive تحتاج ffmpeg على السيرفر.'
     };
 
     infoCache.set(cacheKey, result, CACHE_TTL.info);
