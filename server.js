@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '11.0.0-ULTRA-SPEED';
+const SERVER_VERSION = '12.0.0-TITAN-ACCOUNT';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -302,6 +302,8 @@ async function refreshCookies() {
   }
 }
 refreshCookies();
+// تحديث الكوكيز من Firebase كل 5 دقايق في الخلفية
+setInterval(() => { refreshCookies().catch(() => {}); }, 5 * 60 * 1000);
 
 
 // Check if yt-dlp is installed
@@ -1226,6 +1228,37 @@ app.get('/related', async (req, res) => {
 });
 
 /**
+ * GET /comments?v=VIDEO_ID&limit=50
+ * تعليقات حقيقية من يوتيوب (Top comments)
+ */
+app.get('/comments', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({
+      error: 'Video ID مطلوب وصحيح (11 حرف)',
+      example: '/comments?v=dQw4w9WgXcQ&limit=50'
+    });
+  }
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+  const key = `comments:${videoId}:${limit}`;
+  const cached = infoCache.get(key);
+  if (cached) return res.json(cached);
+  try {
+    const comments = await getVideoComments(videoId, limit);
+    const out = { id: videoId, count: comments.length, comments };
+    infoCache.set(key, out, 10 * 60 * 1000);
+    log.success(`✅ Comments done: ${videoId} (${comments.length})`);
+    res.json(out);
+  } catch (error) {
+    log.error(`Error fetching comments: ${error.message}`);
+    res.status(500).json({
+      error: 'تعذّر جلب التعليقات',
+      details: NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
  * GET /channel?id=CHANNEL_ID&limit=20&page=1
  */
 app.get('/channel', async (req, res) => {
@@ -1820,11 +1853,10 @@ app.get('/video', async (req, res) => {
     const useProxy = ['1', 'true', 'yes'].includes(String(req.query.proxy || '').toLowerCase());
     const resolved = resolveQuality(quality);
 
-    // Fastest mode: browser downloads directly from YouTube CDN.
-    // Add ?proxy=1 when you specifically need the server to proxy the bytes.
-    // 🔒 كل التشغيل تحويل مباشر لجوجل بجودة ثابتة (360p/240p)،
-    // وبيتجاهل quality / proxy / merge — السيرفر مبيمرّرش فيديو أبدًا.
-    if (!probe) {
+    // Fastest default: direct CDN redirect at ~360p (no server bandwidth).
+    // When quality= is explicitly requested, use the full quality-aware path.
+    // ?proxy=1 forces the server to stream the bytes; ?merge=1 forces ffmpeg.
+    if (!probe && !resolved) {
       return getDirectStreamRedirect(req, res, videoId);
     }
 
@@ -2165,10 +2197,13 @@ app.get('/health', (req, res) => {
 
 /**
  * POST /api/update-cookies
+ * محمي بـ ADMIN_SECRET لو موجود
  */
 app.post('/api/update-cookies', async (req, res) => {
   try {
-    // بدون أي تحقق (باسورد/مفتاح) — بناءً على طلب صاحب المشروع
+    if (!isAdminAuthorized(req)) {
+      return res.status(401).json({ error: 'غير مصرح — أرسل X-Admin-Key أو ?key=' });
+    }
     let cookies = req.body;
     if (cookies && typeof cookies === 'object') cookies = cookies.cookies || cookies.value || '';
 
@@ -2253,58 +2288,138 @@ app.post('/api/update-cookies', async (req, res) => {
 
 
 /**
- * GET /cookies  — لوحة تحكم تحديث الكوكيز (بدون باسورد)
+ * GET /admin  /cookies  /cookies-panel
+ * لوحة أدمن كاملة: تحديث الكوكيز + حالة السيرفر + تنظيف الكاش
+ * الحماية: لو ADMIN_SECRET موجود في الـ env لازم تبعتها في ?key= أو header X-Admin-Key
  */
-app.get(['/cookies', '/cookies-panel'], (req, res) => {
+const ADMIN_SECRET = process.env.ADMIN_SECRET || process.env.CACHE_ADMIN_SECRET || '';
+
+function isAdminAuthorized(req) {
+  if (!ADMIN_SECRET) return true; // مفتوح لو مفيش سر
+  const key = req.query.key || req.get('x-admin-key') || req.get('x-cache-admin-key') || '';
+  return key === ADMIN_SECRET;
+}
+
+app.get(['/admin', '/cookies', '/cookies-panel'], (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(401).send(`<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>دخول الأدمن</title>
+<style>body{margin:0;font-family:system-ui;background:#0f1115;color:#e8e8e8;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{background:#181b22;border:1px solid #2a2f3a;border-radius:14px;padding:24px;max-width:360px;width:90%}
+input{width:100%;padding:12px;border-radius:10px;border:1px solid #2a2f3a;background:#0f1115;color:#fff;margin:12px 0}
+button{width:100%;padding:12px;border:0;border-radius:10px;background:#e11d48;color:#fff;font-weight:600;cursor:pointer}</style></head>
+<body><div class="card"><h2>🔒 لوحة الأدمن</h2><p style="opacity:.8;font-size:14px">أدخل مفتاح ADMIN_SECRET</p>
+<form method="GET"><input name="key" type="password" placeholder="المفتاح السري" autofocus required>
+<button type="submit">دخول</button></form></div></body></html>`);
+  }
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  const keyQ = ADMIN_SECRET ? `?key=${encodeURIComponent(req.query.key || '')}` : '';
   res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>لوحة تحديث الكوكيز</title>
+<title>لوحة أدمن السيرفر — TITAN</title>
 <style>
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,'Segoe UI',Tahoma,sans-serif;background:#0f1115;color:#e8e8e8;padding:16px}
-.card{max-width:720px;margin:0 auto;background:#181b22;border:1px solid #2a2f3a;border-radius:14px;padding:18px}
-h1{font-size:20px;margin:0 0 12px}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,'Segoe UI',Tahoma,sans-serif;background:#0b0d12;color:#e8e8e8;padding:16px}
+.wrap{max-width:900px;margin:0 auto}
+.card{background:#151821;border:1px solid #2a2f3a;border-radius:14px;padding:18px;margin-bottom:16px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:0 0 12px;color:#94a3b8}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px}
+.stat{background:#0f1115;border-radius:10px;padding:12px;text-align:center}
+.stat b{display:block;font-size:18px;color:#4ade80}.stat span{font-size:12px;opacity:.7}
 .status{padding:10px 12px;border-radius:10px;background:#20242d;margin-bottom:12px;font-size:14px}
-textarea{width:100%;height:260px;background:#0f1115;color:#e8e8e8;border:1px solid #2a2f3a;border-radius:10px;padding:10px;font-family:monospace;font-size:12px;direction:ltr;resize:vertical}
+textarea{width:100%;height:220px;background:#0f1115;color:#e8e8e8;border:1px solid #2a2f3a;border-radius:10px;padding:10px;font-family:monospace;font-size:12px;direction:ltr;resize:vertical}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-button,label.btn{flex:1;min-width:120px;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;text-align:center}
+button,label.btn{flex:1;min-width:110px;padding:12px;border:0;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;text-align:center}
 #save{background:#e11d48;color:#fff}#file{display:none}label.btn{background:#2a2f3a;color:#fff}
-#clear{background:#20242d;color:#e8e8e8}
+#clear,#refresh,#clearCache{background:#20242d;color:#e8e8e8}
 #msg{margin-top:12px;font-size:14px;min-height:20px}
 .ok{color:#4ade80}.err{color:#f87171}
-</style></head><body><div class="card">
-<h1>🍪 لوحة تحديث كوكيز يوتيوب</h1>
-<div class="status" id="status">جاري فحص الحالة...</div>
-<textarea id="ta" placeholder="الصق محتوى cookies.txt (صيغة Netscape) هنا..."></textarea>
+a{color:#60a5fa;text-decoration:none}
+.links a{display:inline-block;margin:4px 8px 4px 0;padding:6px 10px;background:#20242d;border-radius:8px;font-size:13px}
+</style></head><body><div class="wrap">
+<div class="card">
+<h1>🛡️ لوحة أدمن TITAN v${SERVER_VERSION}</h1>
+<p style="opacity:.7;margin:0 0 12px;font-size:13px">إدارة الكوكيز • حالة السيرفر • تنظيف الكاش</p>
+<div class="grid" id="stats">
+  <div class="stat"><b id="s-cookies">…</b><span>الكوكيز</span></div>
+  <div class="stat"><b id="s-ytdlp">…</b><span>yt-dlp</span></div>
+  <div class="stat"><b id="s-ffmpeg">…</b><span>ffmpeg</span></div>
+  <div class="stat"><b id="s-uptime">…</b><span>Uptime</span></div>
+</div>
+<div class="status" id="status">جاري تحميل الحالة...</div>
+</div>
+
+<div class="card">
+<h2>🍪 تحديث كوكيز يوتيوب (Netscape cookies.txt)</h2>
+<textarea id="ta" placeholder="الصق محتوى cookies.txt هنا أو ارفع الملف..."></textarea>
 <div class="row">
 <button id="save">💾 حفظ وتحديث</button>
 <label class="btn" for="file">📂 اختيار ملف</label><input type="file" id="file" accept=".txt,text/plain">
 <button id="clear">مسح</button>
+<button id="refresh">🔄 تحديث الحالة</button>
 </div>
-<div id="msg"></div></div>
+<div id="msg"></div>
+</div>
+
+<div class="card">
+<h2>🧰 صيانة</h2>
+<div class="row">
+<button id="clearCache">🧹 تنظيف كل الكاش</button>
+</div>
+<div class="links" style="margin-top:14px">
+<a href="/health" target="_blank">/health</a>
+<a href="/api/performance" target="_blank">/api/performance</a>
+<a href="/api/maintenance" target="_blank">/api/maintenance</a>
+<a href="/api/diagnostics" target="_blank">/api/diagnostics</a>
+<a href="/" target="_blank">قائمة الـ Endpoints</a>
+</div>
+</div>
+</div>
 <script>
+const KEY = ${JSON.stringify(req.query.key || '')};
+const authHeaders = KEY ? {'X-Admin-Key': KEY} : {};
 const $=id=>document.getElementById(id);
-async function status(){
-  try{const r=await fetch('/api/cookies-status');const d=await r.json();
-    $('status').textContent=d.status+(d.length?' — '+d.length+' بايت':'');
-  }catch(e){$('status').textContent='❌ تعذر فحص الحالة'}
+function fmtUptime(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h+'س '+m+'د'}
+async function loadHealth(){
+  try{
+    const [h,c] = await Promise.all([
+      fetch('/health').then(r=>r.json()),
+      fetch('/api/cookies-status').then(r=>r.json())
+    ]);
+    $('s-cookies').textContent = c.hasCookies ? '✅' : '❌';
+    $('s-ytdlp').textContent = h.ytdlpReady ? '✅' : '❌';
+    $('s-ffmpeg').textContent = h.ffmpegReady ? '✅' : '❌';
+    $('s-uptime').textContent = fmtUptime(h.uptime||0);
+    $('status').textContent = (c.status||'') + (c.length ? ' — '+c.length+' بايت' : '') + ' | v'+ (h.version||'');
+  }catch(e){$('status').textContent='❌ تعذر فحص الحالة: '+e.message}
 }
 $('file').onchange=async e=>{const f=e.target.files[0];if(f)$('ta').value=await f.text()};
 $('clear').onclick=()=>{$('ta').value='';$('msg').textContent=''};
+$('refresh').onclick=loadHealth;
 $('save').onclick=async()=>{
   const v=$('ta').value.trim();
   if(!v){$('msg').className='err';$('msg').textContent='الصق الكوكيز الأول';return}
   $('save').disabled=true;$('msg').className='';$('msg').textContent='جاري الحفظ...';
   try{
-    const r=await fetch('/api/update-cookies',{method:'POST',headers:{'Content-Type':'text/plain; charset=utf-8'},body:v});
+    const r=await fetch('/api/update-cookies',{method:'POST',headers:{'Content-Type':'text/plain; charset=utf-8',...authHeaders},body:v});
     const d=await r.json();
     if(r.ok){$('msg').className='ok';$('msg').textContent=d.message||'تم ✅'}
     else{$('msg').className='err';$('msg').textContent=d.error||'فشل'}
   }catch(e){$('msg').className='err';$('msg').textContent='خطأ اتصال: '+e.message}
-  $('save').disabled=false;status();
+  $('save').disabled=false;loadHealth();
 };
-status();
+$('clearCache').onclick=async()=>{
+  if(!confirm('تنظيف كل كاش الـ RAM؟'))return;
+  try{
+    const r=await fetch('/api/cache/clear',{method:'POST',headers:authHeaders});
+    const d=await r.json();
+    $('msg').className=r.ok?'ok':'err';
+    $('msg').textContent=d.message||d.error||JSON.stringify(d);
+  }catch(e){$('msg').className='err';$('msg').textContent=e.message}
+};
+loadHealth();
+setInterval(loadHealth,30000);
 </script></body></html>`);
 });
 
@@ -2324,7 +2439,7 @@ app.get('/api/cookies-status', async (req, res) => {
  */
 app.get('/', (req, res) => {
   res.json({
-    name: '🎬 srver v10.0.0 TITAN Maintenance - YouTube media server',
+    name: '🎬 srver TITAN ACCOUNT — YouTube-like media server (live, subscriptions, history, playlists, comments, qualities)',
     version: SERVER_VERSION,
     environment: NODE_ENV,
     recommended: '/trending?region=EG&seed=dQw4w9WgXcQ',
@@ -2345,6 +2460,7 @@ app.get('/', (req, res) => {
       formats: '/formats?v=VIDEO_ID',
       search: '/search?q=QUERY&limit=20&page=1',
       related: '/related?v=VIDEO_ID&limit=10&page=1',
+      comments: '/comments?v=VIDEO_ID&limit=50',
       channel: '/channel?id=CHANNEL_ID&limit=20&page=1',
       channelPlaylists: '/channel/playlists?id=CHANNEL_ID&limit=30&page=1',
       channelStreams: '/channel/streams?id=CHANNEL_ID&limit=30&page=1',
@@ -2369,10 +2485,11 @@ app.get('/', (req, res) => {
       meChannels: '/api/me/channels',
       meLive: '/api/me/live',
       liveNow: '/api/live?q=QUERY&limit=20&page=1',
-      cookiesPanel: '/cookies',
+      recommendations: '/recommendations?region=EG&page=1&limit=20',
+      adminPanel: '/admin (أو /cookies) — لوحة أدمن الكوكيز والحالة',
       cookiesStatus: '/api/cookies-status',
       testAll: '/api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw',
-      clearCache: 'POST /api/cache/clear (requires CACHE_ADMIN_SECRET)'
+      clearCache: 'POST /api/cache/clear (يتطلب ADMIN_SECRET)'
     },
     videoQualityValues: 'يتم اكتشاف كل الارتفاعات الحقيقية تلقائيًا عبر /video/qualities',
     pagination: 'كل endpoints البحث/الترند/related/channel بترجع page و limit و hasMore — استخدمهم لعمل infinite scroll',
@@ -2482,10 +2599,8 @@ app.get('/api/maintenance', (req, res) => {
 });
 
 app.post('/api/cache/clear', (req, res) => {
-  const secret = process.env.CACHE_ADMIN_SECRET || '';
-  const provided = req.get('x-cache-admin-key') || '';
-  if (!secret || provided !== secret) {
-    return res.status(401).json({ error: 'غير مصرح' });
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: 'غير مصرح — أرسل X-Admin-Key أو ?key=' });
   }
 
   infoCache.clear();
@@ -2699,9 +2814,9 @@ app.get('/recommendations', async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 40);
   const seeds = parseSeedIds(req.query.seed || req.query.seeds || req.query.history);
   const poolSize = Math.min(Math.max(page * limit, 40), 80);
+  const started = Date.now();
 
   try {
-    const started = Date.now();
     const data = await getRecommendedVideos(region, poolSize, seeds);
     const start = (page - 1) * limit;
     const results = data.items.slice(start, start + limit);
@@ -2928,6 +3043,7 @@ app.get('/api/test-all', async (req, res) => {
     ['formats', `/formats?v=${encodeURIComponent(videoId)}`],
     ['video-qualities', `/video/qualities?v=${encodeURIComponent(videoId)}`],
     ['related', `/related?v=${encodeURIComponent(videoId)}&limit=3&page=1`],
+    ['comments', `/comments?v=${encodeURIComponent(videoId)}&limit=5`],
     ['channel', `/channel?id=${encodeURIComponent(channelId)}&limit=3&page=1`],
     ['video-probe', `/video?v=${encodeURIComponent(videoId)}&format=best&probe=1`],
     ['video-1080-probe', `/video?v=${encodeURIComponent(videoId)}&quality=1080&probe=1`],
