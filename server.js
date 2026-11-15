@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '14.0.2-STABLE';
+const SERVER_VERSION = '14.0.4-STREAM-DURATION';
 
 const BEAST_API_REFERENCE = 'TITAN BEAST API reference: see /api/beast/docs and /api/beast/runbook';
 
@@ -2312,45 +2312,64 @@ function getAvailableQualities(info) {
   )].sort((a, b) => b - a);
 }
 
+/**
+ * دمج video+audio عبر ffmpeg ببث مستمر.
+ * - مدة الفيديو تتمرر للعميل (X-Video-Duration)
+ * - headers يوتيوب + reconnect عشان الروابط متقطعش في النص
+ * - MPEG-TS أكثر ثباتًا للبث الحي من frag-mp4 (المدة كانت بتبدأ 5 ثواني)
+ */
 function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
-  const inputArgs = [
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  const commonIn = [
     '-user_agent', UA,
+    '-headers', 'Referer: https://www.youtube.com\r\nOrigin: https://www.youtube.com\r\n',
     '-reconnect', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_at_eof', '1',
-    '-reconnect_delay_max', '2',
-    '-rw_timeout', '12000000',
-    '-i', videoUrl
+    '-reconnect_on_network_error', '1',
+    '-reconnect_on_http_error', '4xx,5xx',
+    '-reconnect_delay_max', '5',
+    '-rw_timeout', '30000000',
+    '-timeout', '30000000'
   ];
 
-  if (audioUrl) inputArgs.push(
-    '-user_agent', UA,
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_at_eof', '1',
-    '-reconnect_delay_max', '2',
-    '-rw_timeout', '12000000',
-    '-i', audioUrl
-  );
+  const inputArgs = [...commonIn, '-i', videoUrl];
+  if (audioUrl) inputArgs.push(...commonIn, '-i', audioUrl);
 
+  const dur = Number(duration) > 0 ? Number(duration) : 0;
+  // MPEG-TS: بث خطي ثابت — مفيش مدة وهمية 5 ثواني زي frag-mp4، والتقطيع أقل
   const args = [
-    '-loglevel', 'warning',
+    '-loglevel', 'error',
     '-hide_banner',
     '-nostdin',
+    '-fflags', '+genpts+igndts+discardcorrupt',
+    '-err_detect', 'ignore_err',
     ...inputArgs,
     '-map', '0:v:0',
     ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
     '-c', 'copy',
-    '-avoid_negative_ts', 'make_zero',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-f', 'mp4', 'pipe:1'
+    '-copyts',
+    '-start_at_zero',
+    '-muxdelay', '0',
+    '-muxpreload', '0',
+    '-max_interleave_delta', '0',
+    '-max_muxing_queue_size', '9999',
+    ...(dur > 0 ? ['-t', String(dur)] : []),
+    '-f', 'mpegts',
+    'pipe:1'
   ];
 
-  res.status(200);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Cache-Control', 'no-store');
-  if (Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
+  if (!res.headersSent) {
+    res.status(200);
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Accept-Ranges', 'none');
+    res.setHeader('X-Stream-Format', 'mpegts');
+    if (dur > 0) {
+      res.setHeader('X-Video-Duration', String(dur));
+      // تلميح للمشغّلات (بعضها يقرأها)
+      res.setHeader('X-Content-Duration', String(dur));
+    }
+  }
 
   const ff = spawn(ffmpegBin || 'ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderrBuf = '';
@@ -2378,6 +2397,63 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
     }
   });
   req.on('close', cleanup);
+}
+
+/**
+ * دمج عبر yt-dlp نفسه (stdout) — غالبًا أثبت من فتح رابطين يدويًا
+ * yt-dlp يدير ffmpeg داخليًا ويعيد المحاولة عند انقطاع يوتيوب
+ */
+function streamMergedViaYtDlp(req, res, videoId, height, duration = 0) {
+  const h = Number(height) || 360;
+  const selector =
+    `bv*[height=${h}]+ba/bv*[height<=${h}][height>=${Math.max(144, h - 80)}]+ba/` +
+    `b[height<=${h}]/b`;
+
+  const args = [
+    '--no-warnings',
+    '--no-progress',
+    '--no-part',
+    '--no-cache-dir',
+    '-f', selector,
+    '-o', '-',
+    '--merge-output-format', 'mp4',
+    '--geo-bypass'
+  ];
+  if (detectNodeRuntime()) args.push('--js-runtimes', 'node');
+  if (cookiesReady) args.push('--cookies', COOKIES_PATH);
+  args.push(
+    '--extractor-args', 'youtube:player_client=tv_samsung,tv,android_sdkless,web_embedded',
+    `https://www.youtube.com/watch?v=${videoId}`
+  );
+
+  if (!res.headersSent) {
+    res.status(200);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Accept-Ranges', 'none');
+    res.setHeader('X-Stream-Mode', 'ytdlp-merge');
+    res.setHeader('X-Video-Quality', `${h}p`);
+    if (Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
+  }
+
+  const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let errBuf = '';
+  child.stderr.on('data', d => {
+    errBuf += d.toString();
+    if (errBuf.length > 4000) errBuf = errBuf.slice(-4000);
+  });
+  child.stdout.pipe(res);
+  const kill = () => { try { if (!child.killed) child.kill('SIGKILL'); } catch {} };
+  child.on('error', e => {
+    log.error(`yt-dlp merge spawn: ${e.message}`);
+    kill();
+    if (!res.headersSent) res.status(500).json({ error: 'تعذّر دمج الجودة' });
+  });
+  child.on('close', code => {
+    if (code && code !== 0) log.warn(`yt-dlp merge exit ${code}: ${errBuf.slice(-400)}`);
+  });
+  req.on('close', kill);
+  res.on('close', kill);
 }
 
 app.get('/video/source', async (req, res) => {
@@ -2474,8 +2550,6 @@ app.get('/video', async (req, res) => {
   }
 
   try {
-    // Explicit quality requires full format metadata. The default path does not.
-    const videoDuration = 0;
     // Probe mode: resolve the stream without sending the video bytes.
     const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
     // الافتراضي الآن: السيرفر يعمل proxy للفيديو (مش redirect لجوجل).
@@ -2483,12 +2557,20 @@ app.get('/video', async (req, res) => {
     const wantDirect = ['1', 'true', 'yes'].includes(String(req.query.direct || '').toLowerCase());
     const resolved = resolveQuality(quality);
 
+    // مدة حقيقية من الميتاداتا — كانت 0 وده كان بيخلي المشغّل يبان 5 ثواني ويزيد
+    let videoDuration = 0;
+    try {
+      const meta = await getVideoInfo(videoId);
+      videoDuration = Number(meta.duration) || 0;
+    } catch {}
+
     // المسار الافتراضي السريع: proxy عبر السيرفر بجودة ~360p progressive.
     if (!probe && !resolved) {
       if (wantDirect) return getDirectStreamRedirect(req, res, videoId);
       const streamUrl = await getFastStreamUrl(videoId);
       res.setHeader('X-Stream-Mode', 'proxy-fast');
       res.setHeader('X-Video-Quality', '360p');
+      if (videoDuration > 0) res.setHeader('X-Video-Duration', String(videoDuration));
       recordPerf('video-default', Date.now() - requestStartedAt, true);
       return streamFromUpstream(req, res, streamUrl, 0, videoDuration);
     }
@@ -2498,6 +2580,7 @@ app.get('/video', async (req, res) => {
       if (probe) return res.json({ probe: true, id: videoId, type: 'audio', resolved: true, urlLength: String(urls[0] || '').length });
       if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: 'audio' });
       res.setHeader('X-Stream-Mode', 'proxy-audio');
+      if (videoDuration > 0) res.setHeader('X-Video-Duration', String(videoDuration));
       return streamFromUpstream(req, res, urls[0], 0, videoDuration);
     }
 
@@ -2552,19 +2635,32 @@ app.get('/video', async (req, res) => {
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
       }
 
-      // رابطين = فيديو + صوت → ffmpeg
-      if (urls.length >= 2) {
-        if (!okFf) throw new Error('الجودة دي محتاجة دمج ffmpeg — مش متاح على السيرفر');
-        res.setHeader('X-Video-Quality', `${h}p`);
-        res.setHeader('X-Requested-Quality', `${h}p`);
-        res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
+      // رابطين أو مفيش progressive → دمج
+      // 1) yt-dlp stdout (أثبت للمدة الكاملة)  2) ffmpeg يدوي
+      if (urls.length >= 2 || urls.length === 0) {
         if (probe) {
           return res.json({
             probe: true, id: videoId, type: 'video',
-            requestedQuality: h, actualQuality: h, mode: 'ffmpeg', resolved: true
+            requestedQuality: h, actualQuality: h,
+            mode: okFf ? 'merge' : 'unavailable',
+            duration: videoDuration || null,
+            resolved: true
           });
         }
+        res.setHeader('X-Video-Quality', `${h}p`);
+        res.setHeader('X-Requested-Quality', `${h}p`);
+        if (videoDuration > 0) res.setHeader('X-Video-Duration', String(videoDuration));
         recordPerf('video-quality', Date.now() - requestStartedAt, true);
+
+        // مسار yt-dlp (يفضّل) — بيبني الملف كامل للآخر
+        try {
+          return streamMergedViaYtDlp(req, res, videoId, h, videoDuration);
+        } catch (e) {
+          log.warn(`yt-dlp merge fail: ${String(e.message || e).split('\n')[0]}`);
+        }
+
+        if (!okFf || urls.length < 2) throw new Error('الجودة دي محتاجة دمج ومش متاح حاليًا');
+        res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
         return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
       }
 
@@ -2575,16 +2671,23 @@ app.get('/video', async (req, res) => {
         const u = await getFormatUrls(videoId, selected.videoFormatId);
         res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
         res.setHeader('X-Requested-Quality', `${h}p`);
-        if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', resolved: true });
+        if (videoDuration > 0) res.setHeader('X-Video-Duration', String(videoDuration));
+        if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', duration: videoDuration || null, resolved: true });
         if (wantDirect) return redirectToCdn(res, u[0], { mode: 'direct-cdn', quality: selected.actualHeight });
         return streamFromUpstream(req, res, u[0], 0, videoDuration);
       }
+      if (probe) {
+        return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'merge', duration: videoDuration || null, resolved: true });
+      }
+      if (videoDuration > 0) res.setHeader('X-Video-Duration', String(videoDuration));
+      try {
+        return streamMergedViaYtDlp(req, res, videoId, selected.actualHeight || h, videoDuration);
+      } catch {}
       if (!okFf) throw new Error(`مفيش مصدر لـ ${h}p`);
       const u2 = await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`);
       if (u2.length < 2) throw new Error('Could not resolve video/audio URLs');
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
       res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
-      if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true });
       return streamMergedViaFfmpeg(req, res, u2[0], u2[1], videoDuration);
     }
 
@@ -3812,20 +3915,6 @@ app.get('/api/live', async (req, res) => {
   }
 });
 
-// 404
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint غير موجود', path: req.path });
-});
-
-// Error handler
-app.use((err, req, res, next) => {
-  log.error(`Unhandled error: ${err.message}`);
-  res.status(500).json({
-    error: 'خطأ في السيرفر',
-    details: NODE_ENV === 'development' ? err.message : undefined
-  });
-});
-
 // ==========================================================================
 // 🧪 TITAN ENDPOINT TEST SUITE
 // GET /api/test-all?v=dQw4w9WgXcQ&channel=UCuAXFkgsw1L7xaCfnd5JJOw
@@ -4923,6 +5012,19 @@ END
 
 app.get('/api/beast/reference', (_req, res) => {
   res.type('text/plain; charset=utf-8').send(typeof BEAST_API_REFERENCE === 'string' ? BEAST_API_REFERENCE : 'missing');
+});
+
+// 404 + Error handlers MUST be last (after all routes including BEAST layer)
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint غير موجود', path: req.path });
+});
+
+app.use((err, req, res, next) => {
+  log.error(`Unhandled error: ${err.message}`);
+  res.status(500).json({
+    error: 'خطأ في السيرفر',
+    details: NODE_ENV === 'development' ? err.message : undefined
+  });
 });
 
 // Start server
