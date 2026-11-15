@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.4.0-MULTI-QUALITY-FFMPEG';
+const SERVER_VERSION = '13.4.1-FULL-FORMATS';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -645,26 +645,51 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
  * الحصول على معلومات الفيديو الكاملة
  */
 async function getVideoInfo(videoId) {
-  const key = `raw_info_${videoId}`;
+  // كاش جديد عشان منرجّعش formats ناقصة (كانت بترجع 360 بس)
+  const key = `raw_info_v2_${videoId}`;
   const cached = infoCache.get(key);
-  if (cached) return cached;
+  if (cached && Array.isArray(cached.formats) && cached.formats.length > 3) return cached;
 
   return dedupe(key, async () => {
     const again = infoCache.get(key);
-    if (again) return again;
+    if (again && Array.isArray(again.formats) && again.formats.length > 3) return again;
 
-    // كوكيز + clients متعددة → تشتغل مع غير المدرج والعمر
-    const stdout = await runYtDlp([
-      '--dump-json', '--no-playlist',
-      `https://www.youtube.com/watch?v=${videoId}`
-    ], {
-      timeout: 60000,
-      useCookies: cookiesReady,
-      allowCookieFallback: true
-    });
-    const info = JSON.parse(stdout);
-    infoCache.set(key, info, CACHE_TTL.info);
-    return info;
+    // android/ios/tv بيرجعوا adaptive (144→1080) — web لوحده غالبًا format 18 فقط
+    const clients = ['android,web', 'ios,web', 'tv,android,web', 'web'];
+    let best = null;
+    let lastErr = null;
+    for (const client of clients) {
+      try {
+        const stdout = await runYtDlp([
+          '--dump-json', '--no-playlist',
+          '--extractor-args', `youtube:player_client=${client}`,
+          `https://www.youtube.com/watch?v=${videoId}`
+        ], {
+          timeout: 55000,
+          useCookies: cookiesReady,
+          allowCookieFallback: true
+        });
+        const info = JSON.parse(stdout);
+        const n = (info.formats || []).length;
+        log.info(`📦 formats via ${client}: ${n}`);
+        if (!best || n > (best.formats || []).length) best = info;
+        const heights = new Set(
+          (info.formats || [])
+            .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none')
+            .map(f => Number(f.height))
+        );
+        if (heights.size >= 3 || n >= 8) {
+          best = info;
+          break;
+        }
+      } catch (e) {
+        lastErr = e;
+        log.warn(`getVideoInfo client ${client} failed: ${String(e.message || e).split('\n')[0]}`);
+      }
+    }
+    if (!best) throw lastErr || new Error('Failed to fetch video info');
+    infoCache.set(key, best, CACHE_TTL.info);
+    return best;
   });
 }
 
