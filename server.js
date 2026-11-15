@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.3.0-REAL-FMT-STREAMS';
+const SERVER_VERSION = '13.4.0-MULTI-QUALITY-FFMPEG';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -376,10 +376,76 @@ function sanitizeFilename(name) {
  * بيدي كل request مكانه في الطابور (semaphore) بدل ما يبوّظ السيرفر كله.
  */
 const commandCache = new Map();
+const pathMod = require('path');
+const FFMPEG_LOCAL = pathMod.join(__dirname, '.bin', 'ffmpeg');
+let ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+
 function commandExists(command) {
+  if (command === 'ffmpeg') {
+    if (commandCache.has('ffmpeg')) return commandCache.get('ffmpeg');
+    // جرّب المسار المحلي أولًا
+    for (const cand of [ffmpegBin, FFMPEG_LOCAL, 'ffmpeg']) {
+      try {
+        require('child_process').execFileSync(cand, ['-version'], { stdio: 'ignore', timeout: 5000 });
+        ffmpegBin = cand;
+        commandCache.set('ffmpeg', true);
+        return true;
+      } catch {}
+    }
+    commandCache.set('ffmpeg', false);
+    return false;
+  }
   if (commandCache.has(command)) return commandCache.get(command);
   try { require('child_process').execFileSync(command, ['--version'], { stdio: 'ignore' }); commandCache.set(command, true); return true; }
   catch { commandCache.set(command, false); return false; }
+}
+
+/** تحميل ffmpeg static لو مش موجود (مهم لـ 144/240/480/720 الحقيقية على Railway) */
+async function ensureFfmpeg() {
+  if (commandExists('ffmpeg')) return true;
+  try {
+    const dir = pathMod.dirname(FFMPEG_LOCAL);
+    fs.mkdirSync(dir, { recursive: true });
+    const urls = [
+      'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-x64',
+      'https://cdn.jsdelivr.net/npm/@ffmpeg-installer/linux-x64@4.1.0/ffmpeg'
+    ];
+    for (const url of urls) {
+      try {
+        log.info(`⬇️  Downloading ffmpeg from ${url.split('/').slice(-2).join('/')}...`);
+        await new Promise((resolve, reject) => {
+          const file = fs.createWriteStream(FFMPEG_LOCAL);
+          const get = (u, redirects = 0) => {
+            https.get(u, { timeout: 120000 }, (res) => {
+              if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects < 5) {
+                res.resume();
+                return get(res.headers.location, redirects + 1);
+              }
+              if (res.statusCode !== 200) {
+                res.resume();
+                return reject(new Error('HTTP ' + res.statusCode));
+              }
+              res.pipe(file);
+              file.on('finish', () => file.close(resolve));
+            }).on('error', reject);
+          };
+          get(url);
+        });
+        fs.chmodSync(FFMPEG_LOCAL, 0o755);
+        commandCache.delete('ffmpeg');
+        if (commandExists('ffmpeg')) {
+          log.success(`✅ ffmpeg ready at ${ffmpegBin}`);
+          return true;
+        }
+      } catch (e) {
+        log.warn(`ffmpeg download failed: ${String(e.message || e).split('\n')[0]}`);
+        try { fs.unlinkSync(FFMPEG_LOCAL); } catch {}
+      }
+    }
+  } catch (e) {
+    log.warn(`ensureFfmpeg: ${e.message}`);
+  }
+  return false;
 }
 
 function isRetryableYoutubeError(error) {
@@ -552,9 +618,9 @@ function filterUnwanted(items) {
  * عشان السكرول اللانهائي (infinite scroll) يقدر يكمّل يجيب صفحات جديدة
  * من غير ما يعيد طلب yt-dlp لنفس البيانات القديمة تاني.
  */
-async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, maxPool = 150, ttl = CACHE_TTL.search) {
+async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, maxPool = 200, ttl = CACHE_TTL.search) {
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
-  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 30);
+  const pageSize = Math.min(Math.max(parseInt(limit, 10) || 24, 1), 50);
   const needed = pageNum * pageSize;
   const poolSize = Math.min(Math.max(needed, pageSize * 2), maxPool);
   const cacheKey = `${cacheKeyBase}_${poolSize}`;
@@ -673,7 +739,7 @@ async function searchVideos(query, limit = 10, options = {}) {
  * جلب الفيديوهات المقترحة/ذات الصلة (related) لفيديو معين
  * بيستخدم playlist المكسات التلقائية اللي يوتيوب بيولدها (RD + videoId)
  */
-async function getRelatedVideos(videoId, limit = 10) {
+async function getRelatedVideos(videoId, limit = 40) {
   const key = `related:${videoId}:${limit}`;
   const cached = infoCache.get(key); if (cached) return cached;
   return dedupe(key, async () => {
@@ -682,11 +748,15 @@ async function getRelatedVideos(videoId, limit = 10) {
     try { title = String((await getVideoInfo(videoId)).title || '').replace(/[|]/g, ' ').trim(); } catch {}
     const sources = [];
     try {
-      const stdout = await runYtDlp(['--dump-json','--flat-playlist','--yes-playlist','--playlist-end',String(Math.max(limit * 3, 20)),`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`]);
+      const stdout = await runYtDlp([
+        '--dump-json', '--flat-playlist', '--yes-playlist',
+        '--playlist-end', String(Math.min(Math.max(limit * 2, 50), 100)),
+        `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`
+      ], { useCookies: cookiesReady, allowCookieFallback: true, timeout: 45000 });
       sources.push(parseFlatItems(stdout, videoId));
     } catch (e) { log.warn(`Related RD failed: ${e.message}`); }
     if (sources.flat().length < limit && title) {
-      try { sources.push(await searchVideos(title, Math.max(limit * 3, 20))); } catch (e) { log.warn(`Related title search failed: ${e.message}`); }
+      try { sources.push(await searchVideos(title, Math.min(Math.max(limit, 40), 80))); } catch (e) { log.warn(`Related title search failed: ${e.message}`); }
     }
     const seen = new Set([videoId]); const final = [];
     for (const item of sources.flat()) {
@@ -1191,16 +1261,22 @@ async function searchLive(query = 'بث مباشر', limit = 30) {
  * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن
  */
 async function getVideoComments(videoId, limit = 50) {
-  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+  log.info(`💬 Fetching comments: ${videoId} (limit ${safeLimit})`);
+  // أسرع: max_comments أقل + player_skip يقلل شغل إضافي
   const args = [
-    '--skip-download', '--dump-json', '--write-comments',
-    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},all,all,${limit}`,
+    '--skip-download', '--dump-json', '--write-comments', '--no-check-certificates',
+    '--extractor-args', `youtube:player_client=web;comment_sort=top;max_comments=${safeLimit},0,0,0`,
     `https://www.youtube.com/watch?v=${videoId}`
   ];
-  const stdout = await runYtDlp(args, { timeout: 45000 });
+  const stdout = await runYtDlp(args, {
+    timeout: 28000,
+    useCookies: cookiesReady,
+    allowCookieFallback: true
+  });
   const lines = stdout.trim().split('\n').filter(Boolean);
   const data = JSON.parse(lines[lines.length - 1]);
-  return (data.comments || []).slice(0, limit).map(c => ({
+  return (data.comments || []).slice(0, safeLimit).map(c => ({
     id: c.id,
     author: c.author || 'مستخدم يوتيوب',
     authorThumbnail: c.author_thumbnail || '',
@@ -1340,7 +1416,7 @@ app.get('/related', async (req, res) => {
     const { page, limit, results, hasMore } = await getPaginatedPool(
       infoCache, `related_${videoId}`,
       (poolSize) => getRelatedVideos(videoId, poolSize),
-      req.query.page, req.query.limit, 60
+      req.query.page, req.query.limit || 40, 120
     );
     log.success(`✅ Related done: ${videoId} page ${page} (${results.length} نتيجة)`);
     res.json({ id: videoId, page, limit, count: results.length, hasMore, results });
@@ -1372,7 +1448,7 @@ app.get('/comments', async (req, res) => {
   try {
     const comments = await getVideoComments(videoId, limit);
     const out = { id: videoId, count: comments.length, comments };
-    infoCache.set(key, out, 10 * 60 * 1000);
+    infoCache.set(key, out, 25 * 60 * 1000); // كاش أطول = تعليقات أسرع في الطلبات التالية
     log.success(`✅ Comments done: ${videoId} (${comments.length})`);
     res.json(out);
   } catch (error) {
@@ -1864,11 +1940,11 @@ function pickProgressiveForHeight(info, requestedHeight) {
 }
 
 /**
- * رابط بث من format_id الحقيقي فقط — 144≠240≠360≠720 لما يكونوا progressive
+ * progressive فقط لو الارتفاع مطابق تمامًا — مش نسقط 240→360
  */
 async function getQualityStreamUrl(videoId, height) {
   const h = clampQualityHeight(height);
-  const key = `qurl_v2:${videoId}:${h}`;
+  const key = `qurl_v3:${videoId}:${h}`;
   const cached = streamCache.get(key);
   if (cached) return cached;
 
@@ -1877,22 +1953,23 @@ async function getQualityStreamUrl(videoId, height) {
     if (again) return again;
 
     const info = await getVideoInfo(videoId);
-    const pick = pickProgressiveForHeight(info, h);
-    if (!pick?.formatId) throw new Error(`No progressive format for ${h}p`);
+    const map = buildProgressiveMap(info);
+    const exact = map.get(h);
+    if (!exact) throw new Error(`No exact progressive ${h}p`);
 
-    const urls = await getFormatUrls(videoId, pick.formatId);
-    if (!urls[0]) throw new Error(`No URL for format ${pick.formatId}`);
+    const urls = await getFormatUrls(videoId, String(exact.format_id));
+    if (!urls[0]) throw new Error(`No URL for format ${exact.format_id}`);
 
     const out = {
       url: urls[0],
-      actualHeight: pick.actualHeight,
+      actualHeight: h,
       requestedHeight: h,
       mode: 'progressive',
-      formatId: pick.formatId,
-      ext: pick.format?.ext || null
+      formatId: String(exact.format_id),
+      ext: exact.ext || null
     };
     streamCache.set(key, out, CACHE_TTL.stream);
-    log.success(`🎬 quality ${h}p → ${pick.actualHeight}p (fmt ${pick.formatId})`);
+    log.success(`🎬 exact progressive ${h}p (fmt ${exact.format_id})`);
     return out;
   });
 }
@@ -2189,7 +2266,7 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
   res.setHeader('Cache-Control', 'no-store');
   if (Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
 
-  const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ff = spawn(ffmpegBin || 'ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderrBuf = '';
 
   ff.stderr.on('data', d => {
@@ -2339,51 +2416,46 @@ app.get('/video', async (req, res) => {
     }
 
     if (resolved?.type === 'video') {
-      const forceMerge = ['1', 'true', 'yes'].includes(String(req.query.merge || '').toLowerCase());
-      const hasFfmpeg = commandExists('ffmpeg');
+      const h = resolved.height;
 
-      // 1) المسار الأساسي: progressive بصيغة مربوطة بالارتفاع المطلوب
-      //    ده اللي بيخلي 144p ≠ 360p ≠ 720p فعليًا بدون ffmpeg.
-      if (!forceMerge || !hasFfmpeg) {
-        try {
-          const q = await getQualityStreamUrl(videoId, resolved.height);
-          res.setHeader('X-Video-Quality', `${q.actualHeight}p`);
-          res.setHeader('X-Requested-Quality', `${resolved.height}p`);
+      // 1) progressive بنفس الارتفاع بالظبط (مش سقوط لـ 360)
+      try {
+        const q = await getQualityStreamUrl(videoId, h);
+        if (q.actualHeight === h) {
+          res.setHeader('X-Video-Quality', `${h}p`);
+          res.setHeader('X-Requested-Quality', `${h}p`);
           res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-quality');
+          res.setHeader('X-Format-Id', q.formatId || '');
           if (probe) {
             return res.json({
-              probe: true,
-              id: videoId,
-              type: 'video',
-              requestedQuality: resolved.height,
-              actualQuality: q.actualHeight,
-              mode: 'progressive',
-              resolved: true,
-              urlLength: String(q.url || '').length
+              probe: true, id: videoId, type: 'video',
+              requestedQuality: h, actualQuality: h, mode: 'progressive',
+              formatId: q.formatId, resolved: true
             });
           }
           recordPerf('video-quality', Date.now() - requestStartedAt, true);
-          if (wantDirect) return redirectToCdn(res, q.url, { mode: 'direct-cdn', quality: q.actualHeight });
+          if (wantDirect) return redirectToCdn(res, q.url, { mode: 'direct-cdn', quality: h });
           return streamFromUpstream(req, res, q.url, 0, videoDuration);
-        } catch (e) {
-          log.warn(`progressive quality ${resolved.height}p failed: ${String(e.message || e).split('\n')[0]}`);
         }
+      } catch (e) {
+        log.info(`no exact progressive ${h}p — will merge adaptive`);
       }
 
-      // 2) دمج video+audio عبر ffmpeg للجودات العالية لو متاح ومطلوب
-      if (!hasFfmpeg) {
-        throw new Error('الجودة دي محتاجة ffmpeg مش موجود على السيرفر');
+      // 2) video-only + audio عبر ffmpeg (144/240/480/720/1080 الحقيقية)
+      const okFf = await ensureFfmpeg();
+      if (!okFf) {
+        throw new Error('مفيش progressive بالارتفاع ده وffmpeg مش متاح — أعد تشغيل السيرفر بعد رفع النسخة دي');
       }
 
       const info = await getVideoInfo(videoId);
-      const selected = chooseQualityFormats(info, resolved.height);
+      const selected = chooseQualityFormats(info, h);
 
       if (selected.mode === 'direct') {
         const urls = await getFormatUrls(videoId, selected.videoFormatId);
         res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
-        res.setHeader('X-Requested-Quality', `${resolved.height}p`);
+        res.setHeader('X-Requested-Quality', `${h}p`);
         res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-quality');
-        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'direct', resolved: true, urlLength: String(urls[0] || '').length });
+        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', resolved: true });
         recordPerf('video-quality', Date.now() - requestStartedAt, true);
         if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: selected.actualHeight });
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
@@ -2393,9 +2465,15 @@ app.get('/video', async (req, res) => {
       if (urls.length < 2) throw new Error('Could not resolve video/audio URLs');
 
       res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
-      res.setHeader('X-Requested-Quality', `${resolved.height}p`);
-      res.setHeader('X-Stream-Mode', 'ffmpeg');
-      if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: quality, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true, videoUrlLength: String(urls[0] || '').length, audioUrlLength: String(urls[1] || '').length });
+      res.setHeader('X-Requested-Quality', `${h}p`);
+      res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
+      if (probe) {
+        return res.json({
+          probe: true, id: videoId, type: 'video',
+          requestedQuality: h, actualQuality: selected.actualHeight,
+          mode: 'ffmpeg', videoFormatId: selected.videoFormatId, audioFormatId: selected.audioFormatId
+        });
+      }
       recordPerf('video-quality', Date.now() - requestStartedAt, true);
       return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
     }
@@ -2679,7 +2757,7 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v10_${videoId}`;
+  const cacheKey = `qualities_v11_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -2688,42 +2766,38 @@ app.get('/video/qualities', async (req, res) => {
     const progMap = buildProgressiveMap(info);
     const progressiveHeights = [...progMap.keys()].sort((a, b) => b - a);
     const allHeights = getAvailableQualities(info);
+    // نعتبر ffmpeg متاح أو هيتحمل تلقائي عند أول طلب
     const hasFfmpeg = commandExists('ffmpeg');
 
-    // نعرض الجودات اللي ليها ملف progressive مختلف فعليًا
-    const qualities = progressiveHeights.map(h => {
-      const f = progMap.get(h);
+    const heightSet = new Set([
+      ...SUPPORTED_QUALITIES.filter(h => allHeights.includes(h) || progressiveHeights.includes(h)),
+      ...progressiveHeights.filter(h => SUPPORTED_QUALITIES.includes(h) || h <= 1080)
+    ]);
+
+    const qualities = [...heightSet].sort((a, b) => b - a).map(h => {
+      const prog = progMap.get(h);
+      if (prog) {
+        return {
+          label: `${h}p`,
+          quality: String(h),
+          height: h,
+          type: 'progressive',
+          playable: true,
+          available: true,
+          formatId: String(prog.format_id),
+          url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
+        };
+      }
       return {
         label: `${h}p`,
         quality: String(h),
         height: h,
-        type: 'progressive',
+        type: 'adaptive+ffmpeg',
         playable: true,
-        available: true,
-        formatId: String(f.format_id),
-        ext: f.ext || null,
-        bitrate: f.tbr || f.vbr || null,
+        available: allHeights.includes(h),
         url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
     });
-
-    // لو ffmpeg موجود نضيف ارتفاعات adaptive الناقصة
-    if (hasFfmpeg) {
-      for (const h of SUPPORTED_QUALITIES) {
-        if (progressiveHeights.includes(h)) continue;
-        if (!allHeights.includes(h)) continue;
-        qualities.push({
-          label: `${h}p`,
-          quality: String(h),
-          height: h,
-          type: 'merged-ffmpeg',
-          playable: true,
-          available: true,
-          url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}&merge=1`
-        });
-      }
-      qualities.sort((a, b) => b.height - a.height);
-    }
 
     qualities.push({
       label: '🎧 صوت فقط',
@@ -2742,9 +2816,7 @@ app.get('/video/qualities', async (req, res) => {
       allHeights,
       ffmpegReady: hasFfmpeg,
       qualities,
-      note: progressiveHeights.length
-        ? `جودات progressive حقيقية متاحة: ${progressiveHeights.map(h => h + 'p').join(', ')}`
-        : 'مفيش progressive — فعّل ffmpeg للجودات العالية'
+      note: 'progressive = ملف واحد. adaptive+ffmpeg = دمج video+audio لنفس الارتفاع المطلوب (144/240/480...)'
     };
 
     infoCache.set(cacheKey, result, CACHE_TTL.info);
@@ -3714,6 +3786,11 @@ function summarizeTestBody(body) {
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
+  // حضّر ffmpeg في الخلفية عشان 144/240/480 تشتغل من أول طلبات الجودات
+  ensureFfmpeg().then(ok => {
+    if (ok) log.success('✅ ffmpeg available for multi-quality merge');
+    else log.warn('⚠️  ffmpeg not available — only exact progressive heights will differ');
+  }).catch(() => {});
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 66000;
   server.requestTimeout = 0;
