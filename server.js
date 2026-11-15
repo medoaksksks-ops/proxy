@@ -16,7 +16,272 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.4.1-FULL-FORMATS';
+const SERVER_VERSION = '14.0.0-BEAST';
+
+const BEAST_API_REFERENCE = String.raw`# TITAN BEAST Complete API Reference
+Version bound at runtime via SERVER_VERSION.
+
+## Philosophy
+This server is not YouTube. It is a control plane in front of yt-dlp + optional ffmpeg,
+with aggressive caching so that *repeat* views feel fast. Cold starts will never match
+Google's edge CDN; warm + direct mode can feel close for playback.
+
+## Authentication surfaces
+- Public metadata/search/stream: no auth
+- /api/me/* : Netscape cookies on disk (Firebase optional sync)
+- /admin and cookie mutation: ADMIN_SECRET header/query when configured
+
+## Playback contract
+Client should:
+1) GET /api/warmup?v=ID (fire-and-forget is OK)
+2) GET /video/qualities?v=ID  (build quality menu)
+3) GET /video?v=ID&quality=Q   or &direct=1 for CDN redirect
+4) On 403/410 refresh via /video/refresh?v=ID then retry
+
+Probe without downloading:
+  GET /video?v=ID&quality=480&probe=1
+  -> { requestedQuality, actualQuality, mode: progressive|ffmpeg|direct }
+
+## Format extraction (2026)
+Preferred player clients (in order):
+  tv_samsung, tv, android_sdkless, web_embedded, visionos, web_safari
+Avoid relying on web/mweb alone; they often expose only itag 18 (360p progressive)
+unless a PO token provider is configured.
+
+JS runtime:
+  --js-runtimes node   (required on Node hosts; Deno preferred upstream)
+
+## Caching
+MemoryTTLCache with stale-while-revalidate for:
+  search, related, channel, info, stream URLs, comments
+Clear: POST /api/cache/clear
+Inspect: GET /api/cache-summary , GET /api/performance
+
+## Concurrency
+Semaphore lanes:
+  meta  (yt-dlp dump/search)   env YTDLP_META_CONCURRENCY
+  stream (get-url / proxy)     env STREAM_CONCURRENCY
+Never stampede the same video: dedupe(key, fn)
+
+## Error taxonomy
+- 400 validation (bad video id, missing q)
+- 403/401 cookie / bot walls from YouTube
+- 502 upstream empty formats
+- 504 upstream timeout
+Headers of interest: X-Video-Quality, X-Stream-Mode, X-Request-ID
+
+## Frontend packages
+ /app  - full browse UI (mega feed, search, player, related)
+ /p    - single-video player with quality buttons
+ /embed - bare video tag
+
+## Batch helpers
+ /api/batch/info?ids=a,b,c
+ /api/batch/related?ids=a,b&limit=40
+ /api/beast/prefetch-list  POST {ids:[...]}
+
+## Channel streams
+ /channel/streams?id=UC...&status=all|live|upcoming|past
+ Merges official streams tab + was_live videos so older livestreams appear.
+
+## Security notes
+- This proxy can expose Google stream URLs; treat ADMIN_SECRET seriously
+- Do not log cookie values
+- CORS is open (*) by design for flexible frontends; tighten for production brands
+
+## Scaling beyond one Railway box
+- Put a CDN in front of metadata JSON (short TTL)
+- Prefer direct=1 for media bytes
+- Shard yt-dlp workers if meta concurrency saturates
+- Keep cookies fresh with the 5-minute Firebase refresh loop
+
+## Acceptance checks after deploy
+curl -s /health | grep ffmpegReady
+curl -s /formats?v=dQw4w9WgXcQ | grep -c height
+curl -s '/video?v=dQw4w9WgXcQ&quality=360&probe=1'
+curl -s /api/beast/status
+curl -s /app | head
+
+## Arabic quick tips
+- لو كل الجودات 360: افحص /formats — لو count=1 فالمشكلة استخراج مش اختيار
+- لو التعليقات بطيئة: أول طلب يبني كاش 25 دقيقة
+- لو غير المدرج مش شغال: كوكيز صالحة + client android/tv
+- للسرعة: warmup ثم direct=1
+- للخصوصية: proxy بدون direct
+
+## Environment checklist
+PORT=3000
+NODE_ENV=production
+ADMIN_SECRET=long-random
+FIREBASE_URL=https://xxx.firebaseio.com
+FFMPEG_PATH=/app/.bin/ffmpeg
+YTDLP_META_CONCURRENCY=8
+STREAM_CONCURRENCY=4
+
+
+## Endpoint matrix (extended)
+
+### Core media
+| Method | Path | Purpose |
+| GET | /video | Proxy or direct stream |
+| GET | /video/quick | Fast path |
+| GET | /video/source | JSON source URL |
+| GET | /video/refresh | Bust stream cache |
+| GET | /video/qualities | UI quality list |
+| GET | /video/ping | Liveness of stream path |
+| GET | /download | Attachment-style download |
+| GET | /thumb | Thumbnail proxy |
+
+### Catalog / discovery
+| GET | /home | Sectioned home |
+| GET | /trending | Trending pool |
+| GET | /search | Search + filters |
+| GET | /search/suggestions | Typeahead |
+| GET | /related | Related / RD mix |
+| GET | /recommendations | Seeded recommendations |
+| GET | /api/mega-feed | Parallel multi-rail feed |
+| GET | /api/shorts | Short-form filter |
+| GET | /api/live | Live search |
+
+### Knowledge
+| GET | /info | Rich metadata |
+| GET | /formats | Raw format table |
+| GET | /comments | Top comments |
+| GET | /captions | Caption tracks |
+| GET | /chapters | Chapter markers |
+| GET | /transcript | Timed transcript |
+| GET | /api/open-graph | Share card JSON |
+| GET | /api/quality-matrix | Height playability matrix |
+
+### Graph
+| GET | /channel | Channel videos / tabs |
+| GET | /channel/streams | Live + past streams |
+| GET | /channel/playlists | Channel playlists |
+| GET | /playlist | Playlist items |
+| GET | /resolve | URL → ids + links |
+
+### Account
+| GET | /api/me/history |
+| GET | /api/me/liked |
+| GET | /api/me/subscriptions |
+| GET | /api/me/recommended |
+| GET | /api/me/playlists |
+| GET | /api/me/playlist |
+| GET | /api/me/channels |
+| GET | /api/me/summary |
+| GET | /api/me/live |
+| GET | /api/account-feed |
+
+### Ops / admin
+| GET | /health |
+| GET | /api/beast/status |
+| GET | /api/beast/docs |
+| GET | /api/beast/catalog |
+| GET | /api/beast/runbook |
+| GET | /api/performance |
+| GET | /api/maintenance |
+| GET | /api/diagnostics |
+| GET | /api/video-debug |
+| GET | /api/test-all |
+| GET | /api/cookies-status |
+| GET | /api/cache-summary |
+| POST | /api/update-cookies |
+| POST | /api/cache/clear |
+| POST | /api/beast/prefetch-list |
+| GET | /admin |
+
+### Frontends shipped in-process
+| GET | /app | Browse + watch shell |
+| GET | /p | Focused player |
+| GET | /embed | Minimal embed |
+
+## Performance budgets (targets)
+- /health: < 50ms
+- cached /home: < 100ms
+- cold /info: 2–8s (yt-dlp)
+- /video progressive first byte: < 1.5s after warmup
+- /video ffmpeg merge first byte: 2–6s
+- /comments cold: 3–15s; warm: cache hit
+
+## Suggested client algorithm
+```
+async function play(id, preferred=360) {
+  warmup(id); // no await required
+  const q = await fetch('/video/qualities?v='+id).then(r=>r.json());
+  const pick = pickQuality(q, preferred);
+  const direct = shouldUseDirect();
+  video.src = `/video?v=${id}&quality=${pick}` + (direct?'&direct=1':'');
+}
+```
+
+## Cookie hygiene
+- Export from browser while logged into YouTube
+- Netscape format only (NOT raw request headers)
+- Rotate when streams start 403-ing en masse
+- Never commit cookies to git
+
+## FFmpeg notes
+ensureFfmpeg() downloads a static linux-x64 binary to .bin/ffmpeg when missing.
+Merge uses stream copy (-c copy) into fragmented mp4 for progressive download play.
+
+## Circuit / resilience
+- Multiple player clients per extraction
+- Retryable YouTube errors cascade across clients
+- Source breaker patterns for bad upstreams
+- Upstream keep-alive agent reuses TLS sessions
+
+## What "BEAST" means in this build
+- Full surface area for a YouTube-like client
+- Quality path that does not silently collapse everything to 360 when adaptive exists
+- Ops endpoints to debug live production
+- In-box UI (/app) so you can test without another repo
+- Runbooks and catalogs embedded for 3am incidents
+
+## License / responsibility
+Use of yt-dlp against YouTube ToS is the operator's responsibility.
+This server is a technical integration layer for personal/research deployments.
+`;
+
+
+
+/*
+═══════════════════════════════════════════════════════════════════════════════
+ TITAN BEAST — Operational Runbook (Arabic / Eng)
+───────────────────────────────────────────────────────────────────────────────
+ Deploy (Railway)
+   1) ارفع server.js + تأكد إن yt-dlp و node على الـ PATH
+   2) Env: PORT, ADMIN_SECRET, FIREBASE_URL (اختياري للكوكيز)
+   3) افتح /admin والصق cookies بصيغة Netscape
+   4) /health لازم يرجّع ffmpegReady + ytdlpReady + cookiesReady
+
+ Quality reality (2026 YouTube)
+   - Progressive (muxed A+V) غالبًا 360p فقط (format 18)
+   - 144/240/480/720/1080 = adaptive video-only + audio → ffmpeg merge
+   - Clients: tv_samsung, tv, android_sdkless, web_embedded, visionos
+   - بدون JS runtime (node) بعض الـ formats بتضيع
+   - فحص: /formats?v=ID و /api/quality-matrix?v=ID
+
+ Speed strategy
+   - أسرع تشغيل للمستخدم: /video?v=ID&direct=1  (CDN جوجل مباشر)
+   - أدق خصوصية: /video?v=ID  (proxy من السيرفر)
+   - قبل play: /api/warmup?v=ID
+   - واجهة جاهزة: /app  أو  /p?v=ID
+
+ Account features
+   - كوكيز Netscape من المتصفح (YouTube login)
+   - /api/me/history | liked | subscriptions | recommended | playlists | live
+
+ Troubleshooting
+   - كل الجودات 360: formats ناقصة → clients/js-runtime
+   - 403 على stream: كوكيز منتهية أو PO token
+   - بطء comments/related: أول طلب ثقيل، بعده كاش
+   - ffmpeg false: السيرفر بيحمّل static تلقائي عند الإقلاع
+
+ Key routes
+   /app /p /video /video/qualities /home /search /related /channel/streams
+   /api/mega-feed /api/warmup /api/beast/status /api/beast/docs /admin /health
+═══════════════════════════════════════════════════════════════════════════════
+*/
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -492,20 +757,24 @@ async function runYtDlp(args, opts = {}) {
 
     // ترتيب المحاولات: كوكيز أولًا لو متاحة (مهمة لغير المدرج / العمر / الخاص-بالرابط)،
     // بعدين clients متعددة عشان unlisted و age-gate يشتغلوا.
+    // 2026 stable: tv_samsung/tv/android_sdkless/visionos — web/mweb لوحدهم غالبًا format 18 فقط بدون PO token
+    const YT_CLIENTS_PRIMARY = 'youtube:player_client=tv_samsung,tv,android_sdkless,web_embedded';
+    const YT_CLIENTS_FALLBACK = 'youtube:player_client=tv,visionos,web_embedded,android';
+    const YT_CLIENTS_SAFARI = 'youtube:player_client=web_safari,mweb,tv';
     if (useCookies && cookiesReady) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_safari'], true);
+      pushAttempt(['--extractor-args', YT_CLIENTS_PRIMARY], true);
+      pushAttempt(['--extractor-args', YT_CLIENTS_FALLBACK], true);
+      pushAttempt(['--extractor-args', YT_CLIENTS_SAFARI], true);
       pushAttempt([], true);
     } else {
+      pushAttempt(['--extractor-args', YT_CLIENTS_PRIMARY]);
+      pushAttempt(['--extractor-args', YT_CLIENTS_FALLBACK]);
+      pushAttempt(['--extractor-args', YT_CLIENTS_SAFARI]);
       pushAttempt([]);
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web_safari']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded']);
     }
     if (allowCookieFallback && cookiesReady && !useCookies) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded,web'], true);
+      pushAttempt(['--extractor-args', YT_CLIENTS_PRIMARY], true);
+      pushAttempt(['--extractor-args', YT_CLIENTS_FALLBACK], true);
       pushAttempt([], true);
     }
 
@@ -645,46 +914,59 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
  * الحصول على معلومات الفيديو الكاملة
  */
 async function getVideoInfo(videoId) {
-  // كاش جديد عشان منرجّعش formats ناقصة (كانت بترجع 360 بس)
-  const key = `raw_info_v2_${videoId}`;
+  // v3: clients أحدث + منقبلش كاش ناقص (أقل من 5 formats)
+  const key = `raw_info_v3_${videoId}`;
   const cached = infoCache.get(key);
-  if (cached && Array.isArray(cached.formats) && cached.formats.length > 3) return cached;
+  if (cached && Array.isArray(cached.formats) && cached.formats.length >= 5) return cached;
 
   return dedupe(key, async () => {
     const again = infoCache.get(key);
-    if (again && Array.isArray(again.formats) && again.formats.length > 3) return again;
+    if (again && Array.isArray(again.formats) && again.formats.length >= 5) return again;
 
-    // android/ios/tv بيرجعوا adaptive (144→1080) — web لوحده غالبًا format 18 فقط
-    const clients = ['android,web', 'ios,web', 'tv,android,web', 'web'];
+    // أهم clients في أواخر 2026 لجلب adaptive بدون PO token
+    const clientTries = [
+      'tv_samsung,tv,android_sdkless',
+      'tv,android_sdkless,web_embedded',
+      'visionos,tv,web_embedded',
+      'android_sdkless,web_embedded',
+      'web_safari,tv',
+      'web'
+    ];
     let best = null;
     let lastErr = null;
-    for (const client of clients) {
+    for (const client of clientTries) {
       try {
-        const stdout = await runYtDlp([
-          '--dump-json', '--no-playlist',
+        const baseArgs = [
+          '--no-warnings', '--geo-bypass', '--dump-json', '--no-playlist',
           '--extractor-args', `youtube:player_client=${client}`,
           `https://www.youtube.com/watch?v=${videoId}`
-        ], {
+        ];
+        if (detectNodeRuntime()) baseArgs.splice(2, 0, '--js-runtimes', 'node');
+        if (cookiesReady) baseArgs.splice(2, 0, '--cookies', COOKIES_PATH);
+
+        const { stdout } = await execFileAsync('yt-dlp', baseArgs, {
           timeout: 55000,
-          useCookies: cookiesReady,
-          allowCookieFallback: true
+          maxBuffer: 1024 * 1024 * 16,
+          encoding: 'utf-8'
         });
         const info = JSON.parse(stdout);
         const n = (info.formats || []).length;
-        log.info(`📦 formats via ${client}: ${n}`);
+        const heights = [
+          ...new Set(
+            (info.formats || [])
+              .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none')
+              .map(f => Number(f.height))
+          )
+        ];
+        log.info(`📦 formats via ${client}: ${n} heights=[${heights.slice(0, 8).join(',')}]`);
         if (!best || n > (best.formats || []).length) best = info;
-        const heights = new Set(
-          (info.formats || [])
-            .filter(f => f && f.height && f.vcodec && f.vcodec !== 'none')
-            .map(f => Number(f.height))
-        );
-        if (heights.size >= 3 || n >= 8) {
+        if (heights.length >= 3 || n >= 10) {
           best = info;
           break;
         }
       } catch (e) {
         lastErr = e;
-        log.warn(`getVideoInfo client ${client} failed: ${String(e.message || e).split('\n')[0]}`);
+        log.warn(`getVideoInfo ${client}: ${String(e.message || e).split('\n')[0]}`);
       }
     }
     if (!best) throw lastErr || new Error('Failed to fetch video info');
@@ -2466,41 +2748,65 @@ app.get('/video', async (req, res) => {
         log.info(`no exact progressive ${h}p — will merge adaptive`);
       }
 
-      // 2) video-only + audio عبر ffmpeg (144/240/480/720/1080 الحقيقية)
+      // 2) اطلب الارتفاع من yt-dlp مباشرة (حتى لو الكاش كان ناقص)
+      //    bv* عند الارتفاع + أفضل صوت → رابطين للدمج
       const okFf = await ensureFfmpeg();
-      if (!okFf) {
-        throw new Error('مفيش progressive بالارتفاع ده وffmpeg مش متاح — أعد تشغيل السيرفر بعد رفع النسخة دي');
+      const heightSelector =
+        `bv*[height=${h}]+ba/bv*[height<=${h}][height>=${Math.max(144, h - 80)}]+ba/` +
+        `b[height=${h}]/b[height<=${h}]`;
+
+      let urls = [];
+      try {
+        urls = await getFormatUrls(videoId, heightSelector);
+      } catch (e) {
+        log.warn(`height selector ${h}p failed: ${String(e.message || e).split('\n')[0]}`);
       }
 
-      const info = await getVideoInfo(videoId);
-      const selected = chooseQualityFormats(info, h);
-
-      if (selected.mode === 'direct') {
-        const urls = await getFormatUrls(videoId, selected.videoFormatId);
-        res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
+      // مسار واحد (progressive) رجع من selector
+      if (urls.length === 1 && urls[0]) {
+        res.setHeader('X-Video-Quality', `${h}p`);
         res.setHeader('X-Requested-Quality', `${h}p`);
         res.setHeader('X-Stream-Mode', wantDirect ? 'direct-cdn' : 'proxy-quality');
-        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', resolved: true });
+        if (probe) return res.json({ probe: true, id: videoId, type: 'video', requestedQuality: h, actualQuality: h, mode: 'selector-single', resolved: true });
         recordPerf('video-quality', Date.now() - requestStartedAt, true);
-        if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: selected.actualHeight });
+        if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: h });
         return streamFromUpstream(req, res, urls[0], 0, videoDuration);
       }
 
-      const urls = await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`);
-      if (urls.length < 2) throw new Error('Could not resolve video/audio URLs');
-
-      res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
-      res.setHeader('X-Requested-Quality', `${h}p`);
-      res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
-      if (probe) {
-        return res.json({
-          probe: true, id: videoId, type: 'video',
-          requestedQuality: h, actualQuality: selected.actualHeight,
-          mode: 'ffmpeg', videoFormatId: selected.videoFormatId, audioFormatId: selected.audioFormatId
-        });
+      // رابطين = فيديو + صوت → ffmpeg
+      if (urls.length >= 2) {
+        if (!okFf) throw new Error('الجودة دي محتاجة دمج ffmpeg — مش متاح على السيرفر');
+        res.setHeader('X-Video-Quality', `${h}p`);
+        res.setHeader('X-Requested-Quality', `${h}p`);
+        res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
+        if (probe) {
+          return res.json({
+            probe: true, id: videoId, type: 'video',
+            requestedQuality: h, actualQuality: h, mode: 'ffmpeg', resolved: true
+          });
+        }
+        recordPerf('video-quality', Date.now() - requestStartedAt, true);
+        return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
       }
-      recordPerf('video-quality', Date.now() - requestStartedAt, true);
-      return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
+
+      // 3) آخر محاولة من metadata
+      const info = await getVideoInfo(videoId);
+      const selected = chooseQualityFormats(info, h);
+      if (selected.mode === 'direct') {
+        const u = await getFormatUrls(videoId, selected.videoFormatId);
+        res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
+        res.setHeader('X-Requested-Quality', `${h}p`);
+        if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', resolved: true });
+        if (wantDirect) return redirectToCdn(res, u[0], { mode: 'direct-cdn', quality: selected.actualHeight });
+        return streamFromUpstream(req, res, u[0], 0, videoDuration);
+      }
+      if (!okFf) throw new Error(`مفيش مصدر لـ ${h}p`);
+      const u2 = await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`);
+      if (u2.length < 2) throw new Error('Could not resolve video/audio URLs');
+      res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
+      res.setHeader('X-Stream-Mode', 'ffmpeg-merge');
+      if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true });
+      return streamMergedViaFfmpeg(req, res, u2[0], u2[1], videoDuration);
     }
 
     // Default = fastest direct progressive stream.
@@ -3808,6 +4114,1037 @@ function summarizeTestBody(body) {
   }
   return out;
 }
+
+// ==========================================================================
+// 🦖 TITAN BEAST LAYER — ميزات إضافية للنسخة الوحشية
+// ==========================================================================
+
+/** استخراج videoId من أي رابط يوتيوب */
+function extractVideoIdFromUrl(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  if (isValidVideoId(s)) return s;
+  try {
+    const u = new URL(s.startsWith('http') ? s : `https://${s}`);
+    if (u.hostname.includes('youtu.be')) {
+      const id = u.pathname.replace(/\//g, '');
+      return isValidVideoId(id) ? id : null;
+    }
+    if (u.hostname.includes('youtube.com') || u.hostname.includes('youtube-nocookie.com')) {
+      const v = u.searchParams.get('v');
+      if (v && isValidVideoId(v)) return v;
+      const m = u.pathname.match(/\/(shorts|embed|live|v)\/([a-zA-Z0-9_-]{11})/);
+      if (m && isValidVideoId(m[2])) return m[2];
+    }
+  } catch {}
+  const loose = s.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:[&?\s]|$)/);
+  return loose && isValidVideoId(loose[1]) ? loose[1] : null;
+}
+
+function extractChannelIdFromUrl(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  if (/^UC[\w-]{20,}$/.test(s)) return s;
+  if (s.startsWith('@')) return s;
+  try {
+    const u = new URL(s.startsWith('http') ? s : `https://${s}`);
+    const m = u.pathname.match(/\/channel\/(UC[\w-]{20,})/);
+    if (m) return m[1];
+    const h = u.pathname.match(/\/@([\w.-]+)/);
+    if (h) return `@${h[1]}`;
+  } catch {}
+  return null;
+}
+
+/**
+ * GET /resolve?url=https://youtu.be/xxx
+ * يحوّل أي رابط يوتيوب لـ videoId / channelId جاهز للـ API
+ */
+app.get('/resolve', (req, res) => {
+  const url = String(req.query.url || req.query.q || '');
+  if (!url) return res.status(400).json({ error: 'url مطلوب', example: '/resolve?url=https://youtu.be/dQw4w9WgXcQ' });
+  const videoId = extractVideoIdFromUrl(url);
+  const channelId = extractChannelIdFromUrl(url);
+  if (!videoId && !channelId) return res.status(400).json({ error: 'مش رابط يوتيوب معروف', url });
+  const out = { input: url, videoId, channelId };
+  if (videoId) {
+    out.links = {
+      info: `/info?v=${videoId}`,
+      video: `/video?v=${videoId}`,
+      quick: `/video/quick?v=${videoId}`,
+      qualities: `/video/qualities?v=${videoId}`,
+      related: `/related?v=${videoId}&limit=40`,
+      comments: `/comments?v=${videoId}`,
+      embed: `/embed?v=${videoId}`
+    };
+  }
+  if (channelId) {
+    out.links = {
+      ...(out.links || {}),
+      channel: `/channel?id=${encodeURIComponent(channelId)}`,
+      streams: `/channel/streams?id=${encodeURIComponent(channelId)}`,
+      playlists: `/channel/playlists?id=${encodeURIComponent(channelId)}`
+    };
+  }
+  res.json(out);
+});
+
+/**
+ * GET /api/batch/info?ids=id1,id2,id3
+ * معلومات عدة فيديوهات بالتوازي (حد 12)
+ */
+app.get('/api/batch/info', async (req, res) => {
+  const raw = String(req.query.ids || req.query.v || '');
+  const ids = [...new Set(raw.split(/[,\s]+/).map(s => s.trim()).filter(isValidVideoId))].slice(0, 12);
+  if (!ids.length) return res.status(400).json({ error: 'ids مطلوبة', example: '/api/batch/info?ids=dQw4w9WgXcQ,jNQXAC9IVRw' });
+  const started = Date.now();
+  const settled = await Promise.allSettled(ids.map(async id => {
+    const info = await getVideoInfo(id);
+    return {
+      id,
+      title: info.title,
+      duration: info.duration,
+      channel: info.channel || info.uploader,
+      channelId: info.channel_id,
+      viewCount: info.view_count,
+      thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+      isLive: !!info.is_live,
+      formatsCount: (info.formats || []).length,
+      heights: getAvailableQualities(info)
+    };
+  }));
+  const results = settled.map((s, i) => s.status === 'fulfilled'
+    ? { ok: true, ...s.value }
+    : { ok: false, id: ids[i], error: String(s.reason?.message || s.reason).split('\n')[0] });
+  res.json({ count: results.length, ms: Date.now() - started, results });
+});
+
+/**
+ * GET /api/batch/related?ids=id1,id2&limit=20
+ * اقتراحات مجمّعة من عدة فيديوهات (محتوى أكتر)
+ */
+app.get('/api/batch/related', async (req, res) => {
+  const raw = String(req.query.ids || req.query.v || '');
+  const ids = [...new Set(raw.split(/[,\s]+/).map(s => s.trim()).filter(isValidVideoId))].slice(0, 6);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 10), 80);
+  if (!ids.length) return res.status(400).json({ error: 'ids مطلوبة' });
+  const started = Date.now();
+  const settled = await Promise.allSettled(ids.map(id => getRelatedVideos(id, Math.ceil(limit / ids.length) + 8)));
+  const merged = [];
+  const seen = new Set(ids);
+  for (const s of settled) {
+    if (s.status !== 'fulfilled') continue;
+    for (const v of s.value || []) {
+      if (!v?.id || seen.has(v.id)) continue;
+      seen.add(v.id);
+      merged.push(v);
+      if (merged.length >= limit) break;
+    }
+    if (merged.length >= limit) break;
+  }
+  res.json({ seeds: ids, count: merged.length, ms: Date.now() - started, results: merged });
+});
+
+/**
+ * GET /api/warmup?v=VIDEO_ID
+ * يسخّن كاش info + stream URL عشان أول play يبقى فوري
+ */
+app.get('/api/warmup', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) {
+    return res.status(400).json({ error: 'Video ID مطلوب', example: '/api/warmup?v=dQw4w9WgXcQ' });
+  }
+  const started = Date.now();
+  const out = { id: videoId, steps: [] };
+  try {
+    const t0 = Date.now();
+    const info = await getVideoInfo(videoId);
+    out.steps.push({ name: 'info', ms: Date.now() - t0, formats: (info.formats || []).length, title: info.title });
+    const t1 = Date.now();
+    try {
+      const url = await getFastStreamUrl(videoId);
+      out.steps.push({ name: 'fast-stream', ms: Date.now() - t1, urlLength: String(url || '').length });
+    } catch (e) {
+      out.steps.push({ name: 'fast-stream', ms: Date.now() - t1, error: String(e.message || e).split('\n')[0] });
+    }
+    const t2 = Date.now();
+    try {
+      const q = await getQualityStreamUrl(videoId, 360);
+      out.steps.push({ name: 'quality-360', ms: Date.now() - t2, actualHeight: q.actualHeight, formatId: q.formatId });
+    } catch (e) {
+      out.steps.push({ name: 'quality-360', ms: Date.now() - t2, error: String(e.message || e).split('\n')[0] });
+    }
+    // related في الخلفية بدون انتظار
+    getRelatedVideos(videoId, 24).catch(() => {});
+    out.ok = true;
+    out.ms = Date.now() - started;
+    res.json(out);
+  } catch (e) {
+    out.ok = false;
+    out.ms = Date.now() - started;
+    out.error = String(e.message || e).split('\n')[0];
+    res.status(500).json(out);
+  }
+});
+
+/**
+ * GET /api/stream-modes
+ * يشرح أوضاع التشغيل المتاحة للفرونت
+ */
+app.get('/api/stream-modes', (_req, res) => {
+  res.json({
+    version: SERVER_VERSION,
+    modes: [
+      {
+        id: 'proxy-fast',
+        desc: 'تمرير من السيرفر ~360p progressive — متوافق وموثوق',
+        url: '/video?v=VIDEO_ID',
+        speed: 'medium',
+        hidesGoogleUrl: true
+      },
+      {
+        id: 'direct-cdn',
+        desc: 'تحويل 302 لـ googlevideo — أسرع إحساس (زي يوتيوب)',
+        url: '/video?v=VIDEO_ID&direct=1',
+        speed: 'fastest',
+        hidesGoogleUrl: false
+      },
+      {
+        id: 'quality-progressive',
+        desc: 'جودة progressive مطابقة (غالبًا 360 أو 720)',
+        url: '/video?v=VIDEO_ID&quality=360',
+        speed: 'fast',
+        hidesGoogleUrl: true
+      },
+      {
+        id: 'quality-ffmpeg',
+        desc: '144/240/480/720/1080 عبر دمج video+audio',
+        url: '/video?v=VIDEO_ID&quality=480',
+        speed: 'slower-start',
+        requires: 'ffmpeg',
+        hidesGoogleUrl: true
+      },
+      {
+        id: 'quick',
+        desc: 'مسار سريع مبسّط للمشغّل',
+        url: '/video/quick?v=VIDEO_ID',
+        speed: 'fast',
+        hidesGoogleUrl: true
+      }
+    ],
+    tip: 'للسرعة القصوى استخدم direct=1 بعد warmup. للخصوصية استخدم proxy.'
+  });
+});
+
+/**
+ * GET /api/beast/status
+ * لوحة حالة النسخة الوحشية
+ */
+app.get('/api/beast/status', async (_req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    name: 'TITAN BEAST',
+    version: SERVER_VERSION,
+    uptimeSec: Math.floor(process.uptime()),
+    node: process.version,
+    ytdlp: commandExists('yt-dlp'),
+    ffmpeg: commandExists('ffmpeg'),
+    ffmpegBin: typeof ffmpegBin !== 'undefined' ? ffmpegBin : 'ffmpeg',
+    jsRuntime: detectNodeRuntime() || null,
+    cookiesReady,
+    concurrency: {
+      meta: { max: ytdlpLimiter.max, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length },
+      stream: { max: streamLimiter.max, current: streamLimiter.current, queued: streamLimiter.queue.length }
+    },
+    memory: {
+      rssMB: Math.round(mem.rss / 1048576),
+      heapMB: Math.round(mem.heapUsed / 1048576)
+    },
+    clients: [
+      'tv_samsung', 'tv', 'android_sdkless', 'web_embedded', 'visionos', 'web_safari'
+    ],
+    endpointsHighlight: [
+      '/video?v=&quality=',
+      '/video/qualities?v=',
+      '/related?v=&limit=40',
+      '/channel/streams?id=',
+      '/api/me/history',
+      '/api/warmup?v=',
+      '/api/batch/info?ids=',
+      '/resolve?url=',
+      '/admin'
+    ]
+  });
+});
+
+/**
+ * GET /api/mega-feed?region=EG&limit=40
+ * فيد ضخم: ترند + مقترح + لايف + بحث ساخن — بالتوازي
+ */
+app.get('/api/mega-feed', async (req, res) => {
+  const region = String(req.query.region || 'EG');
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 10), 50);
+  const started = Date.now();
+  const tasks = {
+    trending: (async () => {
+      try {
+        const { results } = await getPaginatedPool(
+          searchCache, `mega_trend_${region}`,
+          (n) => searchVideos(`trending ${region}`, n, { sort: 'relevance' }),
+          1, limit, 80
+        );
+        return results;
+      } catch { return []; }
+    })(),
+    live: (async () => {
+      try {
+        return await searchVideos('live', Math.min(limit, 20), { type: 'live' });
+      } catch { return []; }
+    })(),
+    music: (async () => {
+      try { return await searchVideos('موسيقى عربية', Math.min(limit, 24)); } catch { return []; }
+    })(),
+    news: (async () => {
+      try { return await searchVideos('أخبار اليوم', Math.min(limit, 20), { sort: 'date' }); } catch { return []; }
+    })()
+  };
+  if (cookiesReady) {
+    tasks.forYou = (async () => {
+      try {
+        const items = await fetchAccountList('recommended', Math.min(limit, 30));
+        return items;
+      } catch { return []; }
+    })();
+  }
+  const keys = Object.keys(tasks);
+  const settled = await Promise.allSettled(keys.map(k => tasks[k]));
+  const sections = {};
+  keys.forEach((k, i) => {
+    sections[k] = settled[i].status === 'fulfilled' ? settled[i].value : [];
+  });
+  const mixed = dedupeById([
+    ...(sections.forYou || []),
+    ...(sections.trending || []),
+    ...(sections.music || []),
+    ...(sections.news || []),
+    ...(sections.live || [])
+  ]).slice(0, limit * 2);
+  res.json({
+    region,
+    ms: Date.now() - started,
+    personalized: Boolean(sections.forYou?.length),
+    sections: Object.fromEntries(Object.entries(sections).map(([k, v]) => [k, { count: v.length, items: v }])),
+    mixed
+  });
+});
+
+/**
+ * GET /api/open-graph?v=VIDEO_ID
+ * بيانات مشاركة / معاينة سريعة
+ */
+app.get('/api/open-graph', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID مطلوب' });
+  try {
+    const info = await getVideoInfo(videoId);
+    res.json({
+      id: videoId,
+      title: info.title,
+      description: String(info.description || '').slice(0, 300),
+      channel: info.channel || info.uploader,
+      channelId: info.channel_id,
+      duration: info.duration,
+      views: info.view_count,
+      thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      embed: `/embed?v=${videoId}`,
+      watch: `/video?v=${videoId}`
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e).split('\n')[0] });
+  }
+});
+
+/**
+ * GET /api/quality-matrix?v=VIDEO_ID
+ * مصفوفة كاملة: كل ارتفاع + هل progressive / adaptive / playable
+ */
+app.get('/api/quality-matrix', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID مطلوب' });
+  try {
+    const info = await getVideoInfo(videoId);
+    const prog = buildProgressiveMap(info);
+    const all = getAvailableQualities(info);
+    const hasFf = commandExists('ffmpeg');
+    const matrix = SUPPORTED_QUALITIES.map(h => {
+      const p = prog.get(h);
+      const adaptive = all.includes(h);
+      return {
+        height: h,
+        label: `${h}p`,
+        progressive: Boolean(p),
+        progressiveFormatId: p ? String(p.format_id) : null,
+        adaptive,
+        playable: Boolean(p) || (adaptive && hasFf),
+        mode: p ? 'progressive' : (adaptive && hasFf ? 'ffmpeg-merge' : (adaptive ? 'needs-ffmpeg' : 'unavailable')),
+        playUrl: `/video?v=${videoId}&quality=${h}`,
+        probeUrl: `/video?v=${videoId}&quality=${h}&probe=1`
+      };
+    });
+    res.json({
+      id: videoId,
+      title: info.title,
+      formatsTotal: (info.formats || []).length,
+      progressiveHeights: [...prog.keys()].sort((a, b) => b - a),
+      adaptiveHeights: all,
+      ffmpegReady: hasFf,
+      matrix
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e).split('\n')[0] });
+  }
+});
+
+/**
+ * POST /api/beast/prefetch-list
+ * body: { ids: ["...", "..."] } — يسخّن قائمة فيديوهات في الخلفية
+ */
+app.post('/api/beast/prefetch-list', express.json({ limit: '32kb' }), (req, res) => {
+  const ids = [...new Set((req.body?.ids || []).map(String).filter(isValidVideoId))].slice(0, 20);
+  if (!ids.length) return res.status(400).json({ error: 'ids مطلوبة في body' });
+  res.json({ queued: ids.length, ids });
+  // خلفية — متأخرش الرد
+  setImmediate(() => {
+    ids.forEach(id => {
+      getVideoInfo(id).catch(() => {});
+      getFastStreamUrl(id).catch(() => {});
+    });
+  });
+});
+
+/** دليل API مدمج للنسخة الوحشية */
+app.get('/api/beast/docs', (_req, res) => {
+  res.json({
+    version: SERVER_VERSION,
+    title: 'TITAN BEAST API',
+    playback: {
+      defaultProxy: '/video?v=ID',
+      directCdn: '/video?v=ID&direct=1',
+      quality: '/video?v=ID&quality=240|360|480|720|1080',
+      probe: '/video?v=ID&quality=480&probe=1',
+      quick: '/video/quick?v=ID',
+      qualitiesList: '/video/qualities?v=ID',
+      qualityMatrix: '/api/quality-matrix?v=ID',
+      player: '/p?v=ID'
+    },
+    discovery: {
+      home: '/home?region=EG',
+      megaFeed: '/api/mega-feed?region=EG&limit=40',
+      trending: '/trending?region=EG&limit=40',
+      search: '/search?q=...&limit=40',
+      related: '/related?v=ID&limit=40',
+      batchRelated: '/api/batch/related?ids=a,b&limit=40',
+      live: '/api/live?q=...&limit=30',
+      shorts: '/api/shorts?q=...&limit=30'
+    },
+    channel: {
+      videos: '/channel?id=UC...&limit=30',
+      streams: '/channel/streams?id=UC...&status=all|live|past',
+      playlists: '/channel/playlists?id=UC...'
+    },
+    account: {
+      note: 'يتطلب كوكيز Netscape عبر /admin',
+      history: '/api/me/history',
+      liked: '/api/me/liked',
+      subscriptions: '/api/me/subscriptions',
+      recommended: '/api/me/recommended',
+      playlists: '/api/me/playlists',
+      live: '/api/me/live'
+    },
+    tools: {
+      resolve: '/resolve?url=',
+      warmup: '/api/warmup?v=ID',
+      batchInfo: '/api/batch/info?ids=',
+      openGraph: '/api/open-graph?v=ID',
+      health: '/health',
+      beastStatus: '/api/beast/status',
+      admin: '/admin'
+    },
+    speedTips: [
+      'استدع /api/warmup?v=ID قبل التشغيل',
+      'استخدم &direct=1 لأقصى سرعة CDN',
+      'خلي related limit=40 مع infinite scroll عبر page=',
+      'فعّل كوكيز حديثة من /admin لغير المدرج والحساب'
+    ]
+  });
+});
+
+/**
+ * GET /api/shorts?q=&limit=
+ * بحث شورتس (فيديوهات قصيرة)
+ */
+app.get('/api/shorts', async (req, res) => {
+  const q = String(req.query.q || 'shorts').trim() || 'shorts';
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 24, 1), 50);
+  try {
+    const items = await searchVideos(`${q} #shorts`, limit * 2);
+    const shorts = (items || []).filter(v => !v.duration || v.duration <= 180).slice(0, limit);
+    res.json({ query: q, count: shorts.length, results: shorts.length ? shorts : (items || []).slice(0, limit) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e).split('\n')[0] });
+  }
+});
+
+/**
+ * GET /p?v=VIDEO_ID — مشغّل ويب وحشي مدمج (HTML)
+ * يدعم تغيير الجودة + related + وضع direct
+ */
+app.get('/p', async (req, res) => {
+  const videoId = String(req.query.v || '');
+  if (!videoId || !isValidVideoId(videoId)) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(400).send(`<!DOCTYPE html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TITAN Player</title>
+<body style="font-family:system-ui;background:#0b0b0c;color:#eee;padding:24px">
+<h1>TITAN BEAST Player</h1>
+<p>استخدم: <code>/p?v=VIDEO_ID</code></p>
+<p>مثال: <a style="color:#ff2d55" href="/p?v=dQw4w9WgXcQ">/p?v=dQw4w9WgXcQ</a></p>
+</body></html>`);
+  }
+  let title = videoId;
+  try { title = (await getVideoInfo(videoId)).title || title; } catch {}
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>${String(title).replace(/[<>&"]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[s]))}</title>
+<style>
+:root{--bg:#0a0a0b;--card:#141416;--line:#222;--txt:#f2f2f2;--mut:#9a9a9a;--acc:#ff2d55}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:12px 12px 48px}
+.player{background:#000;border-radius:14px;overflow:hidden;aspect-ratio:16/9;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+video{width:100%;height:100%;display:block;background:#000}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
+.btn{border:0;border-radius:999px;padding:8px 14px;background:#1c1c1f;color:#fff;font-weight:600;cursor:pointer}
+.btn.on{background:var(--acc)}
+.btn:disabled{opacity:.5}
+h1{font-size:18px;margin:8px 0 4px;line-height:1.35}
+.meta{color:var(--mut);font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-top:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;text-decoration:none;color:inherit}
+.card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:#111}
+.card .t{padding:8px 10px;font-size:13px;line-height:1.3}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input{flex:1;min-width:160px;background:#121214;border:1px solid var(--line);border-radius:999px;padding:10px 14px;color:#fff}
+.status{font-size:12px;color:var(--mut)}
+a{color:#8ab4ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="margin-bottom:10px">
+    <strong style="color:var(--acc)">TITAN BEAST</strong>
+    <span class="status" id="st">جاري التحميل…</span>
+  </div>
+  <div class="player"><video id="v" controls playsinline autoplay></video></div>
+  <h1 id="title">${String(title).replace(/[<>&"]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[s]))}</h1>
+  <div class="meta" id="meta"></div>
+  <div class="bar" id="qbar"></div>
+  <div class="row">
+    <button class="btn" id="btnProxy">Proxy</button>
+    <button class="btn" id="btnDirect">Direct CDN</button>
+    <button class="btn" id="btnWarm">Warmup</button>
+    <a class="btn" href="/info?v=${videoId}" target="_blank">Info</a>
+    <a class="btn" href="/admin" target="_blank">Admin</a>
+  </div>
+  <h2 style="font-size:16px;margin-top:22px">مقترحات</h2>
+  <div class="grid" id="rel"></div>
+</div>
+<script>
+const ID=${JSON.stringify(videoId)};
+const video=document.getElementById('v');
+const st=document.getElementById('st');
+const qbar=document.getElementById('qbar');
+let quality='360';
+let direct=false;
+function srcUrl(){
+  const base='/video?v='+encodeURIComponent(ID)+'&quality='+encodeURIComponent(quality);
+  return direct ? base+'&direct=1' : base;
+}
+function load(){
+  st.textContent='تشغيل '+(direct?'direct ':'proxy ')+quality+'p…';
+  video.src=srcUrl();
+  video.play().catch(()=>{});
+}
+async function boot(){
+  try{
+    await fetch('/api/warmup?v='+encodeURIComponent(ID)).then(r=>r.json()).catch(()=>null);
+    const q=await fetch('/video/qualities?v='+encodeURIComponent(ID)).then(r=>r.json());
+    const list=(q.qualities||[]).filter(x=>x.quality!=='audio');
+    qbar.innerHTML='';
+    (list.length?list:[{label:'360p',quality:'360'}]).forEach(item=>{
+      const b=document.createElement('button');
+      b.className='btn'+(String(item.quality)===quality?' on':'');
+      b.textContent=item.label+(item.type&&item.type.includes('ffmpeg')?' ⚙':'');
+      b.onclick=()=>{quality=String(item.quality);[...qbar.children].forEach(x=>x.classList.remove('on'));b.classList.add('on');load()};
+      qbar.appendChild(b);
+    });
+    document.getElementById('meta').textContent=(q.progressiveHeights||[]).length
+      ? ('progressive: '+(q.progressiveHeights||[]).join(', ')+' | ffmpeg: '+(q.ffmpegReady?'yes':'no'))
+      : ('formats: '+(q.count||'?')+' | ffmpeg: '+(q.ffmpegReady?'yes':'no'));
+  }catch(e){st.textContent='qualities error'}
+  load();
+  try{
+    const rel=await fetch('/related?v='+encodeURIComponent(ID)+'&limit=24').then(r=>r.json());
+    const box=document.getElementById('rel');
+    (rel.results||[]).forEach(item=>{
+      const a=document.createElement('a');
+      a.className='card';
+      a.href='/p?v='+encodeURIComponent(item.id);
+      a.innerHTML='<img loading="lazy" src="'+(item.thumbnail||('https://i.ytimg.com/vi/'+item.id+'/hqdefault.jpg'))+'" alt=""/><div class="t">'+(item.title||item.id)+'</div>';
+      box.appendChild(a);
+    });
+  }catch{}
+  st.textContent='جاهز';
+}
+document.getElementById('btnProxy').onclick=()=>{direct=false;load()};
+document.getElementById('btnDirect').onclick=()=>{direct=true;load()};
+document.getElementById('btnWarm').onclick=async()=>{st.textContent='warmup…';await fetch('/api/warmup?v='+encodeURIComponent(ID));st.textContent='warmup done';load()};
+boot();
+</script>
+</body></html>`);
+});
+
+/**
+ * كتالوج نصي ضخم للمطورين — مرجع سريع
+ */
+app.get('/api/beast/catalog', (_req, res) => {
+  const catalog = `
+TITAN BEAST ${SERVER_VERSION} — Endpoint Catalog
+================================================
+
+PLAYBACK
+  GET /video?v=ID                         proxy stream (default ~360p)
+  GET /video?v=ID&quality=144|240|360|480|720|1080
+  GET /video?v=ID&quality=480&probe=1     JSON probe without bytes
+  GET /video?v=ID&direct=1                302 to googlevideo CDN (fastest)
+  GET /video/quick?v=ID                   simplified fast path
+  GET /video/qualities?v=ID               list playable qualities
+  GET /api/quality-matrix?v=ID            progressive vs adaptive matrix
+  GET /p?v=ID                             built-in HTML5 player UI
+  GET /embed?v=ID                         minimal embed
+
+DISCOVERY
+  GET /home?region=EG&perSection=12
+  GET /api/mega-feed?region=EG&limit=40   multi-section parallel feed
+  GET /trending?region=EG&limit=40&page=1
+  GET /search?q=QUERY&limit=40&page=1&sort=relevance|date&type=video|live
+  GET /related?v=ID&limit=40&page=1
+  GET /api/batch/related?ids=a,b,c&limit=40
+  GET /api/shorts?q=...&limit=30
+  GET /api/live?q=...&limit=30
+  GET /recommendations?region=EG&limit=40
+
+CHANNEL / PLAYLIST
+  GET /channel?id=UC...|@handle&tab=videos|streams|playlists&limit=30&page=1
+  GET /channel/streams?id=UC...&status=all|live|upcoming|past
+  GET /channel/playlists?id=UC...
+  GET /playlist?id=PL...&limit=30&page=1
+
+METADATA
+  GET /info?v=ID
+  GET /formats?v=ID
+  GET /comments?v=ID&limit=50
+  GET /captions?v=ID
+  GET /chapters?v=ID
+  GET /transcript?v=ID&lang=ar
+  GET /api/open-graph?v=ID
+  GET /api/batch/info?ids=id1,id2
+
+ACCOUNT (cookies required — set via /admin)
+  GET /api/me/history
+  GET /api/me/liked
+  GET /api/me/subscriptions
+  GET /api/me/recommended
+  GET /api/me/playlists
+  GET /api/me/playlist?list=ID
+  GET /api/me/channels
+  GET /api/me/live
+  GET /api/me/summary
+
+OPS
+  GET /health
+  GET /api/beast/status
+  GET /api/beast/docs
+  GET /api/performance
+  GET /api/maintenance
+  GET /api/diagnostics
+  GET /api/test-all
+  GET /api/warmup?v=ID
+  GET /resolve?url=https://youtu.be/...
+  POST /api/update-cookies
+  POST /api/cache/clear
+  POST /api/beast/prefetch-list   body: {"ids":["..."]}
+  GET /admin
+
+QUALITY NOTES (2026)
+  - Progressive muxed streams are often only 360p (itag 18).
+  - 144/240/480/720/1080 usually need adaptive video+audio + ffmpeg merge.
+  - Clients used: tv_samsung, tv, android_sdkless, web_embedded, visionos.
+  - Always pass --js-runtimes node on Railway/Node hosts.
+
+SPEED NOTES
+  - Warmup before play: /api/warmup?v=ID
+  - Fastest playback: /video?v=ID&direct=1
+  - Privacy/proxy: default /video without direct=1
+  - Cache SWR keeps feeds snappy on repeat visits.
+`;
+  res.type('text/plain; charset=utf-8').send(catalog);
+});
+
+// --- BEAST: تحسين حدود الصفحة الافتراضية للمسارات الثقيلة عبر query فقط (بدون كسر التوافق) ---
+// related / search / trending تستفيد من getPaginatedPool (حد 50 في الصفحة)
+
+/**
+ * GET /app — واجهة تصفح كاملة (بحث + ترند + مشغل) مبنية على نفس الـ API
+ * صفحة واحدة كبيرة بما يكفي لتكون فرونت سريع للاختبار بدون مشروع منفصل
+ */
+app.get('/app', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=120');
+  res.send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0a0b"/>
+<title>TITAN BEAST</title>
+<style>
+:root{
+  --bg:#09090b;--elev:#121214;--elev2:#1a1a1e;--line:#26262b;--txt:#f4f4f5;--mut:#a1a1aa;--acc:#ff2d55;--acc2:#ff6b81;
+  --nav:58px;--radius:14px;--font:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Arabic",sans-serif;
+}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--txt);font-family:var(--font);min-height:100%}
+a{color:inherit;text-decoration:none}button,input{font:inherit}
+.top{position:sticky;top:0;z-index:40;height:var(--nav);display:flex;gap:10px;align-items:center;padding:0 12px;
+  background:rgba(9,9,11,.88);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.2px}
+.logo{width:28px;height:22px;border-radius:7px;background:linear-gradient(135deg,var(--acc),#ff7a59);box-shadow:0 6px 18px rgba(255,45,85,.35)}
+.search{flex:1;display:flex;background:var(--elev);border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.search input{flex:1;border:0;outline:0;background:transparent;color:var(--txt);padding:10px 14px;min-width:0}
+.search button{border:0;background:var(--elev2);color:var(--mut);padding:0 14px;cursor:pointer}
+.shell{display:grid;grid-template-columns:72px 1fr;min-height:calc(100vh - var(--nav))}
+.side{position:sticky;top:var(--nav);height:calc(100vh - var(--nav));padding:10px 8px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.side button{border:0;background:transparent;color:var(--mut);border-radius:12px;padding:10px 6px;cursor:pointer;font-size:10px;font-weight:700}
+.side button.active,.side button:hover{background:var(--elev2);color:#fff}
+.main{padding:14px 14px 80px;max-width:1400px}
+.chips{display:flex;gap:8px;overflow:auto;padding-bottom:8px;margin-bottom:10px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;border:0;background:var(--elev2);color:var(--mut);padding:8px 12px;border-radius:999px;cursor:pointer;font-size:12px;font-weight:650}
+.chip.on{background:rgba(255,45,85,.16);color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+.card{cursor:pointer}
+.thumb{position:relative;border-radius:12px;overflow:hidden;background:#111;aspect-ratio:16/9}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.badge{position:absolute;inset-inline-end:8px;bottom:8px;background:rgba(0,0,0,.82);color:#fff;font-size:11px;padding:2px 6px;border-radius:6px}
+.meta{padding:8px 2px 0}.meta h3{margin:0;font-size:13px;line-height:1.35;font-weight:650;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.meta p{margin:4px 0 0;color:var(--mut);font-size:12px}
+.section{margin:18px 0 8px;display:flex;justify-content:space-between;align-items:baseline}
+.section h2{margin:0;font-size:16px}
+.empty,.err{padding:28px;text-align:center;color:var(--mut)}
+.watch{display:none;grid-template-columns:minmax(0,1fr) 320px;gap:16px}
+.watch.on{display:grid}
+.player{background:#000;border-radius:14px;overflow:hidden;aspect-ratio:16/9}
+.player video{width:100%;height:100%;display:block}
+.qbar{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+.qbtn{border:0;border-radius:999px;padding:7px 12px;background:var(--elev2);color:#fff;cursor:pointer;font-size:12px;font-weight:700}
+.qbtn.on{background:var(--acc)}
+.rel .item{display:grid;grid-template-columns:148px 1fr;gap:8px;margin-bottom:10px;cursor:pointer}
+.rel img{width:148px;height:84px;object-fit:cover;border-radius:10px;background:#111}
+.rel h4{margin:0;font-size:12px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.toast{position:fixed;inset-inline:16px;bottom:16px;background:#18181b;border:1px solid var(--line);padding:10px 14px;border-radius:12px;display:none;z-index:99}
+@media(max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .side{position:fixed;bottom:0;top:auto;inset-inline:0;height:auto;z-index:50;flex-direction:row;justify-content:space-around;
+    padding:6px 4px calc(6px + env(safe-area-inset-bottom));background:rgba(9,9,11,.96);border:0;border-top:1px solid var(--line)}
+  .main{padding-bottom:90px}
+  .watch{grid-template-columns:1fr}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .meta h3{font-size:12px}
+}
+@media(max-width:380px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand" id="goHome"><div class="logo"></div><span>TITAN</span></div>
+  <form class="search" id="sf"><input id="q" placeholder="ابحث في يوتيوب..." enterkeyhint="search"/><button type="submit">بحث</button></form>
+</header>
+<div class="shell">
+  <nav class="side">
+    <button class="active" data-go="home">رئيسية</button>
+    <button data-go="trending">رائج</button>
+    <button data-go="live">مباشر</button>
+    <button data-go="shorts">شورتس</button>
+    <button data-go="mega">ميجا</button>
+  </nav>
+  <main class="main">
+    <div id="homeView">
+      <div class="chips" id="chips"></div>
+      <div id="feed" class="grid"></div>
+    </div>
+    <div class="watch" id="watchView">
+      <div>
+        <div class="player"><video id="player" controls playsinline></video></div>
+        <h1 id="wTitle" style="font-size:18px;margin:12px 0 4px"></h1>
+        <div id="wMeta" style="color:var(--mut);font-size:13px"></div>
+        <div class="qbar" id="qbar"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+          <button class="qbtn" id="btnProxy">Proxy</button>
+          <button class="qbtn" id="btnDirect">Direct</button>
+          <button class="qbtn" id="btnBack">رجوع</button>
+        </div>
+      </div>
+      <div class="rel" id="rel"></div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const feed = $('#feed');
+const toast = $('#toast');
+let state = { route:'home', q:'', videoId:null, quality:'360', direct:false };
+function tip(msg){toast.style.display='block';toast.textContent=msg;clearTimeout(tip._t);tip._t=setTimeout(()=>toast.style.display='none',2200)}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]))}
+function dur(sec){sec=Number(sec)||0;const m=Math.floor(sec/60),s=Math.floor(sec%60);return m+':'+String(s).padStart(2,'0')}
+function card(v){
+  const id=v.id||v.videoId; if(!id) return '';
+  const th=v.thumbnail||v.thumbnails?.high||('https://i.ytimg.com/vi/'+id+'/hqdefault.jpg');
+  const title=v.title||id; const author=v.author||v.channel||v.uploader||'';
+  return '<article class="card" data-id="'+esc(id)+'"><div class="thumb"><img loading="lazy" src="'+esc(th)+'" alt=""/>'
+    +(v.duration?('<span class="badge">'+esc(v.durationString||dur(v.duration))+'</span>'):'')
+    +'</div><div class="meta"><h3>'+esc(title)+'</h3><p>'+esc(author)+'</p></div></article>';
+}
+async function api(path){const r=await fetch(path); if(!r.ok) throw new Error('HTTP '+r.status); return r.json()}
+function showHome(){$('#homeView').style.display='block';$('#watchView').classList.remove('on')}
+function showWatch(){$('#homeView').style.display='none';$('#watchView').classList.add('on')}
+async function loadHome(){
+  showHome(); feed.innerHTML='<div class="empty">تحميل...</div>';
+  try{
+    const data = await api('/api/mega-feed?region=EG&limit=28');
+    const mixed = data.mixed||[];
+    const sections = data.sections||{};
+    let html='';
+    if(mixed.length){ html += '<div class="section"><h2>مقترح</h2></div><div class="grid">'+mixed.slice(0,16).map(card).join('')+'</div>'; }
+    for(const [k,sec] of Object.entries(sections)){
+      if(!sec.items||!sec.items.length) continue;
+      html += '<div class="section"><h2>'+esc(k)+'</h2><span style="color:var(--mut);font-size:12px">'+sec.count+'</span></div>';
+      html += '<div class="grid">'+sec.items.slice(0,10).map(card).join('')+'</div>';
+    }
+    feed.innerHTML = html || '<div class="empty">لا نتائج</div>';
+  }catch(e){ feed.innerHTML='<div class="err">فشل التحميل: '+esc(e.message)+'</div>'; }
+}
+async function loadTrending(){
+  showHome(); feed.innerHTML='<div class="empty">تحميل الرائج...</div>';
+  try{
+    const data=await api('/trending?region=EG&limit=40');
+    feed.innerHTML='<div class="section"><h2>رائج</h2></div><div class="grid">'+(data.results||data.videos||[]).map(card).join('')+'</div>';
+  }catch(e){feed.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+}
+async function loadLive(){
+  showHome(); feed.innerHTML='<div class="empty">بث مباشر...</div>';
+  try{
+    const data=await api('/api/live?q=live&limit=30');
+    feed.innerHTML='<div class="section"><h2>مباشر</h2></div><div class="grid">'+(data.results||[]).map(card).join('')+'</div>';
+  }catch(e){feed.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+}
+async function loadShorts(){
+  showHome(); feed.innerHTML='<div class="empty">شورتس...</div>';
+  try{
+    const data=await api('/api/shorts?q=shorts&limit=30');
+    feed.innerHTML='<div class="section"><h2>شورتس</h2></div><div class="grid">'+(data.results||[]).map(card).join('')+'</div>';
+  }catch(e){feed.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+}
+async function loadSearch(q){
+  showHome(); feed.innerHTML='<div class="empty">بحث عن '+esc(q)+'...</div>';
+  try{
+    const data=await api('/search?q='+encodeURIComponent(q)+'&limit=40');
+    feed.innerHTML='<div class="section"><h2>نتائج: '+esc(q)+'</h2></div><div class="grid">'+(data.results||[]).map(card).join('')+'</div>';
+  }catch(e){feed.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+}
+function streamSrc(id, quality, direct){
+  let u='/video?v='+encodeURIComponent(id)+'&quality='+encodeURIComponent(quality||'360');
+  if(direct) u+='&direct=1';
+  return u;
+}
+async function openVideo(id){
+  state.videoId=id; showWatch();
+  const player=$('#player');
+  $('#wTitle').textContent='...'; $('#rel').innerHTML=''; $('#qbar').innerHTML='';
+  tip('تسخين الكاش...');
+  fetch('/api/warmup?v='+encodeURIComponent(id)).catch(()=>{});
+  try{
+    const info=await api('/info?v='+encodeURIComponent(id));
+    $('#wTitle').textContent=info.title||id;
+    $('#wMeta').textContent=(info.channel||info.author||'')+' • '+(info.durationString||dur(info.duration)||'');
+  }catch{ $('#wTitle').textContent=id; }
+  try{
+    const q=await api('/video/qualities?v='+encodeURIComponent(id));
+    const list=(q.qualities||[]).filter(x=>x.quality!=='audio');
+    $('#qbar').innerHTML='';
+    (list.length?list:[{label:'360p',quality:'360'}]).forEach(item=>{
+      const b=document.createElement('button');
+      b.className='qbtn'+(String(item.quality)===String(state.quality)?' on':'');
+      b.textContent=item.label;
+      b.onclick=()=>{state.quality=String(item.quality);[...$('#qbar').children].forEach(x=>x.classList.remove('on'));b.classList.add('on');play()};
+      $('#qbar').appendChild(b);
+    });
+  }catch{}
+  play();
+  try{
+    const rel=await api('/related?v='+encodeURIComponent(id)+'&limit=30');
+    $('#rel').innerHTML=(rel.results||[]).map(v=>
+      '<div class="item" data-id="'+esc(v.id)+'"><img loading="lazy" src="'+esc(v.thumbnail||('https://i.ytimg.com/vi/'+v.id+'/hqdefault.jpg'))+'" alt=""/><h4>'+esc(v.title||'')+'</h4></div>'
+    ).join('');
+  }catch{}
+}
+function play(){
+  if(!state.videoId) return;
+  const player=$('#player');
+  player.src=streamSrc(state.videoId, state.quality, state.direct);
+  player.play().catch(()=>{});
+  tip((state.direct?'Direct ':'Proxy ')+state.quality+'p');
+}
+feed.addEventListener('click',e=>{const c=e.target.closest('[data-id]'); if(c) openVideo(c.getAttribute('data-id'))});
+$('#rel').addEventListener('click',e=>{const c=e.target.closest('[data-id]'); if(c) openVideo(c.getAttribute('data-id'))});
+$('#sf').addEventListener('submit',e=>{e.preventDefault(); const v=$('#q').value.trim(); if(v) loadSearch(v)});
+$('#goHome').onclick=()=>loadHome();
+$('#btnBack').onclick=()=>showHome();
+$('#btnProxy').onclick=()=>{state.direct=false;play()};
+$('#btnDirect').onclick=()=>{state.direct=true;play()};
+document.querySelectorAll('.side button').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('.side button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    const go=btn.getAttribute('data-go');
+    if(go==='home'||go==='mega') loadHome();
+    else if(go==='trending') loadTrending();
+    else if(go==='live') loadLive();
+    else if(go==='shorts') loadShorts();
+  };
+});
+const chips=['الكل','أغاني','أخبار','رياضة','ألعاب','تكنولوجيا','طبخ'];
+$('#chips').innerHTML=chips.map((c,i)=>'<button class="chip'+(i===0?' on':'')+'" data-c="'+esc(c)+'">'+esc(c)+'</button>').join('');
+$('#chips').onclick=e=>{
+  const b=e.target.closest('.chip'); if(!b) return;
+  [...$('#chips').children].forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  const c=b.getAttribute('data-c');
+  if(c==='الكل') loadHome(); else loadSearch(c);
+};
+loadHome();
+</script>
+</body></html>`);
+});
+
+app.get('/api/beast/runbook', (_req, res) => {
+  res.type('text/plain; charset=utf-8').send(`TITAN BEAST RUNBOOK
+===================
+
+1) لماذا يوتيوب أسرع؟
+- CDN عالمي على حافة الشبكة
+- بدون yt-dlp في مسار المشاهدة
+- عندنا: Railway → yt-dlp → (proxy) → المستخدم
+
+2) معادلة السرعة عندنا
+السرعة ≈ (كاش Hit) + (direct CDN) + (warmup مسبق) - (yt-dlp cold start) - (ffmpeg merge)
+
+3) أوامر فحص سريعة
+curl -s /health | jq
+curl -s /formats?v=VIDEO | jq '.count,.formats[0]'
+curl -s /api/quality-matrix?v=VIDEO | jq '.matrix'
+curl -s '/video?v=VIDEO&quality=240&probe=1' | jq
+curl -s /api/warmup?v=VIDEO | jq
+
+4) كوكيز Netscape
+# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	TRUE	0	NAME	VALUE
+ارفعها من /admin — أي لصق headers خام يفشل.
+
+5) Clients 2026
+الأفضل للـ adaptive بدون PO token:
+  tv_samsung, tv, android_sdkless, web_embedded, visionos
+الضعيف (غالبًا format 18 فقط):
+  web, mweb بدون token
+
+6) جدول الجودات
+| الارتفاع | progressive شائع؟ | المسار |
+| 144 | نادر | ffmpeg merge |
+| 240 | نادر | ffmpeg merge |
+| 360 | نعم (18) | progressive proxy |
+| 480 | نادر | ffmpeg merge |
+| 720 | أحيانًا | progressive أو merge |
+| 1080 | نادر progressive | ffmpeg merge |
+
+7) حساب المستخدم
+/api/me/* تحتاج cookiesReady=true
+لو فاضي: جدّد الكوكي من حساب يوتيوب على نفس الجهاز.
+
+8) قنوات وبثوث
+/channel?id=UC...&tab=streams
+/channel/streams?id=UC...&status=past
+يدمج تبويب streams + was_live من videos
+
+9) فرونت مدمج
+/app  واجهة كاملة
+/p?v=ID  مشغل سريع
+/embed?v=ID embed بسيط
+
+10) صيانة
+POST /api/cache/clear
+GET /api/maintenance
+GET /api/test-all?v=dQw4w9WgXcQ
+
+11) متغيرات بيئة مفيدة
+PORT
+ADMIN_SECRET
+FIREBASE_URL
+YTDLP_META_CONCURRENCY
+STREAM_CONCURRENCY
+FFMPEG_PATH
+NODE_ENV
+
+12) ملاحظات أداء Railway
+- أول طلب بعد النوم بارد
+- proxy يستهلك bandwidth الخطة
+- direct=1 يحوّل الحمل لـ googlevideo
+- لا ترفع META concurrency زيادة عن اللزوم (حظر يوتيوب)
+
+13) أخطاء شائعة
+requested format is not available → غيّر quality أو انتظر ffmpeg
+Sign in to confirm → كوكيز / bot check
+ffmpeg غير متاح → تأكد من ensureFfmpeg عند الإقلاع
+No exact progressive → طبيعي لـ 144/240/480
+
+14) توصية الإنتاج
+- افتح /app للمستخدمين
+- قبل كل فيديو: warmup في الخلفية عند ظهور الكرت
+- التشغيل الافتراضي: quality=360 proxy
+- زر "جودة عالية" يستدعي 720/1080 مع merge
+- زر "سرعة" يستخدم direct=1
+
+END
+`);
+});
+
+
+
+app.get('/api/beast/reference', (_req, res) => {
+  res.type('text/plain; charset=utf-8').send(typeof BEAST_API_REFERENCE === 'string' ? BEAST_API_REFERENCE : 'missing');
+});
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
