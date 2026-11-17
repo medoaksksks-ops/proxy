@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.2.1-PLAY-STABLE';
+const SERVER_VERSION = '13.2.2-NO-HLS';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -602,27 +602,55 @@ async function getVideoInfo(videoId) {
   });
 }
 
+function isHlsUrl(url) {
+  const u = String(url || '').toLowerCase();
+  return u.includes('.m3u8') || u.includes('/manifest/hls') || u.includes('playlist/index.m3u8');
+}
+
+const PROGRESSIVE_FALLBACK_SELECTOR =
+  '18/22/best[ext=mp4][acodec!=none][vcodec!=none][protocol^=http]/' +
+  'best[acodec!=none][vcodec!=none][protocol^=http]/best[protocol^=http]';
+
 async function getFormatUrls(videoId, formatSelector) {
   const key = `urls_${videoId}_${formatSelector}`;
   const cached = streamCache.get(key);
-  if (cached) return cached;
+  if (cached && Array.isArray(cached) && !cached.some(isHlsUrl)) return cached;
 
   return dedupe(key, async () => {
     const again = streamCache.get(key);
-    if (again) return again;
+    if (again && Array.isArray(again) && !again.some(isHlsUrl)) return again;
 
-    const stdout = await runYtDlp([
-      '--get-url', '--no-playlist', '-f', formatSelector,
-      `https://www.youtube.com/watch?v=${videoId}`
-    ], {
-      timeout: 50000,
-      lane: 'stream',
-      useCookies: true, // مهم لغير المدرج
-      allowCookieFallback: true
-    });
+    const trySelector = async (selector) => {
+      const stdout = await runYtDlp([
+        '--get-url', '--no-playlist',
+        '-f', selector,
+        '--format-sort', 'proto:https,proto:http,res,br',
+        `https://www.youtube.com/watch?v=${videoId}`
+      ], {
+        timeout: 55000,
+        lane: 'stream',
+        useCookies: true,
+        allowCookieFallback: true
+      });
+      return stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
+    };
 
-    const urls = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
-    if (!urls.length) throw new Error('No stream URL returned');
+    let urls = [];
+    try { urls = await trySelector(formatSelector); }
+    catch (e) { log.warn(`get-url primary fail: ${String(e.message || e).split('\n')[0]}`); }
+
+    if (!urls.length || urls.some(isHlsUrl)) {
+      log.warn(`HLS/empty for ${videoId} — forcing progressive MP4`);
+      try { urls = await trySelector(PROGRESSIVE_FALLBACK_SELECTOR); }
+      catch (e) { log.warn(`progressive force fail: ${String(e.message || e).split('\n')[0]}`); }
+    }
+
+    if (!urls.length || urls.some(isHlsUrl)) {
+      try { urls = await trySelector('18'); } catch {}
+    }
+
+    urls = (urls || []).filter(u => u && !isHlsUrl(u));
+    if (!urls.length) throw new Error('No progressive (non-HLS) stream URL returned');
     streamCache.set(key, urls, CACHE_TTL.stream);
     return urls;
   });
@@ -1846,13 +1874,13 @@ async function getQualityStreamUrl(videoId, height) {
       log.warn(`quality meta ${h}p: ${String(e.message || e).split('\n')[0]}`);
     }
 
-    // 2) selector yt-dlp: progressive بصوت فقط (مش video-only)
+    // 2) progressive HTTP فقط (منع m3u8)
     const lo = Math.max(144, h - 80);
     const selector = [
-      `best[height=${h}][acodec!=none][vcodec!=none]`,
-      `best[height<=${h}][height>=${lo}][acodec!=none][vcodec!=none]`,
-      `best[height<=${h}][acodec!=none][vcodec!=none]`,
-      `18/22/best[acodec!=none][vcodec!=none]/best`
+      `best[height=${h}][ext=mp4][acodec!=none][vcodec!=none][protocol^=http]`,
+      `best[height<=${h}][height>=${lo}][ext=mp4][acodec!=none][vcodec!=none][protocol^=http]`,
+      `best[height<=${h}][acodec!=none][vcodec!=none][protocol^=http]`,
+      `18/22/best[ext=mp4][protocol^=http]/best[protocol^=http]`
     ].join('/');
 
     const urls = await getFormatUrls(videoId, selector);
