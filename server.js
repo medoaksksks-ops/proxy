@@ -16,7 +16,9 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.3.0-PO-FORMATS';
+// v13.4.0 — AUTO PO TOKEN: السيرفر بيولّد PO Token + Visitor Data لوحده
+// (bgutils-js + jsdom) ويجدده كل 4 ساعات، من غير أي توكن يدوي.
+const SERVER_VERSION = '13.4.0-AUTO-PO';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -484,6 +486,8 @@ async function runYtDlp(args, opts = {}) {
       pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('tv,web')}`], true);
       pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('web,mweb')}`], true);
       pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android,web')}`], true);
+      // التوكن التلقائي مربوط بزائر مجهول → محاولة web بدون كوكيز عشان ميحصلش تعارض
+      if (poManager.isAuto()) pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('web,mweb')}`], false);
       pushAttempt([], true);
     } else {
       pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android_vr,tv,ios')}`]);
@@ -506,6 +510,7 @@ async function runYtDlp(args, opts = {}) {
       } catch (error) {
         lastError = error;
         const msg = String(error.message || error).toLowerCase();
+        if (/po.?token|sign in to confirm|not a bot/.test(msg)) poManager.invalidateSoon();
         const keepTrying = isRetryableYoutubeError(error)
           || msg.includes('private')
           || msg.includes('unlisted')
@@ -719,16 +724,144 @@ async function getVideoInfo(videoId) {
 }
 
 
-/** PO Token من البيئة — بدونها يوتيوب غالبًا بيرجع format 18 فقط */
+// ==========================================================================
+// 🔑 AUTO PO TOKEN MANAGER (v13.4.0)
+// بيولّد PO Token حقيقي تلقائيًا جوه السيرفر (من غير متصفح ولا Docker):
+//   1) بيجيب Visitor Data من يوتيوب.
+//   2) بيشغّل BotGuard جوه jsdom عن طريق bgutils-js ويطلع التوكن.
+//   3) بيجدده كل PO_REFRESH_MIN دقيقة (الافتراضي 240) وفي الخلفية.
+// المتطلبات:  npm i bgutils-js jsdom
+// لو YOUTUBE_PO_TOKEN مظبوط يدويًا في الـ env، بيتقدّم على التوليد التلقائي.
+// لو الحزم مش منصّبة السيرفر بيكمّل عادي بدون توكن (مفيش كراش).
+// ==========================================================================
+const poManager = (() => {
+  const REFRESH_MS = Math.max(30, parseInt(process.env.PO_REFRESH_MIN, 10) || 240) * 60 * 1000;
+  const MIN_GAP_MS = 5 * 60 * 1000; // أقل فاصل بين محاولتين
+  const REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  const st = { token: null, visitorData: null, generatedAt: 0, lastError: null, lastAttempt: 0, busy: null };
+
+  async function fetchVisitorData() {
+    const r = await fetch('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': UA, 'Origin': 'https://www.youtube.com' },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+        browseId: 'FEwhat_to_watch'
+      })
+    });
+    if (!r.ok) throw new Error(`visitorData HTTP ${r.status}`);
+    const j = await r.json();
+    const vd = j?.responseContext?.visitorData;
+    if (!vd) throw new Error('visitorData missing in response');
+    return vd;
+  }
+
+  async function generateOnce() {
+    let JSDOM;
+    try { ({ JSDOM } = require('jsdom')); }
+    catch { throw new Error('حزمة jsdom مش منصّبة — شغّل: npm i bgutils-js jsdom'); }
+    let BG;
+    try { ({ BG } = await import('bgutils-js')); }
+    catch { throw new Error('حزمة bgutils-js مش منصّبة — شغّل: npm i bgutils-js jsdom'); }
+
+    const visitorData = await fetchVisitorData();
+    const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
+      url: 'https://www.youtube.com/', referrer: 'https://www.youtube.com/', userAgent: UA
+    });
+    // bgutils محتاج window/document عالميين أثناء التوليد بس — بنشيلهم بعدها
+    const prevWindow = globalThis.window, prevDocument = globalThis.document;
+    Object.assign(globalThis, { window: dom.window, document: dom.window.document });
+    try {
+      const bgConfig = { fetch: (u, o) => fetch(u, o), globalObj: globalThis, identifier: visitorData, requestKey: REQUEST_KEY };
+      const challenge = await BG.Challenge.create(bgConfig);
+      if (!challenge) throw new Error('BotGuard challenge unavailable');
+      const js = challenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+      if (!js) throw new Error('BotGuard interpreter script missing');
+      new Function(js)();
+      const result = await BG.PoToken.generate({ program: challenge.program, globalName: challenge.globalName, bgConfig });
+      if (!result?.poToken) throw new Error('PoToken generation returned empty');
+      return { token: result.poToken, visitorData };
+    } finally {
+      if (prevWindow === undefined) delete globalThis.window; else globalThis.window = prevWindow;
+      if (prevDocument === undefined) delete globalThis.document; else globalThis.document = prevDocument;
+      try { dom.window.close(); } catch {}
+    }
+  }
+
+  async function refresh(force = false) {
+    if (st.busy) return st.busy;
+    if (!force && Date.now() - st.lastAttempt < MIN_GAP_MS) return null;
+    st.lastAttempt = Date.now();
+    st.busy = (async () => {
+      try {
+        const out = await generateOnce();
+        st.token = out.token; st.visitorData = out.visitorData;
+        st.generatedAt = Date.now(); st.lastError = null;
+        streamCache.clear(); fastStreamCache.clear(); infoCache.clear();
+        log.success(`🔑 PO Token generated (${out.token.length} chars) — valid ~${Math.round(REFRESH_MS / 60000)}min`);
+      } catch (e) {
+        st.lastError = String(e.message || e);
+        log.warn(`🔑 PO Token generation failed: ${st.lastError}`);
+      } finally { st.busy = null; }
+    })();
+    return st.busy;
+  }
+
+  const manual = () => String(process.env.YOUTUBE_PO_TOKEN || process.env.PO_TOKEN || '').trim();
+  const fresh = () => Boolean(st.token && st.visitorData && Date.now() - st.generatedAt < REFRESH_MS * 1.5);
+
+  return {
+    refresh,
+    manual,
+    ready: () => Boolean(manual()) || fresh(),
+    isAuto: () => !manual() && fresh(),
+    get token() { return st.token; },
+    get visitorData() { return st.visitorData; },
+    // اتنادي لما يوتيوب يرفض بسبب التوكن — تجديد بحد أدنى 5 دقايق بين المحاولات
+    invalidateSoon() { if (!manual()) refresh(false).catch(() => {}); },
+    status() {
+      return {
+        mode: manual() ? 'manual-env' : (fresh() ? 'auto' : 'none'),
+        hasToken: Boolean(manual()) || fresh(),
+        generatedAt: st.generatedAt ? new Date(st.generatedAt).toISOString() : null,
+        ageMin: st.generatedAt ? Math.round((Date.now() - st.generatedAt) / 60000) : null,
+        refreshEveryMin: Math.round(REFRESH_MS / 60000),
+        lastError: st.lastError
+      };
+    },
+    start() {
+      if (manual()) { log.info('🔑 PO Token: manual env في الاستخدام — التوليد التلقائي متوقف'); return; }
+      refresh(true).catch(() => {});
+      setInterval(() => { refresh(true).catch(() => {}); }, REFRESH_MS).unref();
+    }
+  };
+})();
+poManager.start();
+
+// تجديد التوكن يدويًا (محمي بـ ADMIN_SECRET لو موجود)
+app.post('/api/po-token/refresh', async (req, res) => {
+  if (!isAdminAuthorized(req)) return res.status(401).json({ error: 'غير مصرح — أرسل X-Admin-Key أو ?key=' });
+  if (poManager.manual()) return res.json({ ok: true, note: 'YOUTUBE_PO_TOKEN يدوي مظبوط — شيله من الـ env لتفعيل التوليد التلقائي', ...poManager.status() });
+  await poManager.refresh(true);
+  res.json({ ok: poManager.ready(), ...poManager.status() });
+});
+app.get('/api/po-token/status', (req, res) => res.json(poManager.status()));
+
+/** PO Token — يدوي من الـ env (أولوية)، وإلا التلقائي من poManager */
 function buildYoutubeExtractorArgs(playerClient) {
   const parts = [];
   if (playerClient) parts.push(`player_client=${playerClient}`);
   // أظهر formats اللي محتاجة PO token في الليست (حتى لو التشغيل محتاج token)
   parts.push('formats=missing_pot');
-  const pot = String(process.env.YOUTUBE_PO_TOKEN || process.env.PO_TOKEN || '').trim();
-  if (pot) {
+  const manualPot = poManager.manual();
+  if (manualPot) {
     // يقبل: web.gvs+XXX أو قائمة مفصولة بفاصلة
-    parts.push(`po_token=${pot}`);
+    parts.push(`po_token=${manualPot}`);
+  } else if (poManager.isAuto()) {
+    const t = poManager.token;
+    parts.push(`po_token=web.gvs+${t},web.player+${t},mweb.gvs+${t}`);
+    parts.push(`visitor_data=${poManager.visitorData}`);
   }
   return parts.join(';');
 }
@@ -3170,7 +3303,8 @@ app.get('/health', (req, res) => {
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: Boolean(ffmpegReadyFlag) || commandExists('ffmpeg') || (ffmpegBin && ffmpegBin !== 'ffmpeg' && fs.existsSync(ffmpegBin)),
     ffmpegBin: ffmpegBin || null,
-    poTokenConfigured: Boolean(String(process.env.YOUTUBE_PO_TOKEN || process.env.PO_TOKEN || '').trim()),
+    poTokenConfigured: poManager.ready(),
+    poToken: poManager.status(),
     cookiesReady,
     cookieUpdateProtected: false,
     concurrency: { metaMax: META_CONCURRENCY, metaCurrent: ytdlpLimiter.current, metaQueued: ytdlpLimiter.queue.length, streamMax: STREAM_CONCURRENCY, streamCurrent: streamLimiter.current, streamQueued: streamLimiter.queue.length }
