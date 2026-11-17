@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.2.9-FULL-FORMATS';
+const SERVER_VERSION = '13.3.0-PO-FORMATS';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -466,7 +466,7 @@ async function runYtDlp(args, opts = {}) {
       const cmd = [
         ...base,
         ...(useCookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []),
-        ...(playerClient ? ['--extractor-args', `youtube:player_client=${playerClient}`] : []),
+        ...(playerClient ? ['--extractor-args', `youtube:${buildYoutubeExtractorArgs(playerClient)}`] : []),
         ...args
       ];
       const { stdout } = await execFileAsync('yt-dlp', cmd, { timeout, maxBuffer, encoding: 'utf-8' });
@@ -478,23 +478,23 @@ async function runYtDlp(args, opts = {}) {
       attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
     };
 
-    // clients أغنى بالـ formats أولًا (tv/web) قبل android المحدود
+    // android_vr + tv غالبًا أفضل لformats من غير PO كامل؛ web يحتاج po_token
     if (useCookies && cookiesReady) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android_vr,tv,ios')}`], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('tv,web')}`], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('web,mweb')}`], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android,web')}`], true);
       pushAttempt([], true);
     } else {
-      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=ios,web_safari']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web']);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android_vr,tv,ios')}`]);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('tv,web')}`]);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('web,mweb')}`]);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android,web')}`]);
       pushAttempt([]);
     }
     if (allowCookieFallback && cookiesReady && !useCookies) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb'], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('android_vr,tv,web')}`], true);
+      pushAttempt(['--extractor-args', `youtube:${buildYoutubeExtractorArgs('web,mweb')}`], true);
       pushAttempt([], true);
     }
 
@@ -633,7 +633,7 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
  * الحصول على معلومات الفيديو الكاملة
  */
 async function getVideoInfo(videoId) {
-  const key = `raw_info_v2_${videoId}`;
+  const key = `raw_info_v4_${videoId}`;
   const cached = infoCache.get(key);
   if (cached) return cached;
 
@@ -645,12 +645,12 @@ async function getVideoInfo(videoId) {
     // - tv/web → formats adaptive كتير
     // - web → automatic_captions
     const plans = [
-      { playerClient: 'tv,web', useCookies: true },
-      { playerClient: 'web', useCookies: true },
-      { playerClient: 'web,mweb,tv', useCookies: true },
-      { playerClient: 'ios,tv,web', useCookies: true },
-      { playerClient: 'android,web', useCookies: true },
-      { playerClient: 'tv,web', useCookies: false }
+      { playerClient: 'android_vr,tv,ios', useCookies: true },
+      { playerClient: 'android_vr,web', useCookies: true },
+      { playerClient: 'tv,ios,web', useCookies: true },
+      { playerClient: 'web,mweb', useCookies: true },
+      { playerClient: 'android_vr,tv,ios', useCookies: false },
+      { playerClient: 'web', useCookies: true }
     ];
 
     let best = null;
@@ -716,6 +716,21 @@ async function getVideoInfo(videoId) {
     infoCache.set(key, best, CACHE_TTL.info);
     return best;
   });
+}
+
+
+/** PO Token من البيئة — بدونها يوتيوب غالبًا بيرجع format 18 فقط */
+function buildYoutubeExtractorArgs(playerClient) {
+  const parts = [];
+  if (playerClient) parts.push(`player_client=${playerClient}`);
+  // أظهر formats اللي محتاجة PO token في الليست (حتى لو التشغيل محتاج token)
+  parts.push('formats=missing_pot');
+  const pot = String(process.env.YOUTUBE_PO_TOKEN || process.env.PO_TOKEN || '').trim();
+  if (pot) {
+    // يقبل: web.gvs+XXX أو قائمة مفصولة بفاصلة
+    parts.push(`po_token=${pot}`);
+  }
+  return parts.join(';');
 }
 
 function isHlsUrl(url) {
@@ -3074,7 +3089,7 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v11_${videoId}`;
+  const cacheKey = `qualities_v12_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -3155,6 +3170,7 @@ app.get('/health', (req, res) => {
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: Boolean(ffmpegReadyFlag) || commandExists('ffmpeg') || (ffmpegBin && ffmpegBin !== 'ffmpeg' && fs.existsSync(ffmpegBin)),
     ffmpegBin: ffmpegBin || null,
+    poTokenConfigured: Boolean(String(process.env.YOUTUBE_PO_TOKEN || process.env.PO_TOKEN || '').trim()),
     cookiesReady,
     cookieUpdateProtected: false,
     concurrency: { metaMax: META_CONCURRENCY, metaCurrent: ytdlpLimiter.current, metaQueued: ytdlpLimiter.queue.length, streamMax: STREAM_CONCURRENCY, streamCurrent: streamLimiter.current, streamQueued: streamLimiter.queue.length }
