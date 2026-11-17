@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.2.6-CAPTIONS-AUDIO';
+const SERVER_VERSION = '13.2.8-FFMPEG-FIXED';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -627,16 +627,37 @@ async function getVideoInfo(videoId) {
     const again = infoCache.get(key);
     if (again) return again;
 
-    // كوكيز + clients متعددة → تشتغل مع غير المدرج والعمر
-    const stdout = await runYtDlp([
-      '--dump-json', '--no-playlist',
-      `https://www.youtube.com/watch?v=${videoId}`
-    ], {
-      timeout: 60000,
-      useCookies: cookiesReady,
-      allowCookieFallback: true
-    });
-    const info = JSON.parse(stdout);
+    // web/tv: automatic_captions + formats أكتر (android لوحده غالبًا فاضي من الترجمة)
+    const clients = ['web,mweb,tv', 'tv,web_embedded', 'web', 'android,web'];
+    let info = null;
+    let lastErr = null;
+    for (const client of clients) {
+      try {
+        const stdout = await runYtDlp([
+          '--dump-json', '--no-playlist',
+          '--extractor-args', `youtube:player_client=${client}`,
+          `https://www.youtube.com/watch?v=${videoId}`
+        ], {
+          timeout: 70000,
+          useCookies: cookiesReady,
+          allowCookieFallback: true
+        });
+        const parsed = JSON.parse(stdout);
+        const formats = Array.isArray(parsed.formats) ? parsed.formats.length : 0;
+        const subs =
+          Object.keys(parsed.subtitles || {}).length +
+          Object.keys(parsed.automatic_captions || {}).length;
+        const score = formats + subs * 3;
+        const prev = info
+          ? (info.formats || []).length + (Object.keys(info.subtitles || {}).length + Object.keys(info.automatic_captions || {}).length) * 3
+          : -1;
+        if (score > prev) info = parsed;
+        if (formats >= 5 || subs > 0) break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!info) throw lastErr || new Error('Failed to extract video info');
     infoCache.set(key, info, CACHE_TTL.info);
     return info;
   });
@@ -2349,38 +2370,91 @@ function getAvailableQualities(info) {
 }
 
 
-let ffmpegBin = 'ffmpeg';
+let ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 let ffmpegReadyFlag = null;
-async function ensureFfmpeg() {
-  if (ffmpegReadyFlag === true) return true;
-  if (commandExists('ffmpeg')) { ffmpegReadyFlag = true; ffmpegBin = 'ffmpeg'; return true; }
+
+function httpDownloadToFile(url, dest, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 8) return reject(new Error('too many redirects'));
+    const mod = url.startsWith('http://') ? require('http') : https;
+    const req = mod.get(url, { timeout: 180000, headers: { 'User-Agent': 'titan-ffmpeg-bootstrap/1.0' } }, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return resolve(httpDownloadToFile(next, dest, redirects + 1));
+      }
+      if ((res.statusCode || 500) >= 400) {
+        res.resume();
+        return reject(new Error(`download HTTP ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(dest);
+      res.pipe(file);
+      file.on('finish', () => file.close(err => err ? reject(err) : resolve(dest)));
+      file.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('download timeout')); });
+  });
+}
+
+function testFfmpegBinary(bin) {
   try {
-    const dir = '/tmp/.bin';
-    const dest = dir + '/ffmpeg';
+    require('child_process').execFileSync(bin, ['-version'], { stdio: 'ignore', timeout: 8000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureFfmpeg() {
+  if (ffmpegReadyFlag === true && testFfmpegBinary(ffmpegBin)) return true;
+  if (commandExists('ffmpeg') && testFfmpegBinary('ffmpeg')) {
+    ffmpegBin = 'ffmpeg'; ffmpegReadyFlag = true; return true;
+  }
+  if (process.env.FFMPEG_PATH && testFfmpegBinary(process.env.FFMPEG_PATH)) {
+    ffmpegBin = process.env.FFMPEG_PATH; ffmpegReadyFlag = true; return true;
+  }
+
+  const dir = '/tmp/.bin';
+  const dest = `${dir}/ffmpeg`;
+  try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     if (fs.existsSync(dest)) {
       try { fs.chmodSync(dest, 0o755); } catch {}
-      ffmpegBin = dest; ffmpegReadyFlag = true; return true;
+      if (testFfmpegBinary(dest)) {
+        ffmpegBin = dest; ffmpegReadyFlag = true; return true;
+      }
+      try { fs.unlinkSync(dest); } catch {}
     }
-    // static build optional — لو فشل يفضل progressive فقط
-    const url = 'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/ffmpeg-linux-x64';
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(dest);
-      https.get(url, { timeout: 120000, agent: keepAliveAgent }, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          https.get(res.headers.location, { timeout: 120000 }, (r2) => r2.pipe(file));
-          file.on('finish', () => { file.close(); resolve(); });
-          return;
+
+    const urls = [
+      'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1/ffmpeg-linux-x64',
+      'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/ffmpeg-linux-x64',
+      'https://github.com/eugeneware/ffmpeg-static/releases/download/b5.2.0/ffmpeg-linux-x64'
+    ];
+    let lastErr = null;
+    for (const url of urls) {
+      try {
+        log.info(`⬇️  downloading ffmpeg static: ${url}`);
+        await httpDownloadToFile(url, dest);
+        fs.chmodSync(dest, 0o755);
+        if (testFfmpegBinary(dest)) {
+          ffmpegBin = dest;
+          ffmpegReadyFlag = true;
+          commandCache.set('ffmpeg', true);
+          log.success(`✅ ffmpeg ready at ${dest}`);
+          return true;
         }
-        res.pipe(file);
-        file.on('finish', () => { file.close(); resolve(); });
-      }).on('error', reject);
-    });
-    fs.chmodSync(dest, 0o755);
-    ffmpegBin = dest; ffmpegReadyFlag = true; return true;
+      } catch (e) {
+        lastErr = e;
+        try { fs.unlinkSync(dest); } catch {}
+      }
+    }
+    throw lastErr || new Error('ffmpeg download failed');
   } catch (e) {
     log.warn(`ensureFfmpeg: ${e.message}`);
-    ffmpegReadyFlag = false; return false;
+    ffmpegReadyFlag = false;
+    return false;
   }
 }
 
@@ -2945,7 +3019,7 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v9_${videoId}`;
+  const cacheKey = `qualities_v10_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -2969,9 +3043,9 @@ app.get('/video/qualities', async (req, res) => {
         label: `${h}p`,
         quality: String(h),
         height: h,
-        type: exactProg || nearProg ? 'progressive' : 'needs-ffmpeg',
-        playable,
-        available: !!hasAny,
+        type: exactProg ? 'progressive' : (hasFfmpeg && hasAny ? 'adaptive+ffmpeg' : (nearProg ? 'near-progressive' : 'needs-ffmpeg')),
+        playable: exactProg || (hasFfmpeg && (allHeights.includes(h) || hasAny)) || !!nearProg,
+        available: exactProg || allHeights.includes(h) || !!nearProg || hasFfmpeg,
         actualProgressive: nearProg || (exactProg ? h : null),
         url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
@@ -3024,7 +3098,8 @@ app.get('/health', (req, res) => {
     ytdlpVersion: (() => { try { return require('child_process').execFileSync('yt-dlp', ['--version'], { encoding: 'utf8' }).trim(); } catch { return null; } })(),
     nodeVersion: process.version,
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
-    ffmpegReady: commandExists('ffmpeg'),
+    ffmpegReady: Boolean(ffmpegReadyFlag) || commandExists('ffmpeg') || (ffmpegBin && ffmpegBin !== 'ffmpeg' && fs.existsSync(ffmpegBin)),
+    ffmpegBin: ffmpegBin || null,
     cookiesReady,
     cookieUpdateProtected: false,
     concurrency: { metaMax: META_CONCURRENCY, metaCurrent: ytdlpLimiter.current, metaQueued: ytdlpLimiter.queue.length, streamMax: STREAM_CONCURRENCY, streamCurrent: streamLimiter.current, streamQueued: streamLimiter.queue.length }
@@ -3997,7 +4072,7 @@ function summarizeTestBody(body) {
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
-  ensureFfmpeg().then(ok => log.info(ok ? 'ffmpeg ready' : 'ffmpeg missing')).catch(() => {});
+  ensureFfmpeg().then(ok => { if (ok) log.success('✅ ffmpeg available for multi-quality'); else log.warn('⚠️ ffmpeg missing — only progressive heights'); }).catch(e => log.warn(String(e.message||e)));
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 66000;
   server.requestTimeout = 0;
