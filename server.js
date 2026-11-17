@@ -18,7 +18,7 @@ require('dotenv').config();
 // ==========================================================================
 // v13.4.0 — AUTO PO TOKEN: السيرفر بيولّد PO Token + Visitor Data لوحده
 // (bgutils-js + jsdom) ويجدده كل 4 ساعات، من غير أي توكن يدوي.
-const SERVER_VERSION = '13.4.0-AUTO-PO';
+const SERVER_VERSION = '13.4.1-DIAG';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -762,10 +762,10 @@ const poManager = (() => {
   async function generateOnce() {
     let JSDOM;
     try { ({ JSDOM } = require('jsdom')); }
-    catch { throw new Error('حزمة jsdom مش منصّبة — شغّل: npm i bgutils-js jsdom'); }
+    catch (e) { throw new Error('حزمة jsdom مش متحمّلة: ' + String(e.message || e).split('\n')[0]); }
     let BG;
     try { ({ BG } = await import('bgutils-js')); }
-    catch { throw new Error('حزمة bgutils-js مش منصّبة — شغّل: npm i bgutils-js jsdom'); }
+    catch (e) { throw new Error('حزمة bgutils-js مش متحمّلة: ' + String(e.message || e).split('\n')[0]); }
 
     const visitorData = await fetchVisitorData();
     const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
@@ -4231,6 +4231,149 @@ app.get('/api/live', async (req, res) => {
     log.warn(`/api/live failed: ${String(e.message || e).split('\n')[0]}`);
     res.status(502).json({ error: 'تعذّر جلب البث المباشر' });
   }
+});
+
+// ==========================================================================
+// 🧪 لوحة التجربة: /test — حالة السيرفر + تشغيل فيديو/صوت + اختبار الجودات
+// محمية بـ ADMIN_SECRET لو موجود (?key=...)
+// ==========================================================================
+const TEST_PAGE_HTML = `<!DOCTYPE html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>لوحة التجربة</title>
+<style>
+body{font-family:system-ui,Tahoma,sans-serif;background:#0f1115;color:#eee;margin:0 auto;padding:16px;max-width:900px}
+h2{margin:8px 0}
+.card{background:#181b22;border:1px solid #262b36;border-radius:12px;padding:14px;margin:12px 0}
+input,select,button{font-size:16px;padding:10px;border-radius:8px;border:1px solid #333;background:#0f1115;color:#eee}
+button{background:#e11d48;border:0;cursor:pointer;color:#fff;font-weight:bold}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.ok{color:#4ade80}.bad{color:#f87171}
+pre{white-space:pre-wrap;word-break:break-all;background:#0b0d11;padding:10px;border-radius:8px;font-size:13px;max-height:280px;overflow:auto}
+video{width:100%;max-height:480px;background:#000;border-radius:10px}
+#msg{margin:6px 0;font-weight:bold}
+</style></head><body>
+<h2>🎬 لوحة الإدارة والتجربة</h2>
+
+<div class="card"><b>حالة السيرفر</b>
+<div id="status">جاري التحميل...</div>
+<div class="row"><button onclick="loadStatus()">تحديث الحالة</button></div>
+</div>
+
+<div class="card"><b>تجربة تشغيل فيديو</b>
+<div class="row"><input id="vid" value="XiHeZamhotQ" placeholder="Video ID (11 حرف)" style="flex:1;min-width:200px"></div>
+<div class="row">
+<select id="q">
+<option value="">افتراضي (360)</option>
+<option value="144">144p</option>
+<option value="240">240p</option>
+<option value="360">360p</option>
+<option value="480">480p</option>
+<option value="720">720p</option>
+<option value="1080">1080p</option>
+<option value="audio">صوت فقط</option>
+</select>
+<button onclick="play()">▶ شغّل</button>
+<button onclick="checkQ()">اختبار الجودات</button>
+</div>
+<div id="msg"></div>
+<video id="player" controls playsinline></video>
+</div>
+
+<div class="card"><b>تفاصيل آخر طلب</b><pre id="out">-</pre></div>
+
+<script>
+var KEY = new URLSearchParams(location.search).get('key') || '';
+function withKey(path) {
+  if (!KEY) return path;
+  return path + (path.indexOf('?') > -1 ? '&' : '?') + 'key=' + encodeURIComponent(KEY);
+}
+function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function show(x) { document.getElementById('out').textContent = (typeof x === 'string') ? x : JSON.stringify(x, null, 2); }
+function msg(t, bad) { var m = document.getElementById('msg'); m.textContent = t; m.className = bad ? 'bad' : 'ok'; }
+function getJson(path) {
+  return fetch(withKey(path)).then(function (r) {
+    return r.text().then(function (t) {
+      var j; try { j = JSON.parse(t); } catch (e) { j = { raw: t.slice(0, 500) }; }
+      return { status: r.status, body: j };
+    });
+  });
+}
+
+function loadStatus() {
+  Promise.all([
+    getJson('/health'),
+    getJson('/api/po-token/status'),
+    getJson('/api/cookies-status')
+  ]).then(function (a) {
+    var health = a[0].body, po = a[1].body, ck = a[2].body;
+    var rows = [];
+    rows.push('الكوكيز: ' + (ck.hasCookies ? '<span class="ok">✅ موجودة</span>' : '<span class="bad">❌ فارغة</span>'));
+    rows.push('PO Token: ' + (po.hasToken ? '<span class="ok">✅ ' + esc(po.mode) + '</span>' : '<span class="bad">❌ ' + esc(po.mode) + '</span>'));
+    if (po.lastError) rows.push('<span class="bad">سبب: ' + esc(po.lastError) + '</span>');
+    if (health && health.ffmpegReady !== undefined) {
+      rows.push('ffmpeg: ' + (health.ffmpegReady ? '<span class="ok">✅</span>' : '<span class="bad">❌</span>'));
+    }
+    document.getElementById('status').innerHTML = rows.join('<br>');
+    show({ health: a[0], poToken: a[1], cookies: a[2] });
+  }).catch(function (e) {
+    document.getElementById('status').innerHTML = '<span class="bad">تعذّر الاتصال: ' + esc(e) + '</span>';
+  });
+}
+
+function play() {
+  var id = document.getElementById('vid').value.trim();
+  var qv = document.getElementById('q').value;
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) { msg('Video ID لازم يكون 11 حرف', true); return; }
+  var url = '/video?v=' + id + (qv ? '&quality=' + qv : '');
+  var player = document.getElementById('player');
+  player.onerror = function () { msg('المشغّل ما قدرش يشغّل المصدر — شوف التفاصيل تحت', true); };
+  if (!qv) {
+    msg('بيشغّل الافتراضي...');
+    show({ url: url });
+    player.src = url;
+    player.play().catch(function () {});
+    return;
+  }
+  msg('جاري التحضير... (أول مرة ممكن ياخد 10-40 ثانية)');
+  getJson(url + '&probe=1').then(function (x) {
+    show(x);
+    if (x.status >= 400) {
+      var b = x.body || {};
+      msg('فشل (' + x.status + '): ' + (b.error || 'خطأ') + (b.hint ? ' — ' + b.hint : ''), true);
+      return;
+    }
+    msg('تم التحضير، بيشغّل...');
+    player.src = url;
+    player.play().catch(function () {});
+  }).catch(function (e) { msg('خطأ شبكة: ' + e, true); });
+}
+
+function checkQ() {
+  var id = document.getElementById('vid').value.trim();
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) { msg('Video ID لازم يكون 11 حرف', true); return; }
+  msg('بيفحص الجودات...');
+  getJson('/video/qualities?v=' + id).then(function (x) {
+    show(x);
+    if (x.status >= 400) { msg('فشل الفحص (' + x.status + ')', true); return; }
+    var list = (x.body.qualities || []).map(function (q) {
+      return (q.label || q.quality) + ' → ' + (q.type || '?') + (q.playable ? ' ✅' : ' ❌');
+    });
+    msg('الجودات: ' + (list.length ? list.join(' | ') : 'مفيش'));
+  }).catch(function (e) { msg('خطأ شبكة: ' + e, true); });
+}
+
+loadStatus();
+</script>
+</body></html>`;
+
+app.get('/test', (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).type('text/plain; charset=utf-8').send('غير مصرح — أضف ?key=ADMIN_SECRET للرابط');
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  return res.send(TEST_PAGE_HTML);
 });
 
 // 404
