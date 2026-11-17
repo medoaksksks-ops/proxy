@@ -16,7 +16,7 @@ require('dotenv').config();
 //   • جلب متوازي (Promise.all) بدل التسلسلي → أسرع بشكل ملحوظ.
 //   • keep-alive agent لإعادة استخدام الاتصالات مع جوجل.
 // ==========================================================================
-const SERVER_VERSION = '13.2.8-FFMPEG-FIXED';
+const SERVER_VERSION = '13.2.9-FULL-FORMATS';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -451,7 +451,9 @@ async function runYtDlp(args, opts = {}) {
     maxBuffer = 1024 * 1024 * 12,
     useCookies = false,
     allowCookieFallback = true,
-    lane = 'meta'
+    lane = 'meta',
+    raw = false,
+    playerClient = null
   } = opts;
   const limiter = lane === 'stream' ? streamLimiter : ytdlpLimiter;
   await limiter.acquire();
@@ -459,27 +461,40 @@ async function runYtDlp(args, opts = {}) {
     const base = ['--no-warnings', '--geo-bypass'];
     if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
 
+    // raw: نفّذ args زي ما هي (مفيد لاستخراج formats/ترجمة كاملة)
+    if (raw) {
+      const cmd = [
+        ...base,
+        ...(useCookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []),
+        ...(playerClient ? ['--extractor-args', `youtube:player_client=${playerClient}`] : []),
+        ...args
+      ];
+      const { stdout } = await execFileAsync('yt-dlp', cmd, { timeout, maxBuffer, encoding: 'utf-8' });
+      return stdout;
+    }
+
     const attempts = [];
     const pushAttempt = (extra, cookies = false) => {
       attempts.push([...base, ...extra, ...(cookies && cookiesReady ? ['--cookies', COOKIES_PATH] : []), ...args]);
     };
 
-    // ترتيب المحاولات: كوكيز أولًا لو متاحة (مهمة لغير المدرج / العمر / الخاص-بالرابط)،
-    // بعدين clients متعددة عشان unlisted و age-gate يشتغلوا.
+    // clients أغنى بالـ formats أولًا (tv/web) قبل android المحدود
     if (useCookies && cookiesReady) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb'], true);
       pushAttempt(['--extractor-args', 'youtube:player_client=ios,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_safari'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
       pushAttempt([], true);
     } else {
-      pushAttempt([]);
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web']);
+      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web']);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb']);
       pushAttempt(['--extractor-args', 'youtube:player_client=ios,web_safari']);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded']);
+      pushAttempt(['--extractor-args', 'youtube:player_client=android,web']);
+      pushAttempt([]);
     }
     if (allowCookieFallback && cookiesReady && !useCookies) {
-      pushAttempt(['--extractor-args', 'youtube:player_client=android,web'], true);
-      pushAttempt(['--extractor-args', 'youtube:player_client=web_embedded,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=tv,web'], true);
+      pushAttempt(['--extractor-args', 'youtube:player_client=web,mweb'], true);
       pushAttempt([], true);
     }
 
@@ -491,7 +506,6 @@ async function runYtDlp(args, opts = {}) {
       } catch (error) {
         lastError = error;
         const msg = String(error.message || error).toLowerCase();
-        // غير المدرج / خاص / عمر → كمّل على المحاولة التالية
         const keepTrying = isRetryableYoutubeError(error)
           || msg.includes('private')
           || msg.includes('unlisted')
@@ -619,7 +633,7 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
  * الحصول على معلومات الفيديو الكاملة
  */
 async function getVideoInfo(videoId) {
-  const key = `raw_info_${videoId}`;
+  const key = `raw_info_v2_${videoId}`;
   const cached = infoCache.get(key);
   if (cached) return cached;
 
@@ -627,39 +641,80 @@ async function getVideoInfo(videoId) {
     const again = infoCache.get(key);
     if (again) return again;
 
-    // web/tv: automatic_captions + formats أكتر (android لوحده غالبًا فاضي من الترجمة)
-    const clients = ['web,mweb,tv', 'tv,web_embedded', 'web', 'android,web'];
-    let info = null;
+    // نجمع أفضل نتيجة من clients مختلفة:
+    // - tv/web → formats adaptive كتير
+    // - web → automatic_captions
+    const plans = [
+      { playerClient: 'tv,web', useCookies: true },
+      { playerClient: 'web', useCookies: true },
+      { playerClient: 'web,mweb,tv', useCookies: true },
+      { playerClient: 'ios,tv,web', useCookies: true },
+      { playerClient: 'android,web', useCookies: true },
+      { playerClient: 'tv,web', useCookies: false }
+    ];
+
+    let best = null;
+    let bestScore = -1;
     let lastErr = null;
-    for (const client of clients) {
+
+    for (const plan of plans) {
       try {
         const stdout = await runYtDlp([
-          '--dump-json', '--no-playlist',
-          '--extractor-args', `youtube:player_client=${client}`,
+          '--dump-json',
+          '--no-playlist',
+          '--no-check-certificates',
           `https://www.youtube.com/watch?v=${videoId}`
         ], {
-          timeout: 70000,
-          useCookies: cookiesReady,
-          allowCookieFallback: true
+          timeout: 75000,
+          useCookies: plan.useCookies && cookiesReady,
+          allowCookieFallback: false,
+          raw: true,
+          playerClient: plan.playerClient,
+          maxBuffer: 1024 * 1024 * 20
         });
         const parsed = JSON.parse(stdout);
-        const formats = Array.isArray(parsed.formats) ? parsed.formats.length : 0;
+        const formats = Array.isArray(parsed.formats) ? parsed.formats : [];
+        const heights = new Set(formats.map(f => Number(f.height)).filter(h => h > 0));
         const subs =
           Object.keys(parsed.subtitles || {}).length +
           Object.keys(parsed.automatic_captions || {}).length;
-        const score = formats + subs * 3;
-        const prev = info
-          ? (info.formats || []).length + (Object.keys(info.subtitles || {}).length + Object.keys(info.automatic_captions || {}).length) * 3
-          : -1;
-        if (score > prev) info = parsed;
-        if (formats >= 5 || subs > 0) break;
+        const audioOnly = formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')).length;
+        const score = formats.length * 2 + heights.size * 10 + subs * 5 + audioOnly * 3;
+
+        log.info(`info client=${plan.playerClient} formats=${formats.length} heights=${[...heights].sort((a,b)=>b-a).slice(0,8).join(',')} subs=${subs} score=${score}`);
+
+        if (score > bestScore) {
+          best = parsed;
+          bestScore = score;
+        }
+        // يكفي لو عندنا ارتفاعات متعددة + (ترجمة أو صوت)
+        if (heights.size >= 3 && (subs > 0 || audioOnly > 0)) break;
+        if (heights.size >= 5) break;
       } catch (e) {
         lastErr = e;
+        log.warn(`info client ${plan.playerClient} fail: ${String(e.message || e).split('\n')[0]}`);
       }
     }
-    if (!info) throw lastErr || new Error('Failed to extract video info');
-    infoCache.set(key, info, CACHE_TTL.info);
-    return info;
+
+    if (!best) throw lastErr || new Error('Failed to extract video info');
+
+    // ادمج ترجمات من محاولة web لو best من غيرها فاضي
+    if (!Object.keys(best.automatic_captions || {}).length && !Object.keys(best.subtitles || {}).length) {
+      try {
+        const stdout = await runYtDlp([
+          '--dump-json', '--no-playlist',
+          `https://www.youtube.com/watch?v=${videoId}`
+        ], { timeout: 60000, useCookies: cookiesReady, raw: true, playerClient: 'web', maxBuffer: 1024 * 1024 * 16 });
+        const webInfo = JSON.parse(stdout);
+        if (Object.keys(webInfo.subtitles || {}).length || Object.keys(webInfo.automatic_captions || {}).length) {
+          best.subtitles = webInfo.subtitles || best.subtitles;
+          best.automatic_captions = webInfo.automatic_captions || best.automatic_captions;
+        }
+      } catch {}
+    }
+
+    infoCache.set(key, best, CACHE_TTL.info);
+    return best;
   });
 }
 
@@ -3019,7 +3074,7 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v10_${videoId}`;
+  const cacheKey = `qualities_v11_${videoId}`;
   const cached = infoCache.get(cacheKey);
   if (cached) return res.json(cached);
 
