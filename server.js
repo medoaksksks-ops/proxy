@@ -662,7 +662,9 @@ async function getVideoInfo(videoId) {
     let bestScore = -1;
     let lastErr = null;
 
+    const infoDeadline = Date.now() + 90000;
     for (const plan of plans) {
+      if (best && Date.now() > infoDeadline) break;
       try {
         const stdout = await runYtDlp([
           '--dump-json',
@@ -2269,7 +2271,7 @@ async function getQualityStreamUrl(videoId, height) {
       const info = await getVideoInfo(videoId);
       const prog = chooseProgressiveFormat(info, h);
       if (prog?.formatId && Math.abs(Number(prog.actualHeight) - h) <= 8) {
-        const urls = await getFormatUrls(videoId, prog.formatId);
+        const urls = prog.url ? [prog.url] : await getFormatUrls(videoId, prog.formatId);
         if (urls[0] && !isHlsUrl(urls[0])) {
           const out = {
             url: urls[0],
@@ -2528,7 +2530,13 @@ function chooseQualityFormats(info, requestedHeight) {
     };
   }
 
-  const video = same.sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  // H.264 (avc1) أولًا لأنه بيتشغّل على كل الأجهزة؛ AV1/VP9 ممكن يطلع فيديو أسود أو صوت بس
+  const video = same.sort((a, b) => {
+    const ah = String(a.vcodec || '').startsWith('avc1') ? 1 : 0;
+    const bh = String(b.vcodec || '').startsWith('avc1') ? 1 : 0;
+    if (bh !== ah) return bh - ah;
+    return (b.tbr || 0) - (a.tbr || 0);
+  })[0];
   const audioCandidates = (info.formats || [])
     .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
   const audio = audioCandidates.sort((a, b) => {
@@ -2552,6 +2560,19 @@ function chooseQualityFormats(info, requestedHeight) {
 }
 
 // أعلى جودة فيها صوت+فيديو في ملف واحد (يعني ينفع redirect مباشر) <= الجودة المطلوبة
+// رابط مباشر من ميتاداتا الاستخراج الواحدة (dump-json) — بيلغي استدعاءات get-url الإضافية
+function usableDirectUrl(f) {
+  const u = f && typeof f.url === 'string' ? f.url : '';
+  return u && !isHlsUrl(u) ? u : null;
+}
+
+function pickBestAudioUrl(info) {
+  const audio = (info.formats || [])
+    .filter(f => f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && usableDirectUrl(f))
+    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0));
+  return audio[0] ? audio[0].url : null;
+}
+
 function chooseProgressiveFormat(info, requestedHeight) {
   const h = Number(requestedHeight);
   const prog = (info.formats || []).filter(f =>
@@ -2563,7 +2584,7 @@ function chooseProgressiveFormat(info, requestedHeight) {
     .sort((a, b) => (b.tbr || 0) - (a.tbr || 0));
   if (!exact.length) return null;
   const pick = exact[0];
-  return { actualHeight: Number(pick.height), formatId: String(pick.format_id) };
+  return { actualHeight: Number(pick.height), formatId: String(pick.format_id), url: usableDirectUrl(pick) };
 }
 
 function getAvailableQualities(info) {
@@ -2600,23 +2621,36 @@ function httpDownloadToFile(url, dest, redirects = 0) {
   });
 }
 
+const ffmpegProbeCache = new Map();
 function testFfmpegBinary(bin) {
+  const hit = ffmpegProbeCache.get(bin);
+  if (hit && hit.until > Date.now()) return hit.ok;
+  let ok = false;
   try {
     require('child_process').execFileSync(bin, ['-version'], { stdio: 'ignore', timeout: 8000 });
-    return true;
-  } catch {
-    return false;
-  }
+    ok = true;
+  } catch { ok = false; }
+  ffmpegProbeCache.set(bin, { ok, until: Date.now() + (ok ? 60 * 60 * 1000 : 60 * 1000) });
+  return ok;
 }
 
+let ffmpegRetryAt = 0;
 async function ensureFfmpeg() {
   if (ffmpegReadyFlag === true && testFfmpegBinary(ffmpegBin)) return true;
+  if (ffmpegReadyFlag === false && Date.now() < ffmpegRetryAt) return false;
   if (commandExists('ffmpeg') && testFfmpegBinary('ffmpeg')) {
     ffmpegBin = 'ffmpeg'; ffmpegReadyFlag = true; return true;
   }
   if (process.env.FFMPEG_PATH && testFfmpegBinary(process.env.FFMPEG_PATH)) {
     ffmpegBin = process.env.FFMPEG_PATH; ffmpegReadyFlag = true; return true;
   }
+
+  try {
+    const staticPath = require('ffmpeg-static');
+    if (staticPath && testFfmpegBinary(staticPath)) {
+      ffmpegBin = staticPath; ffmpegReadyFlag = true; return true;
+    }
+  } catch {}
 
   const dir = '/tmp/.bin';
   const dest = `${dir}/ffmpeg`;
@@ -2657,6 +2691,7 @@ async function ensureFfmpeg() {
   } catch (e) {
     log.warn(`ensureFfmpeg: ${e.message}`);
     ffmpegReadyFlag = false;
+    ffmpegRetryAt = Date.now() + 10 * 60 * 1000;
     return false;
   }
 }
@@ -2683,7 +2718,8 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0) {
     ...inputArgs,
     '-map', '0:v:0',
     ...(audioUrl ? ['-map', '1:a:0'] : ['-map', '0:a:0?']),
-    '-c', 'copy',
+    '-c:v', 'copy',
+    '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
     '-avoid_negative_ts', 'make_zero',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     '-f', 'mp4', 'pipe:1'
@@ -2840,7 +2876,13 @@ app.get('/video', async (req, res) => {
       const selector = (audioFormat && /^[\w.-]+$/.test(audioFormat))
         ? audioFormat
         : 'bestaudio[acodec!=none]/bestaudio/best';
-      const urls = await getFormatUrls(videoId, selector);
+      let urls = [];
+      if (!audioFormat) {
+        const info = await getVideoInfo(videoId).catch(() => null);
+        const direct = info ? pickBestAudioUrl(info) : null;
+        if (direct) urls = [direct];
+      }
+      if (!urls.length) urls = await getFormatUrls(videoId, selector);
       if (probe) return res.json({ probe: true, id: videoId, type: 'audio', formatId: audioFormat || null, resolved: true, urlLength: String(urls[0] || '').length });
       if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: 'audio' });
       res.setHeader('X-Stream-Mode', 'proxy-audio');
@@ -2889,6 +2931,17 @@ app.get('/video', async (req, res) => {
             res.setHeader('X-Stream-Mode', 'proxy-quality');
             return streamFromUpstream(req, res, urls[0], 0, videoDuration);
           }
+          // أسرع مسار: روابط الفيديو والصوت موجودة في نفس ميتاداتا الاستخراج
+          const vUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.videoFormatId));
+          const aUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.audioFormatId));
+          if (selected.mode === 'merge' && vUrl && aUrl) {
+            if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true });
+            res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
+            res.setHeader('X-Requested-Quality', `${h}p`);
+            res.setHeader('X-Stream-Mode', 'ffmpeg');
+            recordPerf('video-quality', Date.now() - requestStartedAt, true);
+            return streamMergedViaFfmpeg(req, res, vUrl, aUrl, videoDuration);
+          }
           // adaptive: video-only + audio at target height
           const heightSelector =
             `bv*[height=${h}]+ba/bv*[height<=${h}][height>=${Math.max(144, h - 40)}]+ba/` +
@@ -2920,27 +2973,14 @@ app.get('/video', async (req, res) => {
         log.warn('ffmpeg missing — cannot deliver non-progressive qualities accurately');
       }
 
-      // 3) Fallback مضمون: أفضل progressive شغال (عادة 360) عشان مفيش فيديو يبوظ
-      try {
-        const fallback = await getFastStreamUrl(videoId);
-        res.setHeader('X-Video-Quality', '360p');
-        res.setHeader('X-Requested-Quality', `${h}p`);
-        res.setHeader('X-Stream-Mode', 'proxy-fallback');
-        res.setHeader('X-Quality-Fallback', '1');
-        res.setHeader('X-Quality-Note', 'requested-height-unavailable-using-360');
-        if (probe) {
-          return res.json({
-            probe: true, id: videoId, type: 'video',
-            requestedQuality: h, actualQuality: 360,
-            mode: 'fallback-progressive', resolved: true, fallback: true
-          });
-        }
-        recordPerf('video-quality', Date.now() - requestStartedAt, true);
-        if (wantDirect) return redirectToCdn(res, fallback, { mode: 'direct-cdn', quality: 360 });
-        return streamFromUpstream(req, res, fallback, 0, videoDuration);
-      } catch (e) {
-        throw new Error(`تعذّر تشغيل الفيديو: ${String(e.message || e).split('\n')[0]}`);
-      }
+      // 3) مفيش مصدر حقيقي للجودة دي → خطأ واضح بدل ما نرجّع 360 بصمت
+      res.setHeader('X-Requested-Quality', `${h}p`);
+      return res.status(503).json({
+        error: `جودة ${h}p مش متاحة دلوقتي`,
+        requestedQuality: h,
+        ffmpegReady: Boolean(hasFfmpeg),
+        hint: hasFfmpeg ? 'المصدر مش متاح لهذه الجودة من يوتيوب' : 'ffmpeg مش متثبت على السيرفر (npm i ffmpeg-static)'
+      });
     }
 
     // Default = fastest direct progressive stream.
