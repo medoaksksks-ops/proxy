@@ -444,6 +444,212 @@ function isRetryableYoutubeError(error) {
   return /page needs to be reloaded|sign in to confirm|confirm you’re not a bot|confirm you're not a bot|http error 403|requested format is not available|video unavailable|not available in your country/.test(text);
 }
 
+// ==========================================================================
+// ⚡ InnerTube fast path — بحث / مقترحات (related) بطلب HTTP مباشر ليوتيوب (≈ 0.2–0.6 ثانية)
+// بدل تشغيل عملية yt-dlp كاملة (2–6 ثواني). بيرجّع نفس شكل سطور yt-dlp --flat-playlist
+// فكل الكود الموجود (parseFlatItems, الفلاتر، الكاش) بيشتغل زي ما هو.
+// أي فشل/نتيجة ناقصة → رجوع تلقائي لـ yt-dlp. تعطيله: INNERTUBE_FAST=0
+// ==========================================================================
+const IT_ENABLED = process.env.INNERTUBE_FAST !== '0';
+const IT_BASE = process.env.INNERTUBE_BASE || 'https://www.youtube.com';
+const IT_VERSION = process.env.INNERTUBE_CLIENT_VERSION || '2.20251110.01.00';
+const IT_KEY = process.env.INNERTUBE_API_KEY || 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+const itBreaker = { fails: 0, until: 0 };
+
+function innertubeCall(endpoint, body, timeout = 4500) {
+  return new Promise((resolve, reject) => {
+    const base = new URL(IT_BASE);
+    const payload = JSON.stringify({
+      context: { client: { clientName: 'WEB', clientVersion: IT_VERSION, hl: 'en', gl: 'EG' } },
+      ...body
+    });
+    const mod = base.protocol === 'http:' ? require('http') : https;
+    const req = mod.request({
+      hostname: base.hostname,
+      port: base.port || (base.protocol === 'http:' ? 80 : 443),
+      path: `/youtubei/v1/${endpoint}?key=${IT_KEY}&prettyPrint=false`,
+      method: 'POST',
+      agent: base.protocol === 'https:' ? keepAliveAgent : undefined,
+      timeout,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'User-Agent': SUB_UA,
+        'Origin': 'https://www.youtube.com',
+        'X-Youtube-Client-Name': '1',
+        'X-Youtube-Client-Version': IT_VERSION,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip'
+      }
+    }, (r) => {
+      if ((r.statusCode || 0) >= 400) { r.resume(); return reject(new Error(`innertube HTTP ${r.statusCode}`)); }
+      const stream = String(r.headers['content-encoding'] || '').toLowerCase() === 'gzip' ? r.pipe(zlib.createGunzip()) : r;
+      const chunks = [];
+      stream.on('data', c => chunks.push(c));
+      stream.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(e); } });
+      stream.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('innertube timeout')));
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+// ---- أدوات parsing مرنة (بتدوّر على الـ renderers في أي مكان — بتتحمّل تغيّر الهيكل) ----
+const itText = (o) => {
+  if (!o) return '';
+  if (typeof o === 'string') return o;
+  if (o.simpleText) return o.simpleText;
+  if (Array.isArray(o.runs)) return o.runs.map(r => r.text || '').join('');
+  return o.content || '';
+};
+function itDuration(str) {
+  const p = String(str || '').trim().split(':').map(Number);
+  if (!p.length || p.some(n => Number.isNaN(n))) return 0;
+  return p.reduce((a, b) => a * 60 + b, 0);
+}
+function itViews(str) {
+  const m = String(str || '').toLowerCase().replace(/,/g, '').match(/([\d.]+)\s*([kmb])?/);
+  if (!m) return 0;
+  let n = parseFloat(m[1]);
+  if (m[2] === 'k') n *= 1e3; else if (m[2] === 'm') n *= 1e6; else if (m[2] === 'b') n *= 1e9;
+  return Math.round(n) || 0;
+}
+function itFindAll(root, key, out = [], depth = 0) {
+  if (!root || typeof root !== 'object' || depth > 45) return out;
+  if (Array.isArray(root)) { for (const x of root) itFindAll(x, key, out, depth + 1); return out; }
+  for (const [k, v] of Object.entries(root)) {
+    if (k === key) out.push(v);
+    if (v && typeof v === 'object') itFindAll(v, key, out, depth + 1);
+  }
+  return out;
+}
+const VIDEO_RENDERER_KEYS = ['videoRenderer', 'compactVideoRenderer', 'gridVideoRenderer', 'playlistPanelVideoRenderer'];
+function itCollect(root, out = [], depth = 0) {
+  if (!root || typeof root !== 'object' || depth > 45) return out;
+  if (Array.isArray(root)) { for (const x of root) itCollect(x, out, depth + 1); return out; }
+  for (const [k, v] of Object.entries(root)) {
+    if (VIDEO_RENDERER_KEYS.includes(k) && v && v.videoId) out.push({ kind: 'r', n: v });
+    else if (k === 'lockupViewModel' && v && v.contentId && String(v.contentType || '').includes('VIDEO')) out.push({ kind: 'l', n: v });
+    else if (v && typeof v === 'object') itCollect(v, out, depth + 1);
+  }
+  return out;
+}
+function itBuild(id, title, author, channelId, duration, views, isLive) {
+  if (!id || !title) return null;
+  return {
+    id, title, uploader: author, channel: author, channel_id: channelId || '',
+    duration: isLive ? 0 : duration, view_count: views,
+    thumbnails: [{ url: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, height: 360, id: 'hqdefault' }],
+    is_live: !!isLive, live_status: isLive ? 'is_live' : 'not_live'
+  };
+}
+function itFromRenderer(r) {
+  const owner = r.ownerText || r.longBylineText || r.shortBylineText;
+  const overlay = (r.thumbnailOverlays || []).map(o => o.thumbnailOverlayTimeStatusRenderer).find(Boolean);
+  const isLive = (overlay && overlay.style === 'LIVE') ||
+    (r.badges || []).some(b => b.metadataBadgeRenderer && b.metadataBadgeRenderer.style === 'BADGE_STYLE_TYPE_LIVE_NOW');
+  let dur = itDuration(itText(r.lengthText));
+  if (!dur && overlay) dur = itDuration(itText(overlay.text));
+  return itBuild(
+    r.videoId, itText(r.title),
+    itText(owner), owner && owner.runs && owner.runs[0] && owner.runs[0].navigationEndpoint && owner.runs[0].navigationEndpoint.browseEndpoint && owner.runs[0].navigationEndpoint.browseEndpoint.browseId,
+    dur, itViews(itText(r.viewCountText || r.shortViewCountText)), isLive
+  );
+}
+function itFromLockup(l) {
+  const md = l.metadata && l.metadata.lockupMetadataViewModel;
+  const title = itText(md && md.title);
+  const parts = itFindAll(md && md.metadata, 'metadataParts').flat().map(p => itText(p && p.text));
+  const author = parts[0] || '';
+  const viewsText = parts.find(p => /view|watching|مشاهد/i.test(p)) || '';
+  const badges = itFindAll(l.contentImage, 'thumbnailBadgeViewModel').map(b => itText(b && b.text));
+  const durText = badges.find(b => /^\d+(:\d+)+$/.test(String(b).trim()));
+  const isLive = badges.some(b => /^(live|مباشر)$/i.test(String(b).trim())) || /watching/i.test(viewsText);
+  const browseId = (itFindAll(md, 'browseId')[0]) || '';
+  return itBuild(l.contentId, title, author, browseId, itDuration(durText), itViews(viewsText), isLive);
+}
+function itItems(data) {
+  const seen = new Set(); const out = [];
+  for (const c of itCollect(data)) {
+    const item = c.kind === 'r' ? itFromRenderer(c.n) : itFromLockup(c.n);
+    if (item && !seen.has(item.id)) { seen.add(item.id); out.push(item); }
+  }
+  return out;
+}
+function itContinuation(data) {
+  const c = itFindAll(data, 'continuationItemRenderer')[0];
+  return c && c.continuationEndpoint && c.continuationEndpoint.continuationCommand && c.continuationEndpoint.continuationCommand.token || null;
+}
+
+async function innertubeSearch(query, count, params) {
+  let data = await innertubeCall('search', { query, params });
+  const items = itItems(data);
+  const seen = new Set(items.map(i => i.id));
+  let token = itContinuation(data);
+  for (let page = 1; items.length < count && token && page < 8; page++) {
+    data = await innertubeCall('search', { continuation: token });
+    for (const it of itItems(data)) if (!seen.has(it.id)) { seen.add(it.id); items.push(it); }
+    token = itContinuation(data);
+  }
+  return items.slice(0, count);
+}
+async function innertubeRelated(videoId, count) {
+  let data = await innertubeCall('next', { videoId });
+  const items = itItems(data).filter(i => i.id !== videoId);
+  const seen = new Set(items.map(i => i.id));
+  let token = itContinuation(data);
+  for (let page = 1; items.length < count && token && page < 3; page++) {
+    data = await innertubeCall('next', { continuation: token });
+    for (const it of itItems(data)) if (!seen.has(it.id) && it.id !== videoId) { seen.add(it.id); items.push(it); }
+    token = itContinuation(data);
+  }
+  return items.slice(0, count);
+}
+
+// بيرجّع stdout بنفس شكل yt-dlp (سطر JSON لكل فيديو) أو null لو لازم نرجع لـ yt-dlp
+async function innertubeFastPath(args) {
+  if (!IT_ENABLED || itBreaker.until > Date.now()) return null;
+  const a = args.map(String);
+  const endIdx = a.indexOf('--playlist-end');
+  const endN = endIdx >= 0 ? parseInt(a[endIdx + 1], 10) : 0;
+  let count = 0, run = null;
+
+  const sm = a.map(x => x.match(/^ytsearch(date)?(\d+):([\s\S]+)$/)).find(Boolean);
+  if (sm) {
+    count = Math.min(parseInt(sm[2], 10) || 20, 150);
+    run = () => innertubeSearch(sm[3], count, sm[1] ? 'CAISAhAB' : 'EgIQAQ==');
+  } else {
+    const resUrl = a.find(x => /^https:\/\/www\.youtube\.com\/results\?/.test(x));
+    const relUrl = a.find(x => /^https:\/\/www\.youtube\.com\/watch\?v=[\w-]{11}&list=RD/.test(x));
+    if (resUrl) {
+      const sp = new URL(resUrl).searchParams;
+      const q = sp.get('search_query');
+      if (!q) return null;
+      count = Math.min(endN || 30, 100);
+      run = () => innertubeSearch(q, count, sp.get('sp') || 'EgIQAQ==');
+    } else if (relUrl) {
+      const id = relUrl.match(/v=([\w-]{11})/)[1];
+      count = Math.min(endN || 30, 60);
+      run = () => innertubeRelated(id, count);
+    }
+  }
+  if (!run) return null;
+
+  try {
+    const items = await run();
+    // نتيجة قليلة بشكل مريب (حظر/تغيّر هيكل) → خلي yt-dlp يتولى
+    if (items.length < Math.min(count, 8)) { log.warn(`innertube thin result (${items.length}/${count}) → yt-dlp`); return null; }
+    itBreaker.fails = 0;
+    return items.map(i => JSON.stringify(i)).join('\n');
+  } catch (e) {
+    itBreaker.fails++;
+    if (itBreaker.fails >= 3) { itBreaker.until = Date.now() + 60 * 1000; itBreaker.fails = 0; log.warn('innertube paused 60s after repeated failures'); }
+    log.warn(`innertube fail → yt-dlp: ${String(e.message || e).split('\n')[0]}`);
+    return null;
+  }
+}
+
 async function runYtDlp(args, opts = {}) {
   // yt-dlp الحديث مبقاش بيعرف البريفكس ytsearchdateN: → بنحوّله تلقائيًا
   // لرابط بحث يوتيوب مرتّب بتاريخ الرفع (sp=CAI%3D)، ولو فشل نرجع لـ ytsearchN.
@@ -472,6 +678,12 @@ async function runYtDlp(args, opts = {}) {
     raw = false,
     playerClient = null
   } = opts;
+  // بحث/related: HTTP مباشر بدل عملية yt-dlp (من غير ما نستنى في طابور العمليات)
+  if (!raw && args.includes('--flat-playlist')) {
+    const fast = await innertubeFastPath(args);
+    if (fast) return fast;
+  }
+
   const limiter = lane === 'stream' ? streamLimiter : ytdlpLimiter;
   // الطابور بيتاخد لكل محاولة لوحدها (مش للطلب كله) — قبل كده طلب واحد فاشل كان
   // بيحجز مكان لحد 8 محاولات ورا بعض ويخنق باقي المستخدمين.
@@ -1072,12 +1284,15 @@ async function getRelatedVideos(videoId, limit = 10) {
   return dedupe(key, async () => {
     const again = infoCache.get(key); if (again) return again;
     let title = '';
-    try { title = String((await getVideoInfo(videoId)).title || '').replace(/[|]/g, ' ').trim(); } catch {}
     const sources = [];
     try {
       const stdout = await runYtDlp(['--dump-json','--flat-playlist','--yes-playlist','--playlist-end',String(Math.max(limit * 3, 20)),`https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`]);
       sources.push(parseFlatItems(stdout, videoId));
     } catch (e) { log.warn(`Related RD failed: ${e.message}`); }
+    if (sources.flat().length < limit) {
+      // العنوان مطلوب بس لو المقترحات المباشرة مكفتش (قبل كده كنا بنستنى ميتاداتا الفيديو كاملة الأول)
+      try { title = String((await getVideoInfo(videoId)).title || '').replace(/[|]/g, ' ').trim(); } catch {}
+    }
     if (sources.flat().length < limit && title) {
       try { sources.push(await searchVideos(title, Math.max(limit * 3, 20))); } catch (e) { log.warn(`Related title search failed: ${e.message}`); }
     }
@@ -4991,6 +5206,16 @@ function summarizeTestBody(body) {
 }
 
 // Start server
+// 🔥 تسخين الكاش: الهوم فيد جاهز قبل ما أول مستخدم يطلبه، ويتجدد في الخلفية
+async function warmCaches() {
+  try {
+    await getRecommendedVideos('EG', 40, []);
+    log.info('🔥 warm: home feed ready');
+  } catch (e) { log.warn(`warm failed: ${String(e.message || e).split('\n')[0]}`); }
+}
+setTimeout(() => { warmCaches(); }, 6000).unref();
+setInterval(() => { warmCaches(); }, 10 * 60 * 1000).unref();
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   ensureFfmpeg().then(ok => { if (ok) log.success('✅ ffmpeg available for multi-quality'); else log.warn('⚠️ ffmpeg missing — only progressive heights'); }).catch(e => log.warn(String(e.message||e)));
   server.keepAliveTimeout = 65000;
