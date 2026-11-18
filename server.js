@@ -481,7 +481,7 @@ async function runYtDlp(args, opts = {}) {
     finally { limiter.release(); }
   };
 
-  const base = ['--no-warnings', '--geo-bypass'];
+  const base = ['--no-warnings', '--geo-bypass', '--cache-dir', process.env.YTDLP_CACHE_DIR || '/tmp/yt-dlp-cache'];
   if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
 
   // raw: نفّذ args زي ما هي (مفيد لاستخراج formats/ترجمة كاملة)
@@ -669,6 +669,39 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
 /**
  * الحصول على معلومات الفيديو الكاملة
  */
+// بيستنى الخطة التانية (اللي فيها الترجمة)، ولو الفيديو لسه من غير ترجمة بيجرّب خطتين بديلتين مرة واحدة.
+// قبل كده: لو الخطة اللي فيها الترجمة اتأخرت أو فشلت مرة، السيرفر كان يقول "مفيش ترجمة" للأبد.
+async function ensureSubtitles(videoId, info) {
+  const count = () => Object.keys(info.subtitles || {}).length + Object.keys(info.automatic_captions || {}).length;
+  if (info.__settle) { try { await info.__settle; } catch {} }
+  if (count() || info.__subsRetried) return info;
+  return dedupe(`ensure-subs:${videoId}`, async () => {
+    if (count() || info.__subsRetried) return info;
+    Object.defineProperty(info, '__subsRetried', { value: true, enumerable: false, writable: true, configurable: true });
+    for (const plan of [{ playerClient: 'web,mweb', useCookies: false }, { playerClient: 'tv,ios,web', useCookies: true }]) {
+      try {
+        const stdout = await runYtDlp(['--dump-json', '--no-playlist', '--skip-download', `https://www.youtube.com/watch?v=${videoId}`], {
+          timeout: 40000, raw: true, useCookies: plan.useCookies && cookiesReady, playerClient: plan.playerClient, maxBuffer: 1024 * 1024 * 20
+        });
+        const p = JSON.parse(stdout);
+        if (Object.keys(p.subtitles || {}).length || Object.keys(p.automatic_captions || {}).length) {
+          info.subtitles = p.subtitles || {};
+          info.automatic_captions = p.automatic_captions || {};
+          log.info(`subs recovered for ${videoId} via ${plan.playerClient}`);
+          break;
+        }
+      } catch (e) { log.warn(`ensureSubtitles ${plan.playerClient}: ${String(e.message || e).split('\n')[0]}`); }
+    }
+    return info;
+  });
+}
+
+// الخطة التانية (جودات أعلى + دبلجات + ترجمة) بتكمّل في الخلفية؛ دي بتستناها بسقف وقت
+async function waitSettled(info, ms) {
+  if (!info || !info.__pending || !info.__settle) return;
+  await Promise.race([info.__settle.catch(() => {}), new Promise(r => setTimeout(r, ms))]);
+}
+
 async function getVideoInfo(videoId) {
   const key = `raw_info_v4_${videoId}`;
   const cached = infoCache.get(key);
@@ -725,11 +758,9 @@ async function getVideoInfo(videoId) {
     await Promise.race([pA, pB]);
     if (!results.length) {
       await Promise.all([pA, pB]);                       // الأول فشل → استنى التاني
-    } else if (results.length < 2) {
-      // واحد خلّص: ادّي التاني فرصة قصيرة يضيف ترجمات/صوتيات، من غير ما نعطّل الرد
-      const r0 = results[0];
-      const complete = r0.heights.size >= 3 && r0.subs > 0;
-      if (!complete) await Promise.race([Promise.all([pA, pB]), new Promise(r => setTimeout(r, 6000))]);
+    } else if (results[0].client !== planA.playerClient) {
+      // B خلّصت الأول: لحظة قصيرة لـ A لأن روابطها أضمن
+      await Promise.race([pA, new Promise(r => setTimeout(r, 1500))]);
     }
 
     if (!results.length) {
@@ -742,14 +773,8 @@ async function getVideoInfo(videoId) {
     }
     if (!results.length) throw lastErr || new Error('Failed to extract video info');
 
-    // الأساس: خطة A لو طلّعت جودات كفاية (روابطها أضمن)، وإلا أعلى score
-    results.sort((x, y) => y.score - x.score);
-    const primary = results.find(r => r.client === planA.playerClient && r.heights.size >= 3 && r.audioOnly > 0) || results[0];
-    const best = primary.parsed;
-
-    // كمّل الناقص من الخطة التانية: ترجمات + جودات أعلى + لغات صوت إضافية
-    for (const r of results) {
-      if (r === primary) continue;
+    // كمّل الناقص من نتيجة تانية: ترجمات + جودات أعلى + لغات صوت إضافية
+    const mergeInto = (best, r) => {
       const p = r.parsed;
       if (!Object.keys(best.subtitles || {}).length && Object.keys(p.subtitles || {}).length) best.subtitles = p.subtitles;
       if (!Object.keys(best.automatic_captions || {}).length && Object.keys(p.automatic_captions || {}).length) best.automatic_captions = p.automatic_captions;
@@ -768,7 +793,23 @@ async function getVideoInfo(videoId) {
           haveIds.add(String(f.format_id));
         }
       }
-    }
+    };
+
+    // الأساس: خطة A لو طلّعت جودات كفاية (روابطها أضمن)، وإلا أعلى score
+    results.sort((x, y) => y.score - x.score);
+    const primary = results.find(r => r.client === planA.playerClient && r.heights.size >= 3 && r.audioOnly > 0) || results[0];
+    const best = primary.parsed;
+    const merged = new Set([primary]);
+    for (const r of results) if (!merged.has(r)) { mergeInto(best, r); merged.add(r); }
+
+    // الخطة التانية لسه شغّالة؟ بنرد دلوقتي وهي بتكمّل في الخلفية (بتعدّل نفس الكائن المتكاشّ).
+    // /captions و/transcript بيستنوها عبر ensureSubtitles، و/info مبيستناهاش (عشان الوصف يطلع بسرعة).
+    const settle = Promise.allSettled([pA, pB]).then(() => {
+      for (const r of results) if (!merged.has(r)) { mergeInto(best, r); merged.add(r); }
+    });
+    Object.defineProperty(best, '__settle', { value: settle, enumerable: false, configurable: true });
+    Object.defineProperty(best, '__pending', { value: true, enumerable: false, writable: true, configurable: true });
+    settle.then(() => { best.__pending = false; });
 
     const liveNow = !!(best.is_live || best.live_status === 'is_live');
     noteLiveHint(videoId, liveNow);
@@ -1555,10 +1596,11 @@ async function getVideoComments(videoId, limit = 50) {
   log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
   const args = [
     '--skip-download', '--dump-json', '--write-comments',
-    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},all,all,${limit}`,
+    // max-comments,max-parents,max-replies,max-replies-per-thread: بدون ردود = أسرع بكتير
+    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},${limit},0,0`,
     `https://www.youtube.com/watch?v=${videoId}`
   ];
-  const stdout = await runYtDlp(args, { timeout: 45000 });
+  const stdout = await runYtDlp(args, { timeout: 45000, attemptTimeout: 30000 });
   const lines = stdout.trim().split('\n').filter(Boolean);
   const data = JSON.parse(lines[lines.length - 1]);
   return (data.comments || []).slice(0, limit).map(c => ({
@@ -1727,13 +1769,17 @@ app.get('/comments', async (req, res) => {
     });
   }
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
-  const key = `comments:${videoId}:${limit}`;
+  const key = `comments_v2:${videoId}`;
   const cached = infoCache.get(key);
-  if (cached) return res.json(cached);
+  // لو عندنا كاش بعدد أكبر أو مساوي نرد منه فورًا
+  if (cached && cached.fetchedLimit >= limit) {
+    const list = cached.comments.slice(0, limit);
+    return res.json({ id: videoId, count: list.length, comments: list });
+  }
   try {
-    const comments = await getVideoComments(videoId, limit);
+    const comments = await dedupe(`comments:${videoId}:${limit}`, () => getVideoComments(videoId, limit));
     const out = { id: videoId, count: comments.length, comments };
-    infoCache.set(key, out, 10 * 60 * 1000);
+    infoCache.set(key, { fetchedLimit: limit, comments }, comments.length ? 30 * 60 * 1000 : 2 * 60 * 1000);
     log.success(`✅ Comments done: ${videoId} (${comments.length})`);
     res.json(out);
   } catch (error) {
@@ -1752,11 +1798,11 @@ app.get('/comments', async (req, res) => {
 app.get('/captions', async (req, res) => {
   const videoId = String(req.query.v || '');
   if (!isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID غير صحيح' });
-  const key = `captions_v2:${videoId}`;
+  const key = `captions_v3:${videoId}`;
   const cached = infoCache.get(key);
   if (cached) return res.json(cached);
   try {
-    const info = await getVideoInfo(videoId);
+    const info = await ensureSubtitles(videoId, await getVideoInfo(videoId));
     const manual = info.subtitles || {};
     const auto = info.automatic_captions || {};
     const languages = [];
@@ -1799,7 +1845,7 @@ app.get('/captions', async (req, res) => {
       autoCount: languages.filter(l => l.autoGenerated).length,
       languages
     };
-    infoCache.set(key, out, CACHE_TTL.info);
+    infoCache.set(key, out, languages.length ? CACHE_TTL.info : 60 * 1000);
     res.json(out);
   } catch (e) {
     res.status(502).json({ error: 'تعذّر جلب الكابشنز', details: NODE_ENV === 'development' ? e.message : undefined });
@@ -1978,7 +2024,7 @@ app.get('/captions/file', async (req, res) => {
   const wantExt = String(req.query.ext || 'vtt').toLowerCase();
   if (!isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID غير صحيح' });
   try {
-    const info = await getVideoInfo(videoId);
+    const info = await ensureSubtitles(videoId, await getVideoInfo(videoId));
     const sub = await getSubtitleBody(videoId, info, lang, wantExt);
     let body = sub.body;
     let ext = sub.ext;
@@ -2016,6 +2062,7 @@ app.get('/audio-tracks', async (req, res) => {
   if (cached) return res.json(cached);
   try {
     const info = await getVideoInfo(videoId);
+    await waitSettled(info, 4000);   // الدبلجات بتيجي من الخطة التانية
     const formats = Array.isArray(info.formats) ? info.formats : [];
     const audioOnly = formats.filter(f =>
       f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && !isManifestFormat(f)
@@ -2070,7 +2117,7 @@ app.get('/audio-tracks', async (req, res) => {
       ),
       defaultPlay: `/video?v=${videoId}&quality=audio`
     };
-    infoCache.set(key, out, CACHE_TTL.info);
+    infoCache.set(key, out, info.__pending ? 20 * 1000 : CACHE_TTL.info);
     res.json(out);
   } catch (e) {
     res.status(502).json({ error: 'تعذّر جلب المقاطع الصوتية', details: NODE_ENV === 'development' ? e.message : undefined });
@@ -2105,11 +2152,11 @@ app.get('/transcript', async (req, res) => {
   const videoId = String(req.query.v || '');
   const lang = String(req.query.lang || 'ar').toLowerCase();
   if (!isValidVideoId(videoId)) return res.status(400).json({ error: 'Video ID غير صحيح' });
-  const key = `transcript_v2:${videoId}:${lang}`;
+  const key = `transcript_v3:${videoId}:${lang}`;
   const cached = infoCache.get(key);
   if (cached) return res.json(cached);
   try {
-    const info = await getVideoInfo(videoId);
+    const info = await ensureSubtitles(videoId, await getVideoInfo(videoId));
     let found = findSubtitleList(info, lang);
     if (!found) {
       // أي لغة متاحة (اليدوي أولًا)
@@ -3324,6 +3371,7 @@ app.get('/video', async (req, res) => {
       // الرابط بييجي من الميتاداتا الجاهزة (حتى لو اتحدد audioFormat) — بدل yt-dlp جديد
       // اللي كان بيفشل لما format_id يختلف بين الـ clients.
       const audioInfo = await getVideoInfo(videoId).catch(() => null);
+      if (audioInfo && audioFormat && !(audioInfo.formats || []).some(f => String(f.format_id) === audioFormat)) await waitSettled(audioInfo, 10000);
       if (audioInfo) {
         const direct = audioFormat
           ? usableDirectUrl((audioInfo.formats || []).find(f => String(f.format_id) === audioFormat))
@@ -3369,6 +3417,7 @@ app.get('/video', async (req, res) => {
       if (hasFfmpeg) {
         try {
           const info = await getVideoInfo(videoId);
+          if (info.__pending && !getAvailableQualities(info).includes(h)) await waitSettled(info, 10000);
           const selected = chooseQualityFormats(info, h);
           if (selected.mode === 'direct' && Math.abs(Number(selected.actualHeight) - h) <= tol) {
             const dUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.videoFormatId));
@@ -3563,7 +3612,12 @@ app.get('/info', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cached = infoCache.get(`info_full_${videoId}`);
+  let cached = infoCache.get(`info_full_${videoId}`);
+  // لقطة قديمة كانت لسه مستنية الترجمة، والترجمة جهزت دلوقتي → أعد البناء
+  if (cached && cached.subtitlesPending) {
+    const rawNow = infoCache.get(`raw_info_v4_${videoId}`);
+    if (rawNow && !rawNow.__pending) cached = null;
+  }
   if (cached) {
     log.info(`📋 Info from cache: ${videoId}`);
     return res.json(cached);
@@ -3636,6 +3690,7 @@ app.get('/info', async (req, res) => {
       hasChapters: chapters.length > 0,
       subtitles,
       subtitleLanguages: Object.keys(subtitles),
+      subtitlesPending: !!info.__pending && !Object.keys(subtitles).length,   // الترجمة لسه بتتجمّع → اسأل /captions
       availableHeights: heights,
       formatsCount: info.formats?.length || 0,
       webpageUrl: info.webpage_url || `https://www.youtube.com/watch?v=${videoId}`,
@@ -3656,7 +3711,8 @@ app.get('/info', async (req, res) => {
       }
     };
 
-    infoCache.set(`info_full_${videoId}`, result, CACHE_TTL.info);
+    // لو الترجمة/الصوتيات لسه بتكمّل في الخلفية منكاشيش النتيجة كتير
+    infoCache.set(`info_full_${videoId}`, result, result.subtitlesPending ? 15 * 1000 : CACHE_TTL.info);
     log.success(`✅ Got info: ${info.title}`);
 
     res.json(result);
@@ -3681,6 +3737,7 @@ app.get('/formats', async (req, res) => {
 
   try {
     const info = await getVideoInfo(videoId);
+    await waitSettled(info, 4000);
     const formats = (info.formats || [])
       .filter(f => f.vcodec !== 'none' || f.acodec !== 'none')
       .map(f => ({
@@ -3722,6 +3779,7 @@ app.get('/video/qualities', async (req, res) => {
 
   try {
     const info = await getVideoInfo(videoId);
+    await waitSettled(info, 4000);   // عشان الجودات العالية (1080/4K) تظهر في القايمة
 
     // بث مباشر: الجودات الحقيقية من variants الـ HLS
     if (isLiveInfo(info)) {
@@ -3792,7 +3850,7 @@ app.get('/video/qualities', async (req, res) => {
         : 'الجودات progressive تشتغل فورًا. باقي الجودات تحتاج ffmpeg على السيرفر.'
     };
 
-    infoCache.set(cacheKey, result, CACHE_TTL.info);
+    infoCache.set(cacheKey, result, info.__pending ? 20 * 1000 : CACHE_TTL.info);
     res.json(result);
   } catch (error) {
     log.error(`Error fetching qualities: ${error.message}`);
