@@ -182,6 +182,16 @@ const feedCache = new MemoryTTLCache(300);
 const streamCache = new MemoryTTLCache(1000);
 const fastStreamCache = new MemoryTTLCache(600);
 const channelCache = new MemoryTTLCache(250);
+const channelMetaCache = new MemoryTTLCache(300);
+// فيديوهات القناة (flat) مبتجيبش اسم القناة → كان بيظهر Unknown. نملاها من بيانات القناة نفسها.
+function fillChannelOwner(list, channel) {
+  const title = channel && channel.title && channel.title !== 'قناة' ? channel.title : '';
+  return (list || []).map(v => ({
+    ...v,
+    author: (!v.author || v.author === 'Unknown') ? (title || v.author) : v.author,
+    channelId: v.channelId || (channel && channel.id) || ''
+  }));
+}
 const suggestionCache = new MemoryTTLCache(150);
 // كاش لنصوص الترجمة الجاهزة (ملفات صغيرة) + أي فيديو شفناه بث مباشر
 const subtitleCache = new MemoryTTLCache(300);
@@ -535,13 +545,14 @@ function itCollect(root, out = [], depth = 0) {
   }
   return out;
 }
-function itBuild(id, title, author, channelId, duration, views, isLive) {
+function itBuild(id, title, author, channelId, duration, views, isLive, publishedText) {
   if (!id || !title) return null;
   return {
     id, title, uploader: author, channel: author, channel_id: channelId || '',
     duration: isLive ? 0 : duration, view_count: views,
     thumbnails: [{ url: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, height: 360, id: 'hqdefault' }],
-    is_live: !!isLive, live_status: isLive ? 'is_live' : 'not_live'
+    is_live: !!isLive, live_status: isLive ? 'is_live' : 'not_live',
+    published_text: publishedText || null
   };
 }
 function itFromRenderer(r) {
@@ -554,7 +565,7 @@ function itFromRenderer(r) {
   return itBuild(
     r.videoId, itText(r.title),
     itText(owner), owner && owner.runs && owner.runs[0] && owner.runs[0].navigationEndpoint && owner.runs[0].navigationEndpoint.browseEndpoint && owner.runs[0].navigationEndpoint.browseEndpoint.browseId,
-    dur, itViews(itText(r.viewCountText || r.shortViewCountText)), isLive
+    dur, itViews(itText(r.viewCountText || r.shortViewCountText)), isLive, itText(r.publishedTimeText)
   );
 }
 function itFromLockup(l) {
@@ -567,7 +578,8 @@ function itFromLockup(l) {
   const durText = badges.find(b => /^\d+(:\d+)+$/.test(String(b).trim()));
   const isLive = badges.some(b => /^(live|مباشر)$/i.test(String(b).trim())) || /watching/i.test(viewsText);
   const browseId = (itFindAll(md, 'browseId')[0]) || '';
-  return itBuild(l.contentId, title, author, browseId, itDuration(durText), itViews(viewsText), isLive);
+  const ago = parts.find(p => /\bago\b|منذ|streamed|premiere/i.test(p)) || '';
+  return itBuild(l.contentId, title, author, browseId, itDuration(durText), itViews(viewsText), isLive, ago);
 }
 function itItems(data) {
   const seen = new Set(); const out = [];
@@ -801,6 +813,7 @@ function mapFlatEntry(item, excludeId) {
       ? `${item.upload_date.slice(0, 4)}-${item.upload_date.slice(4, 6)}-${item.upload_date.slice(6, 8)}`
       : (item.release_timestamp ? new Date(item.release_timestamp * 1000).toISOString() : null),
     description: item.description ? String(item.description).slice(0, 280) : null,
+    publishedText: item.published_text || null,
     isLive: !!item.is_live,
     wasLive: !!item.was_live,
     liveStatus: item.live_status || null,
@@ -1676,6 +1689,14 @@ async function getChannelTab(channelId, tab, limit = 30) {
     url
   ], { useCookies: cookiesReady, allowCookieFallback: true, timeout: 60000 });
   const data = JSON.parse(stdout);
+  const chInfo = {
+    id: data.channel_id || channelId,
+    title: data.channel || data.uploader || 'قناة',
+    followers: data.channel_follower_count || null,
+    avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
+    description: data.description || ''
+  };
+  channelMetaCache.set(String(channelId), chInfo, 60 * 60 * 1000);
   const entries = (data.entries || []).map(e => {
     const mapped = mapFlatEntry(e);
     if (!mapped) return null;
@@ -1691,16 +1712,52 @@ async function getChannelTab(channelId, tab, limit = 30) {
     };
   }).filter(Boolean);
   return {
-    channel: {
-      id: data.channel_id || channelId,
-      title: data.channel || data.uploader || 'قناة',
-      followers: data.channel_follower_count || null,
-      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
-      description: data.description || ''
-    },
+    channel: chInfo,
     tab: safeTab,
-    entries
+    entries: fillChannelOwner(entries, chInfo)
   };
+}
+
+
+// ترتيب فيديوهات القناة زي يوتيوب (الأحدث / الأكثر رواجًا / الأقدم) عبر chips بتاعة تبويب الفيديوهات
+async function innertubeChannelSorted(channelId, sort, count) {
+  let data = await innertubeCall('browse', { browseId: channelId, params: 'EgZ2aWRlb3PyBgQKAjoA' }, 6000);
+  const chips = itFindAll(data, 'chipCloudChipRenderer');
+  const want = sort === 'popular' ? /popular|رائج|رواج|الأكثر/i : /oldest|الأقدم|قديم/i;
+  const chip = chips.find(c => want.test(itText(c.text))) || chips[sort === 'popular' ? 1 : 2];
+  const token = chip && chip.navigationEndpoint && chip.navigationEndpoint.continuationCommand && chip.navigationEndpoint.continuationCommand.token;
+  if (!token) return null;
+  data = await innertubeCall('browse', { continuation: token }, 6000);
+  const items = itItems(data);
+  const seen = new Set(items.map(i => i.id));
+  let next = itContinuation(data);
+  for (let page = 1; items.length < count && next && page < 6; page++) {
+    data = await innertubeCall('browse', { continuation: next }, 6000);
+    for (const it of itItems(data)) if (!seen.has(it.id)) { seen.add(it.id); items.push(it); }
+    next = itContinuation(data);
+  }
+  return items.slice(0, count);
+}
+
+async function getChannelSorted(channelId, sort, count) {
+  const cached = channelMetaCache.get(String(channelId));
+  const metaP = cached ? Promise.resolve(cached) : getChannelVideos(channelId, 1).then(d => d.channel);
+  let videos = null, approximate = false;
+  if (IT_ENABLED && String(channelId).startsWith('UC') && itBreaker.until <= Date.now()) {
+    try {
+      const items = await innertubeChannelSorted(channelId, sort, count);
+      if (items && items.length >= Math.min(count, 6)) videos = items.map(i => mapFlatEntry(i)).filter(Boolean);
+    } catch (e) { log.warn(`channel sort via innertube failed: ${String(e.message || e).split('\n')[0]}`); }
+  }
+  const channel = await metaP.catch(() => ({ id: channelId, title: 'قناة' }));
+  if (!videos) {
+    // رجوع: الأحدث من yt-dlp ويترتّب محليًا (تقريبي: على اللي اتجاب بس)
+    const base = await getChannelVideos(channelId, Math.min(100, Math.max(count, 60)));
+    videos = base.videos.slice();
+    if (sort === 'popular') videos.sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0)); else videos.reverse();
+    approximate = true;
+  }
+  return { channel, videos: fillChannelOwner(videos, channel), approximate };
 }
 
 async function getChannelVideos(channelId, limit = 20) {
@@ -1708,17 +1765,16 @@ async function getChannelVideos(channelId, limit = 20) {
   log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
   const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
   const data = JSON.parse(stdout);
-  const videos = (data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean);
-  return {
-    channel: {
-      id: data.channel_id || channelId,
-      title: data.channel || data.uploader || 'قناة',
-      followers: data.channel_follower_count || null,
-      avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
-      description: data.description || ''
-    },
-    videos
+  const chInfo = {
+    id: data.channel_id || channelId,
+    title: data.channel || data.uploader || 'قناة',
+    followers: data.channel_follower_count || null,
+    avatar: data.thumbnails?.length ? data.thumbnails[data.thumbnails.length - 1].url : null,
+    description: data.description || ''
   };
+  channelMetaCache.set(String(channelId), chInfo, 60 * 60 * 1000);
+  const videos = fillChannelOwner((data.entries || []).map(e => mapFlatEntry(e)).filter(Boolean), chInfo);
+  return { channel: chInfo, videos };
 }
 
 
@@ -2503,10 +2559,12 @@ app.get('/channel', async (req, res) => {
       });
     }
 
-    const dataCacheKey = `channel_${channelId}_${poolSize}`;
+    const sortRaw = String(req.query.sort || 'latest').toLowerCase();
+    const sort = ['popular', 'oldest'].includes(sortRaw) ? sortRaw : 'latest';
+    const dataCacheKey = sort === 'latest' ? `channel_${channelId}_${poolSize}` : `channel_${channelId}_${sort}_${poolSize}`;
     let data = channelCache.get(dataCacheKey);
     if (!data) {
-      data = await getChannelVideos(channelId, poolSize);
+      data = sort === 'latest' ? await getChannelVideos(channelId, poolSize) : await getChannelSorted(channelId, sort, poolSize);
       channelCache.set(dataCacheKey, data, CACHE_TTL.channel);
     }
 
@@ -2515,7 +2573,7 @@ app.get('/channel', async (req, res) => {
     const hasMore = data.videos.length > start + pageSize;
 
     log.success(`✅ Channel done: ${channelId} page ${pageNum} (${videos.length} نتيجة)`);
-    res.json({ channel: data.channel, tab: 'videos', page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
+    res.json({ channel: data.channel, tab: 'videos', sort, approximate: data.approximate || undefined, page: pageNum, limit: pageSize, count: videos.length, hasMore, videos });
   } catch (error) {
     log.error(`Error fetching channel: ${error.message}`);
     res.status(500).json({
@@ -2578,6 +2636,8 @@ app.get('/channel/streams', async (req, res) => {
     } else if (status === 'past') {
       list = list.filter(v => v.wasLive || v.liveStatus === 'was_live' || (!v.isLive && v.liveStatus !== 'is_upcoming'));
     }
+    const rank = v => (v.isLive || v.liveStatus === 'is_live') ? 0 : (v.liveStatus === 'is_upcoming' ? 1 : 2);
+    list = list.map((v, i) => [v, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]);
     const start = (page - 1) * limit;
     const results = list.slice(start, start + limit);
     const out = {
