@@ -18,7 +18,7 @@ require('dotenv').config();
 // ==========================================================================
 // v13.4.0 — AUTO PO TOKEN: السيرفر بيولّد PO Token + Visitor Data لوحده
 // (bgutils-js + jsdom) ويجدده كل 4 ساعات، من غير أي توكن يدوي.
-const SERVER_VERSION = '13.5.0-FAST';
+const SERVER_VERSION = '13.6.0-FAST-FIX';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -176,13 +176,15 @@ class MemoryTTLCache {
   }
 }
 
-const infoCache = new MemoryTTLCache(1200);
+const infoCache = new MemoryTTLCache(500);
 const searchCache = new MemoryTTLCache(500);
 const feedCache = new MemoryTTLCache(300);
 const streamCache = new MemoryTTLCache(1000);
 const fastStreamCache = new MemoryTTLCache(600);
 const channelCache = new MemoryTTLCache(250);
 const channelMetaCache = new MemoryTTLCache(300);
+// URL → { fmt: http_headers من yt-dlp, ok/cookies: نتيجة التحقق } (v13.6)
+const urlMeta = new MemoryTTLCache(3000);
 // فيديوهات القناة (flat) مبتجيبش اسم القناة → كان بيظهر Unknown. نملاها من بيانات القناة نفسها.
 function fillChannelOwner(list, channel) {
   const title = channel && channel.title && channel.title !== 'قناة' ? channel.title : '';
@@ -255,8 +257,9 @@ class Semaphore {
     if (next) { this.current++; next(); }
   }
 }
-const META_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_META_CONCURRENCY, 10) || 10);
-const STREAM_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_STREAM_CONCURRENCY, 10) || 4);
+const META_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_META_CONCURRENCY, 10) || 8);
+// طابور التشغيل (getVideoInfo + روابط الفيديو) منفصل عن طابور الهوم/البحث عشان الخلفية متخنقش التشغيل
+const STREAM_CONCURRENCY = Math.max(1, parseInt(process.env.YTDLP_STREAM_CONCURRENCY, 10) || 6);
 const ytdlpLimiter = new Semaphore(META_CONCURRENCY);
 const streamLimiter = new Semaphore(STREAM_CONCURRENCY);
 
@@ -267,6 +270,77 @@ function detectNodeRuntime() {
   runtimeChecked = true;
   try { require('child_process').execFileSync('node', ['--version'], { stdio: 'ignore' }); nodeRuntime = 'node'; } catch { nodeRuntime = null; }
   return nodeRuntime;
+}
+
+
+// ==========================================================================
+// 🧰 yt-dlp binary management (v13.6)
+// أكتر سبب بيخلّي "كل الفيديوهات تقف مرة واحدة" هو إن يوتيوب غيّر حاجة ونسخة yt-dlp قديمة.
+// السيرفر دلوقتي بيحدّث yt-dlp لوحده (نسخة standalone من GitHub في /tmp/.bin) عند التشغيل وكل 6 ساعات.
+// تعطيل: YTDLP_AUTO_UPDATE=0  |  نسخة nightly: YTDLP_CHANNEL=nightly  |  مسار ثابت: YTDLP_PATH=/path/yt-dlp
+// ==========================================================================
+const YTDLP_DIR = '/tmp/.bin';
+const YTDLP_LOCAL = `${YTDLP_DIR}/yt-dlp`;
+let ytdlpBin = process.env.YTDLP_PATH || (fs.existsSync(YTDLP_LOCAL) ? YTDLP_LOCAL : 'yt-dlp');
+const ytdlpState = { version: null, remoteComponents: false, lastCheck: 0, lastError: null, updatedAt: 0, bin: ytdlpBin };
+async function refreshYtdlpInfo() {
+  const tryVersion = async (bin) => (await execFileAsync(bin, ['--version'], { timeout: 20000 })).stdout.trim();
+  try { ytdlpState.version = await tryVersion(ytdlpBin); }
+  catch (e) {
+    if (ytdlpBin !== 'yt-dlp' && !process.env.YTDLP_PATH) {
+      log.warn(`yt-dlp المحلي مش شغال (${String(e.message || e).split('\n')[0]}) → رجوع للنسخة اللي في النظام`);
+      ytdlpBin = 'yt-dlp';
+      try { ytdlpState.version = await tryVersion(ytdlpBin); } catch { ytdlpState.version = null; }
+    } else ytdlpState.version = null;
+  }
+  ytdlpState.bin = ytdlpBin;
+  try {
+    const { stdout } = await execFileAsync(ytdlpBin, ['--help'], { timeout: 25000, maxBuffer: 8 * 1024 * 1024 });
+    ytdlpState.remoteComponents = /--remote-components/.test(stdout);
+  } catch { ytdlpState.remoteComponents = false; }
+  return ytdlpState.version;
+}
+function ytdlpBaseArgs() {
+  const a = ['--no-warnings', '--geo-bypass', '--cache-dir', process.env.YTDLP_CACHE_DIR || '/tmp/yt-dlp-cache',
+    // أي فشل بيحصل بسرعة بدل ما ياخد دقايق في إعادة المحاولات → الـ fallback التالي يشتغل فورًا
+    '--retries', '2', '--extractor-retries', '1', '--socket-timeout', '20'];
+  if (detectNodeRuntime()) a.push('--js-runtimes', 'node');
+  // حل تحديات n/sig الجديدة (لو النسخة بتدعمه) — من غيره روابط الـ web client بترجع 403
+  if (ytdlpState.remoteComponents && process.env.YTDLP_REMOTE_COMPONENTS !== '0') a.push('--remote-components', 'ejs:github');
+  return a;
+}
+async function updateYtDlp(force = false) {
+  if (process.env.YTDLP_AUTO_UPDATE === '0' || process.env.YTDLP_PATH) return;
+  if (!force && Date.now() - ytdlpState.lastCheck < 5 * 3600 * 1000) return;
+  ytdlpState.lastCheck = Date.now();
+  const nightly = process.env.YTDLP_CHANNEL === 'nightly';
+  const repo = nightly ? 'yt-dlp/yt-dlp-nightly-builds' : 'yt-dlp/yt-dlp';
+  const asset = process.env.YTDLP_ASSET || 'yt-dlp_linux';
+  const tmp = `${YTDLP_LOCAL}.new`;
+  try {
+    let tag = null;
+    try {
+      const r = await httpGetText(`https://api.github.com/repos/${repo}/releases/latest`, { timeout: 15000, headers: { Accept: 'application/vnd.github+json' } });
+      if (r.status === 200) tag = String(JSON.parse(r.body).tag_name || '').replace(/^v/, '') || null;
+    } catch {}
+    if (tag && ytdlpState.version && tag === ytdlpState.version) { ytdlpState.lastError = null; return; }
+    if (!fs.existsSync(YTDLP_DIR)) fs.mkdirSync(YTDLP_DIR, { recursive: true });
+    log.info(`⬇️  تحديث yt-dlp (${ytdlpState.version || 'غير معروف'} → ${tag || 'latest'})`);
+    await httpDownloadToFile(`https://github.com/${repo}/releases/latest/download/${asset}`, tmp);
+    fs.chmodSync(tmp, 0o755);
+    const v = (await execFileAsync(tmp, ['--version'], { timeout: 30000 })).stdout.trim();
+    if (!v) throw new Error('النسخة الجديدة مش بترد على --version');
+    fs.renameSync(tmp, YTDLP_LOCAL);
+    ytdlpBin = YTDLP_LOCAL;
+    await refreshYtdlpInfo();
+    ytdlpState.updatedAt = Date.now(); ytdlpState.lastError = null;
+    infoCache.clear(); streamCache.clear(); fastStreamCache.clear();
+    log.success(`✅ yt-dlp اتحدّث لـ ${ytdlpState.version}`);
+  } catch (e) {
+    ytdlpState.lastError = String(e.message || e).split('\n')[0];
+    log.warn(`yt-dlp update failed: ${ytdlpState.lastError}`);
+    try { fs.unlinkSync(tmp); } catch {}
+  }
 }
 
 // منع تشغيل نفس yt-dlp أكثر من مرة لو عدة مستخدمين طلبوا نفس الشيء في نفس اللحظة.
@@ -334,9 +408,11 @@ let lastCookiesContent = '';
 /** يتحقق إن المحتوى صيغة Netscape حقيقية (مش هيدرز HTTP) */
 
 /** يبني Cookie header من ملف Netscape لتمريره لـ googlevideo (بدونها كتير 403) */
+let ckHeaderMemo = { src: null, val: '' };   // كاش: كان بيقرا الملف ويحلله مع كل طلب (حتى كل segment)
 function buildYoutubeCookieHeader() {
   try {
     if (!cookiesReady || !fs.existsSync(COOKIES_PATH)) return '';
+    if (ckHeaderMemo.src !== null && ckHeaderMemo.src === lastCookiesContent) return ckHeaderMemo.val;
     const text = fs.readFileSync(COOKIES_PATH, 'utf8');
     const pairs = [];
     for (const line of text.split(/\r?\n/)) {
@@ -356,7 +432,9 @@ function buildYoutubeCookieHeader() {
       const i = p.indexOf('=');
       map.set(p.slice(0, i), p.slice(i + 1));
     }
-    return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+    const joined = [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+    ckHeaderMemo = { src: lastCookiesContent, val: joined };
+    return joined;
   } catch {
     return '';
   }
@@ -419,7 +497,7 @@ setInterval(() => { refreshCookies().catch(() => {}); }, 5 * 60 * 1000);
 
 
 // Check if yt-dlp is installed
-function checkYtDlp() { return commandExists('yt-dlp'); }
+function checkYtDlp() { return commandExists(ytdlpBin); }
 
 // Validation
 function isValidVideoId(id) {
@@ -462,7 +540,8 @@ function isRetryableYoutubeError(error) {
 // ==========================================================================
 const IT_ENABLED = process.env.INNERTUBE_FAST !== '0';
 const IT_BASE = process.env.INNERTUBE_BASE || 'https://www.youtube.com';
-const IT_VERSION = process.env.INNERTUBE_CLIENT_VERSION || '2.20251110.01.00';
+// نسخة ثابتة قديمة ممكن يوتيوب يرفضها → بنستخدم تاريخ حديث تلقائي (تقدر تثبّتها بـ INNERTUBE_CLIENT_VERSION)
+const IT_VERSION = process.env.INNERTUBE_CLIENT_VERSION || `2.${new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10).replace(/-/g, '')}.01.00`;
 const IT_KEY = process.env.INNERTUBE_API_KEY || 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 const itBreaker = { fails: 0, until: 0 };
 
@@ -701,12 +780,11 @@ async function runYtDlp(args, opts = {}) {
   // بيحجز مكان لحد 8 محاولات ورا بعض ويخنق باقي المستخدمين.
   const execOnce = async (cmd, execOpts) => {
     await limiter.acquire();
-    try { return await execFileAsync('yt-dlp', cmd, execOpts); }
+    try { return await execFileAsync(ytdlpBin, cmd, execOpts); }
     finally { limiter.release(); }
   };
 
-  const base = ['--no-warnings', '--geo-bypass', '--cache-dir', process.env.YTDLP_CACHE_DIR || '/tmp/yt-dlp-cache'];
-  if (detectNodeRuntime()) base.push('--js-runtimes', 'node');
+  const base = ytdlpBaseArgs();
 
   // raw: نفّذ args زي ما هي (مفيد لاستخراج formats/ترجمة كاملة)
   if (raw) {
@@ -736,23 +814,15 @@ async function runYtDlp(args, opts = {}) {
     // (كان بيكرر نفس الفشل 5-8 مرات). محاولة عادية + محاولة بالكوكيز بس.
     pushAttempt([], useCookies && cookiesReady);
     if (cookiesReady) pushAttempt([], true);
-  } else if (useCookies && cookiesReady) {
-    // android_vr + tv غالبًا أفضل لformats من غير PO كامل؛ web يحتاج po_token
-    pushAttempt(withClient('android_vr,tv,ios'), true);
-    pushAttempt(withClient('tv,web'), true);
-    pushAttempt(withClient('web,mweb'), true);
-    // التوكن التلقائي مربوط بزائر مجهول → محاولة web بدون كوكيز عشان ميحصلش تعارض
-    if (poManager.isAuto()) pushAttempt(withClient('web,mweb'), false);
-    pushAttempt([], true);
   } else {
+    // الأول من غير كوكيز (android_vr/tv/ios): أسرع وأضمن للروابط، وبعدها نجرّب الكوكيز للفيديوهات اللي محتاجة تسجيل دخول
+    // (قبل كده الكوكيز كانت الأولى: android_vr/ios مبيدعموش الكوكيز فكانت المحاولة الأولى بتضيع وقت)
+    const cookieOk = cookiesReady && (useCookies || allowCookieFallback);
     pushAttempt(withClient('android_vr,tv,ios'));
-    pushAttempt(withClient('tv,web'));
+    if (cookieOk) { pushAttempt(withClient('tv,web'), true); pushAttempt(withClient('web,mweb'), true); }
     pushAttempt(withClient('web,mweb'));
     pushAttempt([]);
-    if (allowCookieFallback && cookiesReady) {
-      pushAttempt(withClient('android_vr,tv,web'), true);
-      pushAttempt([], true);
-    }
+    if (cookieOk) pushAttempt([], true);
   }
 
   // كل محاولة ليها سقف وقت، والطلب كله ليه ميزانية — بدل 45 ثانية × 8 محاولات
@@ -760,8 +830,9 @@ async function runYtDlp(args, opts = {}) {
   const deadline = Date.now() + (opts.budget || Math.max(timeout, 60000));
 
   let lastError;
-  for (let i = 0; i < attempts.length; i++) {
-    if (i > 0 && Date.now() > deadline) break;
+  const startIdx = Math.min(Math.max(0, opts.skip | 0), Math.max(0, attempts.length - 1));
+  for (let i = startIdx; i < attempts.length; i++) {
+    if (i > startIdx && Date.now() > deadline) break;
     try {
       const { stdout } = await execOnce(attempts[i], { timeout: attemptTimeout, maxBuffer, encoding: 'utf-8' });
       return stdout;
@@ -778,7 +849,7 @@ async function runYtDlp(args, opts = {}) {
         || msg.includes('age')
         || msg.includes('not available')
         || msg.includes('requested format is not available');
-      if (!keepTrying && i === 0) throw error;
+      if (!keepTrying && i === startIdx) throw error;
       if (i < attempts.length - 1) log.warn(`yt-dlp fallback ${i + 1}: ${String(error.message || error).split('\n')[0]}`);
     }
   }
@@ -957,10 +1028,11 @@ async function getVideoInfo(videoId) {
         useCookies: plan.useCookies && cookiesReady,
         allowCookieFallback: false,
         raw: true,
+        lane: 'stream',
         playerClient: plan.playerClient,
         maxBuffer: 1024 * 1024 * 20
       });
-      const parsed = JSON.parse(stdout);
+      const parsed = slimInfo(JSON.parse(stdout));
       const formats = Array.isArray(parsed.formats) ? parsed.formats : [];
       const heights = new Set(formats.map(f => Number(f.height)).filter(h => h > 0));
       const subs =
@@ -1173,13 +1245,15 @@ app.get('/api/po-token/status', (req, res) => res.json(poManager.status()));
 function buildYoutubeExtractorArgs(playerClient) {
   const parts = [];
   if (playerClient) parts.push(`player_client=${playerClient}`);
-  // أظهر formats اللي محتاجة PO token في الليست (حتى لو التشغيل محتاج token)
-  parts.push('formats=missing_pot');
+  // formats=missing_pot بتعرض روابط محتاجة PO Token وبترجع 403 وقت التشغيل → اختيارية فقط (YTDLP_MISSING_POT=1)
+  if (process.env.YTDLP_MISSING_POT === '1') parts.push('formats=missing_pot');
+  const usesWeb = !playerClient || /\b(web|mweb)\b/.test(String(playerClient));
   const manualPot = poManager.manual();
   if (manualPot) {
     // يقبل: web.gvs+XXX أو قائمة مفصولة بفاصلة
     parts.push(`po_token=${manualPot}`);
-  } else if (poManager.isAuto()) {
+  } else if (usesWeb && poManager.isAuto()) {
+    // التوكن/الزائر التلقائي للـ web فقط — إرسال visitor_data بتاع web لـ android_vr/tv/ios كان ممكن يبوّظ الاستخراج
     const t = poManager.token;
     parts.push(`po_token=web.gvs+${t},web.player+${t},web.subs+${t},mweb.gvs+${t},mweb.subs+${t}`);
     parts.push(`visitor_data=${poManager.visitorData}`);
@@ -1198,28 +1272,36 @@ const PROGRESSIVE_FALLBACK_SELECTOR =
 
 async function getFormatUrls(videoId, formatSelector, opts = {}) {
   // strict: من غير أي fallback لـ progressive 360 — مهم عشان جودة معيّنة متتبدلش بصمت بغيرها
+  // fresh: تجاهل الكاش (بنستخدمه بعد ما رابط مكاشّ يفشل في التحقق)
   const strict = !!opts.strict;
-  const key = `urls_${videoId}_${formatSelector}${strict ? '_strict' : ''}`;
-  const cached = streamCache.get(key);
-  if (cached && Array.isArray(cached) && !cached.some(isHlsUrl)) return cached;
+  const skip = Math.max(0, opts.skip | 0);   // تخطّي أول N محاولات (clients) بعد ما رابطها فشل في التحقق
+  const key = `urls_${videoId}_${formatSelector}${strict ? '_strict' : ''}${skip ? `_s${skip}` : ''}`;
+  if (!opts.fresh) {
+    const cached = streamCache.get(key);
+    if (cached && Array.isArray(cached) && !cached.some(isHlsUrl)) return cached;
+  } else streamCache.delete(key);
 
-  return dedupe(key, async () => {
-    const again = streamCache.get(key);
-    if (again && Array.isArray(again) && !again.some(isHlsUrl)) return again;
+  return dedupe(key + (opts.fresh ? ':fresh' : ''), async () => {
+    if (!opts.fresh) {
+      const again = streamCache.get(key);
+      if (again && Array.isArray(again) && !again.some(isHlsUrl)) return again;
+    }
 
+    // --dump-json بدل --get-url: نفس التكلفة لكن بيرجّع كمان الـ http_headers الصح لكل رابط
     const trySelector = async (selector) => {
       const stdout = await runYtDlp([
-        '--get-url', '--no-playlist',
+        '--dump-json', '--no-playlist',
         '-f', selector,
         '--format-sort', 'proto:https,proto:http,res,br',
         `https://www.youtube.com/watch?v=${videoId}`
       ], {
         timeout: 40000,
         lane: 'stream',
+        skip,
         useCookies: true,
         allowCookieFallback: true
       });
-      return stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
+      return extractUrlsFromDump(stdout);
     };
 
     let urls = [];
@@ -1244,6 +1326,22 @@ async function getFormatUrls(videoId, formatSelector, opts = {}) {
     streamCache.set(key, urls, CACHE_TTL.stream);
     return urls;
   });
+}
+
+
+// بيجيب روابط ويتحقق منها فعليًا؛ لو رفضها يوتيوب (403) بيجرّب client/كوكيز مختلف بدل ما يرجّع نفس الرابط الفاشل
+async function getVerifiedUrls(videoId, selector, { strict = false, minCount = 1, rounds = 4 } = {}) {
+  const t0 = Date.now();
+  let lastErr = null;
+  for (let skip = 0; skip < rounds; skip++) {
+    if (skip > 0 && Date.now() - t0 > 40000) break;
+    try {
+      const urls = await getFormatUrls(videoId, selector, { strict, fresh: skip > 0, skip });
+      if (urls.length >= minCount && await verifyAll(urls)) return urls;
+      lastErr = new Error('upstream rejected the stream URL (403)');
+    } catch (e) { lastErr = e; if (strict === false && /No progressive/.test(String(e.message))) break; }
+  }
+  throw lastErr || new Error('no verified stream url');
 }
 
 async function getVideoStreamUrl(videoId, format = 'best') {
@@ -2734,46 +2832,33 @@ async function getFastStreamUrl(videoId) {
     const again = fastStreamCache.get(key);
     if (again) return typeof again === 'string' ? again : again.url;
 
-    // لو الميتاداتا الكاملة جاهزة في الكاش (prefetch/info) → رابط progressive منها فورًا
-    // من غير ما نفتح عملية yt-dlp تانية.
-    const cachedInfo = infoCache.get(`raw_info_v4_${videoId}`);
-    const infoUrl = pickFastProgressiveUrl(cachedInfo);
-    if (infoUrl) {
-      fastStreamCache.set(key, infoUrl, CACHE_TTL.fastStream);
-      return infoUrl;
+    // كل رابط بنجرّبه الأول بطلب صغير: لو 403 (PO Token / headers / IP) بنروح للمصدر اللي بعده بدل ما نبعته للمتصفح ويفشل.
+    const tried = new Set();
+    const accept = async (u) => {
+      if (!u || tried.has(u) || isHlsUrl(u)) return null;
+      tried.add(u);
+      if (!(await verifyUrl(u))) return null;
+      fastStreamCache.set(key, u, CACHE_TTL.fastStream);
+      return u;
+    };
+
+    // لو الميتاداتا الكاملة جاهزة في الكاش → روابط progressive منها فورًا من غير عملية yt-dlp تانية.
+    let info = infoCache.get(`raw_info_v4_${videoId}`), infoFailed = false;
+    if (!info) {
+      // الميتاداتا الأول (عمليتين بالتوازي وبتتكاش وبتفيد الجودات/الترجمة بعدين)
+      try { info = await getVideoInfo(videoId); } catch (e) { infoFailed = true; }
+    }
+    if (info) {
+      for (const u of progressiveCandidates(info)) { const ok = await accept(u); if (ok) return ok; }
+      if (isLiveInfo(info)) throw new Error('Live stream: no progressive URL');
     }
 
-    // الميتاداتا الأول (عمليتين بالتوازي وبتتكاش وبتفيد الجودات/الترجمة بعدين) بدل ما نطلق
-    // عشرات عمليات get-url عمياء — خصوصًا مع البث المباشر والفيديوهات المحجوبة.
-    let infoFailed = false;
+    // مفيش progressive شغال في الميتاداتا: بنسأل yt-dlp من جديد ونجرّب client/كوكيز مختلف لحد ما نلاقي رابط يوتيوب بيقبله
     try {
-      const fullInfo = await getVideoInfo(videoId);
-      const u = pickFastProgressiveUrl(fullInfo);
-      if (u) { fastStreamCache.set(key, u, CACHE_TTL.fastStream); return u; }
-      if (isLiveInfo(fullInfo)) throw new Error('Live stream: no progressive URL');
-    } catch (e) {
-      if (/live stream/i.test(String(e.message))) throw e;
-      infoFailed = true;
-    }
-
-    // مفيش progressive في الميتاداتا: itag 18 مباشرة (محاولة واحدة لو الميتاداتا نفسها فشلت)
-    const attempts = infoFailed ? ['18'] : [
-      '18',
-      '22/18/best[height<=360][ext=mp4][protocol^=http]',
-      PROGRESSIVE_FALLBACK_SELECTOR
-    ];
-    let lastErr;
-    for (const sel of attempts) {
-      try {
-        const urls = await getFormatUrls(videoId, sel);
-        if (urls[0] && !isHlsUrl(urls[0])) {
-          fastStreamCache.set(key, urls[0], CACHE_TTL.fastStream);
-          return urls[0];
-        }
-      } catch (e) {
-        lastErr = e;
-      }
-    }
+      const urls = await getVerifiedUrls(videoId, infoFailed ? '18' : '18/22/best[height<=360][ext=mp4][protocol^=http]', { minCount: 1 });
+      const ok = await accept(urls[0]);
+      if (ok) return ok;
+    } catch (e) { var lastErr = e; }
     throw lastErr || new Error('No playable progressive stream');
   });
 }
@@ -2799,7 +2884,7 @@ async function getQualityStreamUrl(videoId, height) {
       const prog = chooseProgressiveFormat(info, h);
       if (prog?.formatId && Math.abs(Number(prog.actualHeight) - h) <= 8) {
         const urls = prog.url ? [prog.url] : await getFormatUrls(videoId, prog.formatId, { strict: true });
-        if (urls[0] && !isHlsUrl(urls[0])) {
+        if (urls[0] && !isHlsUrl(urls[0]) && await verifyUrl(urls[0])) {
           const out = {
             url: urls[0],
             actualHeight: prog.actualHeight,
@@ -2824,7 +2909,7 @@ async function getQualityStreamUrl(videoId, height) {
       `best[height=${h}][acodec!=none][vcodec!=none][protocol^=http]`;
     try {
       const urls = await getFormatUrls(videoId, selector, { strict: true });
-      if (urls[0] && !isHlsUrl(urls[0])) {
+      if (urls[0] && !isHlsUrl(urls[0]) && await verifyUrl(urls[0])) {
         const out = { url: urls[0], actualHeight: h, requestedHeight: h, mode: 'progressive-exact' };
         streamCache.set(key, out, CACHE_TTL.stream);
         return out;
@@ -2870,7 +2955,114 @@ function destroyResponseStream(res) {
   } catch {}
 }
 
-function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
+// ==========================================================================
+// 🔗 Upstream headers + التحقق من الروابط قبل ما نبعتها للمتصفح (v13.6)
+// yt-dlp بيرجّع مع كل format الـ http_headers اللازمة (User-Agent بتاع الـ client اللي طلّع الرابط).
+// السيرفر القديم كان بيبعت دايمًا User-Agent بتاع Chrome + كوكيز الحساب → روابط كتير بترجع 403.
+// دلوقتي: بنستخدم نفس الـ headers، وبنجرّب الرابط بطلب صغير (Range 0-1) الأول — ولو 403 بنجرّب مصدر تاني.
+// ==========================================================================
+const UP_DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+function rememberFormatHeaders(url, h) {
+  if (!url || !h || typeof h !== 'object') return;
+  const cur = urlMeta.peek(url);
+  if (cur && cur.fmt) return;
+  urlMeta.set(url, { ...(cur || {}), fmt: h }, 6 * 3600 * 1000);
+}
+function buildUpstreamHeaders(url, { withCookies } = {}) {
+  const meta = urlMeta.peek(url) || {};
+  const h = { 'user-agent': UP_DEFAULT_UA, accept: '*/*', 'accept-encoding': 'identity', connection: 'keep-alive' };
+  if (meta.fmt) {
+    for (const [k, v] of Object.entries(meta.fmt)) {
+      const lk = String(k).toLowerCase();
+      if (typeof v === 'string' && !['host', 'range', 'content-length', 'accept-encoding', 'connection', 'cookie'].includes(lk)) h[lk] = v;
+    }
+  }
+  const browserLike = /^Mozilla\//.test(h['user-agent']);
+  if (!meta.fmt || browserLike) { h.referer = 'https://www.youtube.com/'; h.origin = 'https://www.youtube.com'; }
+  let host = ''; try { host = new URL(url).hostname; } catch {}
+  const useCookies = withCookies !== undefined ? withCookies : (meta.cookies !== undefined ? meta.cookies : true);
+  if (useCookies && /googlevideo\.com$/i.test(host)) { const ck = buildYoutubeCookieHeader(); if (ck) h.cookie = ck; }
+  return h;
+}
+function probeOnce(url, headers, hop = 0) {
+  return new Promise((resolve, reject) => {
+    let target; try { target = new URL(url); } catch (e) { return reject(e); }
+    const req = https.get(target, { headers: { ...headers, range: 'bytes=0-1' }, timeout: 7000, agent: keepAliveAgent }, (r) => {
+      const code = Number(r.statusCode || 0);
+      if ([301, 302, 303, 307, 308].includes(code) && r.headers.location && hop < 4) {
+        r.resume();
+        return resolve(probeOnce(new URL(r.headers.location, target).toString(), headers, hop + 1));
+      }
+      if (code === 206) r.resume(); else r.destroy();
+      resolve({ status: code });
+    });
+    req.on('timeout', () => req.destroy(new Error('probe timeout')));
+    req.on('error', reject);
+  });
+}
+// بيرجّع true لو الرابط شغال فعلًا (200/206). لو رد 401/403/404/410 بنجرّب بكوكيز كمان، ولو لسه بايظ → false.
+// أخطاء الشبكة المؤقتة مش بتمنع التشغيل (بنفترض إنه شغال).
+async function verifyUrl(url) {
+  if (!url) return false;
+  const meta = urlMeta.peek(url) || {};
+  const now = Date.now();
+  if (meta.ok && now - (meta.verifiedAt || 0) < 20 * 60 * 1000) return true;
+  if (meta.bad && now - (meta.badAt || 0) < 2 * 60 * 1000) return false;
+  const variants = [false];
+  if (buildYoutubeCookieHeader()) variants.push(true);
+  let definiteBad = false;
+  for (const withCookies of variants) {
+    try {
+      const r = await probeOnce(url, buildUpstreamHeaders(url, { withCookies }));
+      if (r.status === 200 || r.status === 206) {
+        urlMeta.set(url, { ...(urlMeta.peek(url) || {}), ok: true, bad: false, cookies: withCookies, verifiedAt: Date.now() }, 6 * 3600 * 1000);
+        return true;
+      }
+      if ([400, 401, 403, 404, 410].includes(r.status)) definiteBad = true;
+    } catch { /* مؤقت */ }
+  }
+  if (definiteBad) {
+    urlMeta.set(url, { ...(urlMeta.peek(url) || {}), ok: false, bad: true, badAt: Date.now() }, 6 * 3600 * 1000);
+    return false;
+  }
+  return true;
+}
+const verifyAll = async (arr) => (await Promise.all((arr || []).map(verifyUrl))).every(Boolean);
+function forgetVideo(videoId) {
+  fastStreamCache.delete(`fast:${videoId}`);
+  infoCache.delete(`raw_info_v4_${videoId}`);
+  for (const k of [...streamCache.map.keys()]) if (String(k).includes(videoId)) streamCache.delete(k);
+}
+
+// ---- تخفيف الميتاداتا في الذاكرة: dump-json كامل بيوصل 1-2MB للفيديو (ترجمات تلقائية بمئات اللغات + fragments) ----
+function slimInfo(p) {
+  if (!p || typeof p !== 'object') return p;
+  for (const k of ['thumbnails', 'heatmap', 'requested_formats', 'requested_downloads', 'requested_subtitles', '_format_sort_fields', 'storyboards', 'comments']) delete p[k];
+  if (Array.isArray(p.formats)) for (const f of p.formats) { if (f) { delete f.fragments; delete f.downloader_options; delete f.fragment_base_url; delete f.manifest_stream_number; } }
+  if (p.automatic_captions && typeof p.automatic_captions === 'object') {
+    for (const [lang, list] of Object.entries(p.automatic_captions)) {
+      if (!Array.isArray(list)) continue;
+      const keep = list.filter(s => s && ['vtt', 'srv3', 'json3'].includes(s.ext));
+      p.automatic_captions[lang] = (keep.length ? keep : list.slice(0, 1)).map(s => ({ ext: s.ext, url: s.url, name: s.name }));
+    }
+  }
+  return p;
+}
+function progressiveCandidates(info) {
+  if (!info) return [];
+  const prog = (info.formats || []).filter(f => f && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' &&
+    /^https?$/.test(String(f.protocol || 'https')) && typeof f.url === 'string' && !isHlsUrl(f.url));
+  const score = f => String(f.format_id) === '18' ? -1 : Math.abs((Number(f.height) || 360) - 360) + (Number(f.height) > 720 ? 1000 : 0);
+  return prog.sort((a, b) => score(a) - score(b)).slice(0, 4).map(f => usableDirectUrl(f)).filter(Boolean);
+}
+function extractUrlsFromDump(stdout) {
+  const lines = String(stdout || '').trim().split('\n').filter(Boolean);
+  const j = JSON.parse(lines[lines.length - 1]);
+  const fmts = Array.isArray(j.requested_formats) && j.requested_formats.length ? j.requested_formats : [j];
+  return fmts.map(f => { const u = f && typeof f.url === 'string' ? f.url : ''; if (u) rememberFormatHeaders(u, f.http_headers || j.http_headers); return u; }).filter(Boolean);
+}
+
+function streamFromUpstream(req, res, url, redirectCount = 0, duration = null, opts = {}) {
   if (!url) {
     if (!res.headersSent) res.status(502).json({ error: 'رابط الفيديو غير متاح' });
     return;
@@ -2889,24 +3081,15 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
     return;
   }
 
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Encoding': 'identity',
-    'Connection': 'keep-alive',
-    'Referer': 'https://www.youtube.com/',
-    'Origin': 'https://www.youtube.com'
-  };
-
-  // تمرير كوكيز الحساب لـ CDN — بدونها روابط كتير بترجع 403 من Railway IP
-  try {
-    const ck = buildYoutubeCookieHeader();
-    if (ck) headers.Cookie = ck;
-  } catch {}
+  // الـ headers بتتحدد من الرابط الأصلي (حتى بعد الـ redirects): User-Agent الصح + كوكيز بس لو التحقق احتاجها
+  const metaUrl = opts.metaUrl || target;
+  const headers = buildUpstreamHeaders(metaUrl);
+  let host = ''; try { host = new URL(target).hostname; } catch {}
+  if (!/googlevideo\.com$/i.test(host)) delete headers.cookie;
 
   // Critical for seeking and for browsers that request the video in chunks.
-  if (req.headers.range) headers.Range = req.headers.range;
-  if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+  if (req.headers.range) headers.range = req.headers.range;
+  if (req.headers['if-range']) headers['if-range'] = req.headers['if-range'];
 
   const upstreamReq = https.get(target, {
     headers,
@@ -2922,15 +3105,28 @@ function streamFromUpstream(req, res, url, redirectCount = 0, duration = null) {
         if (!res.headersSent) res.status(502).json({ error: 'تحويل المصدر غير صالح' });
         return;
       }
-      return streamFromUpstream(req, res, nextUrl, redirectCount + 1, duration);
+      return streamFromUpstream(req, res, nextUrl, redirectCount + 1, duration, { ...opts, metaUrl });
     }
 
     if ([401, 403, 410].includes(code)) {
       upstreamRes.resume();
-      if (!res.headersSent) res.status(code === 410 ? 502 : 502).json({
-        error: 'مصدر الفيديو انتهت صلاحيته، أعد طلب التشغيل لإحضار رابط جديد',
-        upstreamStatus: code
-      });
+      const failForbidden = () => {
+        if (!res.headersSent) res.status(502).json({
+          error: 'مصدر الفيديو انتهت صلاحيته، أعد طلب التشغيل لإحضار رابط جديد',
+          upstreamStatus: code
+        });
+      };
+      // رابط اتحرق/انتهى قبل ما أي بايت يتبعت → نجيب رابط جديد ونكمّل في نفس الطلب (مرة واحدة)
+      if (opts.onForbidden && !res.headersSent) {
+        const retry = opts.onForbidden;
+        Promise.resolve().then(() => retry()).then(nu => {
+          if (res.headersSent || res.destroyed) return;
+          if (nu) return streamFromUpstream(req, res, nu, 0, duration, { ...opts, onForbidden: null, metaUrl: undefined });
+          failForbidden();
+        }).catch(() => failForbidden());
+        return;
+      }
+      failForbidden();
       return;
     }
 
@@ -3120,7 +3316,8 @@ function chooseQualityFormats(info, requestedHeight) {
 // رابط مباشر من ميتاداتا الاستخراج الواحدة (dump-json) — بيلغي استدعاءات get-url الإضافية
 function usableDirectUrl(f) {
   const u = f && typeof f.url === 'string' ? f.url : '';
-  return u && !isHlsUrl(u) ? u : null;
+  if (u && !isHlsUrl(u)) { rememberFormatHeaders(u, f.http_headers); return u; }
+  return null;
 }
 
 function pickFastProgressiveUrl(info) {
@@ -3275,21 +3472,28 @@ async function ensureFfmpeg() {
 
 function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audioCopy = false) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  const commonIn = [
-    '-user_agent', UA,
-    '-headers', 'Referer: https://www.youtube.com\r\nOrigin: https://www.youtube.com\r\n',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_on_network_error', '1',
-    '-reconnect_delay_max', '5',
-    '-rw_timeout', '30000000',
-    // تحليل أقصر للمدخلات = أول بايت يوصل أسرع
-    '-probesize', '1000000',
-    '-analyzeduration', '1000000',
-    '-i'
-  ];
-  const inputArgs = [...commonIn.slice(0, -1), '-i', videoUrl];
-  if (audioUrl) inputArgs.push(...commonIn.slice(0, -1), '-i', audioUrl);
+  // نفس الـ User-Agent/headers اللي yt-dlp طلّع بيها الرابط (ده اللي بيمنع 403)
+  const ffIn = (u) => {
+    const h = buildUpstreamHeaders(u);
+    const extra = Object.entries(h)
+      .filter(([k]) => !['user-agent', 'range', 'accept-encoding', 'connection', 'host'].includes(k))
+      .map(([k, v]) => `${k}: ${v}\r\n`).join('');
+    return [
+      '-user_agent', h['user-agent'] || UA,
+      ...(extra ? ['-headers', extra] : []),
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_on_network_error', '1',
+      '-reconnect_delay_max', '5',
+      '-rw_timeout', '30000000',
+      // تحليل أقصر للمدخلات = أول بايت يوصل أسرع
+      '-probesize', '1000000',
+      '-analyzeduration', '1000000',
+      '-i', u
+    ];
+  };
+  const inputArgs = [...ffIn(videoUrl)];
+  if (audioUrl) inputArgs.push(...ffIn(audioUrl));
 
   const args = [
     '-loglevel', 'warning',
@@ -3551,7 +3755,7 @@ app.get('/video/quick', async (req, res) => {
     const url = await getFastStreamUrl(videoId);
     res.setHeader('X-Stream-Mode', 'proxy-fast');
     res.setHeader('X-Video-Quality', '360p');
-    return streamFromUpstream(req, res, url, 0, 0);
+    return streamFromUpstream(req, res, url, 0, 0, { onForbidden: async () => { forgetVideo(videoId); return getFastStreamUrl(videoId); } });
   } catch (error) {
     log.warn(`Quick stream failed ${videoId}: ${error.message}`);
     return res.status(502).json({
@@ -3625,7 +3829,7 @@ app.get('/video', async (req, res) => {
         res.setHeader('X-Stream-Mode', 'proxy-fast');
         res.setHeader('X-Video-Quality', '360p');
         recordPerf('video-default', Date.now() - requestStartedAt, true);
-        return streamFromUpstream(req, res, streamUrl, 0, videoDuration);
+        return streamFromUpstream(req, res, streamUrl, 0, videoDuration, { onForbidden: async () => { forgetVideo(videoId); return getFastStreamUrl(videoId); } });
       }
       // مفيش progressive: يا بث مباشر (HLS)، يا فيديو ملوش غير adaptive → نشغّله بدمج ffmpeg
       try {
@@ -3654,6 +3858,7 @@ app.get('/video', async (req, res) => {
         if (direct) urls = [direct];
       }
       if (!urls.length) urls = await getFormatUrls(videoId, selector);
+      if (!(await verifyUrl(urls[0]))) { try { urls = await getVerifiedUrls(videoId, selector, { minCount: 1 }); } catch {} }
       if (probe) return res.json({ probe: true, id: videoId, type: 'audio', formatId: audioFormat || null, resolved: true, urlLength: String(urls[0] || '').length });
       if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: 'audio' });
       res.setHeader('X-Stream-Mode', 'proxy-audio');
@@ -3682,7 +3887,7 @@ app.get('/video', async (req, res) => {
           }
           recordPerf('video-quality', Date.now() - requestStartedAt, true);
           if (wantDirect) return redirectToCdn(res, q.url, { mode: 'direct-cdn', quality: q.actualHeight || h });
-          return streamFromUpstream(req, res, q.url, 0, videoDuration);
+          return streamFromUpstream(req, res, q.url, 0, videoDuration, { onForbidden: async () => { forgetVideo(videoId); const nq = await getQualityStreamUrl(videoId, h); return nq && nq.url; } });
         }
       } catch (e) {
         log.warn(`quality ${h}p progressive fail: ${String(e.message || e).split('\n')[0]}`);
@@ -3697,6 +3902,7 @@ app.get('/video', async (req, res) => {
           if (selected.mode === 'direct' && Math.abs(Number(selected.actualHeight) - h) <= tol) {
             const dUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.videoFormatId));
             const urls = dUrl ? [dUrl] : await getFormatUrls(videoId, selected.videoFormatId, { strict: true });
+            if (!(await verifyUrl(urls[0]))) throw new Error('direct stream rejected by upstream (403)');
             if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'direct', resolved: true });
             if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: selected.actualHeight });
             res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
@@ -3707,7 +3913,8 @@ app.get('/video', async (req, res) => {
           // أسرع مسار: روابط الفيديو والصوت موجودة في نفس ميتاداتا الاستخراج
           const vUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.videoFormatId));
           const aUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === selected.audioFormatId));
-          if (selected.mode === 'merge' && vUrl && aUrl) {
+          const pairOk = vUrl && aUrl ? await verifyAll([vUrl, aUrl]) : false;
+          if (selected.mode === 'merge' && vUrl && aUrl && pairOk) {
             if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true });
             res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
             res.setHeader('X-Requested-Quality', `${h}p`);
@@ -3720,7 +3927,7 @@ app.get('/video', async (req, res) => {
             `bv*[height=${h}]+ba/bv*[height<=${h}][height>=${Math.max(144, h - 40)}]+ba/` +
             `b[height=${h}]/bestvideo[height<=${h}]+bestaudio`;
           let urls = [];
-          try { urls = await getFormatUrls(videoId, heightSelector, { strict: true }); } catch {}
+          try { urls = await getVerifiedUrls(videoId, heightSelector, { strict: true, minCount: 2 }); } catch {}
           if (urls.length >= 2) {
             if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: h, mode: 'ffmpeg', resolved: true });
             res.setHeader('X-Video-Quality', `${h}p`);
@@ -3730,7 +3937,7 @@ app.get('/video', async (req, res) => {
             return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
           }
           if (selected.mode === 'merge') {
-            const u2 = await getFormatUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`, { strict: true });
+            const u2 = await getVerifiedUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`, { strict: true, minCount: 2 }).catch(() => []);
             if (u2.length >= 2) {
               if (probe) return res.json({ probe: true, id: videoId, requestedQuality: h, actualQuality: selected.actualHeight, mode: 'ffmpeg', resolved: true });
               res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
@@ -3773,7 +3980,11 @@ app.get('/video', async (req, res) => {
     if (res.headersSent) return;
 
     const msg = String(error.message || '').toLowerCase();
+    if (/upstream rejected|rejected by upstream/.test(msg)) {
+      return res.status(502).json({ error: 'يوتيوب رفض مصدر الفيديو (403) — حدّث yt-dlp أو جدّد الكوكيز', retryable: true, debug: `/api/video-debug?v=${videoId}` });
+    }
     if (msg.includes('unavailable') || msg.includes('not available')) {
+
       return res.status(404).json({ error: 'الفيديو غير متاح أو محذوف' });
     }
     if (msg.includes('private')) {
@@ -3822,8 +4033,8 @@ app.get('/download', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.setHeader('Content-Type', quality === 'audio' ? 'audio/mpeg' : 'video/mp4');
 
-    const args = ['--no-warnings', '--no-playlist', '--format-sort', 'lang,quality', '-f', format, '-o', '-', `https://www.youtube.com/watch?v=${videoId}`];
-    child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const args = [...ytdlpBaseArgs(), '--no-playlist', '--format-sort', 'lang,quality', '-f', format, '-o', '-', `https://www.youtube.com/watch?v=${videoId}`];
+    child = spawn(ytdlpBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     child.stderr.on('data', d => { err += d.toString(); if (err.length > 3000) err = err.slice(-3000); });
     child.stdout.pipe(res);
@@ -4145,8 +4356,9 @@ app.get('/health', (req, res) => {
     version: SERVER_VERSION,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    ytdlpReady: commandExists('yt-dlp'),
-    ytdlpVersion: (() => { try { return require('child_process').execFileSync('yt-dlp', ['--version'], { encoding: 'utf8' }).trim(); } catch { return null; } })(),
+    ytdlpReady: Boolean(ytdlpState.version),
+    ytdlp: { bin: ytdlpState.bin, version: ytdlpState.version, remoteComponents: ytdlpState.remoteComponents, lastError: ytdlpState.lastError, updatedAt: ytdlpState.updatedAt ? new Date(ytdlpState.updatedAt).toISOString() : null },
+    ytdlpVersion: ytdlpState.version,   // مكاشّة: execFileSync كان بيقفّل الـ event loop (وبيبطّأ الستريمنج) مع كل /health
     nodeVersion: process.version,
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
     ffmpegReady: Boolean(ffmpegReadyFlag) || commandExists('ffmpeg') || (ffmpegBin && ffmpegBin !== 'ffmpeg' && fs.existsSync(ffmpegBin)),
@@ -4625,19 +4837,11 @@ app.get('/api/video-debug', async (req, res) => {
   const out = {
     id,
     startedAt: new Date(started).toISOString(),
+    ytdlp: { version: ytdlpState.version, bin: ytdlpState.bin, remoteComponents: ytdlpState.remoteComponents, lastError: ytdlpState.lastError, updatedAt: ytdlpState.updatedAt ? new Date(ytdlpState.updatedAt).toISOString() : null },
     steps: []
   };
 
   try {
-    const t1 = Date.now();
-    const fast = await getFastStreamUrl(id);
-    out.steps.push({
-      name: 'fast-source',
-      ok: true,
-      ms: Date.now() - t1,
-      urlLength: fast.length
-    });
-
     const t2 = Date.now();
     const info = await getVideoInfo(id);
     out.steps.push({
@@ -4649,11 +4853,37 @@ app.get('/api/video-debug', async (req, res) => {
       formats: info.formats?.length || 0
     });
 
+    // فحص حقيقي لكل مصدر: بنجرّب طلب صغير على الرابط بدون كوكيز ومعاها (من غير ما نعرض الروابط نفسها)
+    const fm = (info.formats || []).filter(f => f && typeof f.url === 'string' && !isHlsUrl(f.url) && /^https?$/.test(String(f.protocol || 'https')));
+    const progressive = fm.filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none').slice(0, 4);
+    const videoOnly = fm.filter(f => f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')).sort((a, b) => (b.height || 0) - (a.height || 0)).slice(0, 3);
+    const audioOnly = fm.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')).slice(0, 1);
+    const probes = [];
+    for (const f of [...progressive, ...videoOnly, ...audioOnly]) {
+      usableDirectUrl(f);
+      const row = { formatId: String(f.format_id), height: f.height || null, vcodec: f.vcodec, acodec: f.acodec, ua: String((f.http_headers || {})['User-Agent'] || '').slice(0, 40) || null };
+      for (const [label, withCookies] of [['noCookies', false], ['withCookies', true]]) {
+        try { row[label] = (await probeOnce(f.url, buildUpstreamHeaders(f.url, { withCookies }))).status; }
+        catch (e) { row[label] = 'ERR ' + String(e.message || e).slice(0, 40); }
+      }
+      probes.push(row);
+    }
+    out.probes = probes;
+
+    const t1 = Date.now();
+    try {
+      const fast = await getFastStreamUrl(id);
+      out.steps.push({ name: 'fast-source', ok: true, ms: Date.now() - t1, urlLength: fast.length });
+    } catch (e) {
+      out.steps.push({ name: 'fast-source', ok: false, ms: Date.now() - t1, error: String(e.message || e).split('\n')[0] });
+    }
+
     out.totalMs = Date.now() - started;
-    out.ok = true;
-    out.hint = out.steps[0].ms > 5000
-      ? 'مصدر الفيديو نفسه بطيء؛ راجع yt-dlp/YouTube connectivity.'
-      : 'المسار السريع جاهز.';
+    out.ok = out.steps.every(s => s.ok);
+    const good = probes.filter(p => [200, 206].includes(p.noCookies) || [200, 206].includes(p.withCookies));
+    out.hint = !probes.length ? 'مفيش formats بروابط مباشرة — غالبًا yt-dlp قديم أو يوتيوب رفض: حدّث yt-dlp وجدّد الكوكيز'
+      : !good.length ? 'كل الروابط بترجع 403/خطأ من جوجل: yt-dlp قديم أو الـ IP/الكوكيز/PO Token مرفوضين'
+      : 'في روابط شغالة — السيرفر هيستخدمها تلقائيًا';
     return res.json(out);
   } catch (e) {
     out.totalMs = Date.now() - started;
@@ -5266,6 +5496,36 @@ function summarizeTestBody(body) {
 }
 
 // Start server
+// ==========================================================================
+// 🧠 Memory watchdog (v13.6) — لو الرام قربت من الحد (Railway بيقتل العملية) بنفضّي الكاشات التقيلة بدل ما السيرفر يقع.
+// الحد: MEM_SOFT_LIMIT_MB أو 70% من حد الحاوية (cgroup)، وإلا 1000MB.
+// ==========================================================================
+function memSoftLimitMb() {
+  const env = parseInt(process.env.MEM_SOFT_LIMIT_MB, 10);
+  if (env > 0) return env;
+  for (const f of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    try { const n = Number(fs.readFileSync(f, 'utf8').trim()); if (n > 0 && n < 64 * 1024 ** 3) return Math.max(256, Math.round(n / 1048576 * 0.7)); } catch {}
+  }
+  return 1000;
+}
+const MEM_LIMIT_MB = memSoftLimitMb();
+setInterval(() => {
+  const rss = process.memoryUsage().rss / 1048576;
+  if (rss > MEM_LIMIT_MB) {
+    log.warn(`🧠 RSS ${Math.round(rss)}MB > ${MEM_LIMIT_MB}MB → تفريغ كاشات الميتاداتا`);
+    infoCache.clear(); searchCache.clear(); channelCache.clear(); subtitleCache.clear(); channelMetaCache.clear(); urlMeta.clear();
+    if (global.gc) try { global.gc(); } catch {}
+  }
+}, 30000).unref();
+
+// yt-dlp: اقرا النسخة/الإمكانيات الأول، وبعدين حدّث في الخلفية (مش بيعطّل أي طلب)
+(async () => {
+  await refreshYtdlpInfo();
+  log.info(`yt-dlp ${ytdlpState.version || 'غير متاح'} (${ytdlpState.bin}) remote-components=${ytdlpState.remoteComponents}`);
+  setTimeout(() => { updateYtDlp(false).catch(() => {}); }, 4000).unref();
+  setInterval(() => { updateYtDlp(false).catch(() => {}); }, 6 * 3600 * 1000).unref();
+})().catch(e => log.warn(`yt-dlp init: ${e.message}`));
+
 // 🔥 تسخين الكاش: الهوم فيد جاهز قبل ما أول مستخدم يطلبه، ويتجدد في الخلفية
 async function warmCaches() {
   try {
@@ -5282,7 +5542,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   server.headersTimeout = 66000;
   server.requestTimeout = 0;
   server.maxConnections = 2000;
-  const ytdlpStatus = commandExists('yt-dlp') ? '✅' : '❌';
+  const ytdlpStatus = commandExists(ytdlpBin) ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
 ║  🎬 srver v${SERVER_VERSION} شغّال 🔥        ║
