@@ -1426,7 +1426,7 @@ const poManager = (() => {
         for (const base of [path.join(process.cwd(), 'node_modules', 'bgutils-js'), path.join(__dirname, 'node_modules', 'bgutils-js')]) {
           let pkg = null; try { pkg = JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf8')); } catch { continue; }
           const cands = [];
-          const addStr = (v) => { if (typeof v === 'string') cands.push(v); else if (v && typeof v === 'object') Object.values(v).forEach(addStr); };
+          const addStr = (v) => { if (typeof v === 'string') { if (!/\.d\.ts$/.test(v)) cands.push(v); } else if (v && typeof v === 'object') Object.values(v).forEach(addStr); };
           addStr(pkg.exports); cands.push(pkg.module, pkg.main);
           const files = [];
           (function walk(d, depth) {
@@ -1440,7 +1440,7 @@ const poManager = (() => {
           })(base, 0);
           files.sort((x, y) => ((/esm|\.mjs/.test(y) ? 2 : 0) + (/index/.test(y) ? 1 : 0)) - ((/esm|\.mjs/.test(x) ? 2 : 0) + (/index/.test(x) ? 1 : 0)));
           cands.push(...files);
-          tried.push(`exports=${JSON.stringify(pkg.exports || null).slice(0, 160)} files=${files.slice(0, 12).join(',') || 'none'}`);
+          tried.push(`version=${pkg.version || '?'} ${/^[3-9]\./.test(String(pkg.version || '')) ? '← النسخة دي API مختلف عن اللي السيرفر مبني عليه: نزّل bgutils-js@2 (npm i bgutils-js@2)' : ''} exports=${JSON.stringify(pkg.exports || null).slice(0, 100)}`);
           for (const rel of [...new Set(cands.filter(Boolean))]) {
             const f = path.join(base, rel);
             if (!fs.existsSync(f)) continue;
