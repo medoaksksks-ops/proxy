@@ -2688,6 +2688,44 @@ function subtitleToVtt(body, ext) {
     return 'WEBVTT\n\n' + cues.map(([a, b, t]) => `${msToVttTs(a)} --> ${msToVttTs(b)}\n${t}`).join('\n\n') + '\n';
   } catch { return null; }
 }
+// الترجمة التلقائية (ASR) في يوتيوب "متدحرجة": كل cue بيكرر سطر الـ cue اللي قبله ويضيف الجديد جنبه، وفيه cues مدتها 10ms للانتقال.
+// الدالة دي بتشيل السطور المكررة فكل cue يبدأ بالكلام الجديد بس، وبتشيل tags التوقيت الداخلية وإعدادات المكان. بتتطبق بس لو الملف فعلًا متدحرج.
+function cleanRollingVtt(body) {
+  try {
+    const tsRe = /(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})\s*-->\s*(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})/;
+    const toS = (h, m, sec, ms) => Number(h || 0) * 3600 + Number(m) * 60 + Number(sec) + Number(ms) / 1000;
+    const cues = [];
+    for (const block of String(body).split(/\r?\n\r?\n/)) {
+      const lines = block.split(/\r?\n/);
+      const i = lines.findIndex(l => tsRe.test(l));
+      if (i < 0) continue;
+      const m = lines[i].match(tsRe);
+      const text = lines.slice(i + 1).map(l => l.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+      cues.push({ a: toS(m[1], m[2], m[3], m[4]), b: toS(m[5], m[6], m[7], m[8]), lines: text });
+    }
+    if (cues.length < 4) return body;
+    let rolling = 0;
+    for (let k = 1; k < cues.length; k++) {
+      const p = cues[k - 1].lines, c = cues[k].lines;
+      if (c.length && p.length && (c[0] === p[p.length - 1] || (c.length === p.length && c.every((x, j) => x === p[j])))) rolling++;
+    }
+    if (rolling / cues.length < 0.15) return body;   // ترجمة عادية (مش متدحرجة) → منلمسهاش
+    const out = [];
+    let prev = [];
+    for (const c of cues) {
+      let fresh = c.lines;
+      // شيل السطور اللي كانت في آخر cue (بالترتيب من الأول)
+      while (fresh.length && prev.includes(fresh[0])) fresh = fresh.slice(1);
+      fresh = fresh.filter(l => !prev.includes(l));
+      prev = c.lines.length ? c.lines : prev;
+      if (!fresh.length) continue;
+      out.push({ a: c.a, b: c.b, text: fresh.join('\n') });
+    }
+    for (let k = 0; k < out.length - 1; k++) if (out[k].b > out[k + 1].a) out[k].b = Math.max(out[k].a + 0.2, out[k + 1].a);   // من غير تداخل في الوقت
+    const fmt = (t) => msToVttTs(t * 1000);
+    return 'WEBVTT\n\n' + out.map(o => `${fmt(o.a)} --> ${fmt(o.b)}\n${o.text}`).join('\n\n') + '\n';
+  } catch { return body; }
+}
 function parseVttSegments(body) {
   const out = [];
   let start = null, last = '';
@@ -2723,6 +2761,7 @@ app.get('/captions/file', async (req, res) => {
       const conv = subtitleToVtt(body, ext);
       if (conv) { body = conv; ext = 'vtt'; }
     }
+    if (ext === 'vtt') body = cleanRollingVtt(body);
     const type =
       ext === 'vtt' ? 'text/vtt; charset=utf-8' :
       ext === 'srt' ? 'application/x-subrip; charset=utf-8' :
@@ -6092,6 +6131,17 @@ function buildReport() {
 }
 
 let selfTestRunning = false;
+// تفاصيل رابط: format + حالة الرد بدون/مع كوكيز (عشان نعرف ليه 403)
+async function describeUrlProbe(f) {
+  const u = f && f.url;
+  if (!u) return `${f && f.format_id}: مفيش url`;
+  const res = [];
+  for (const withCookies of [false, true]) {
+    try { res.push(`${withCookies ? 'كوكيز' : 'بدون'}=${(await probeOnce(u, buildUpstreamHeaders(u, { withCookies }))).status}`); }
+    catch (e) { res.push(`${withCookies ? 'كوكيز' : 'بدون'}=${String(e.message || e).slice(0, 30)}`); }
+  }
+  return `${f.format_id}[${f.format_note || f.ext || ''}|${f.protocol || ''}${/[?&]pot=/.test(u) ? '|pot' : ''}${/[?&]sabr=/.test(u) ? '|sabr' : ''}] ${res.join(' ')}`;
+}
 async function runSelfTest(videoId = 'dQw4w9WgXcQ') {
   const steps = [];
   const t00 = Date.now();
@@ -6152,7 +6202,8 @@ async function runSelfTest(videoId = 'dQw4w9WgXcQ') {
       const langs = [...new Set(audio.map(f => f.language || 'und'))];
       const url = pickBestAudioUrl(info);
       const ok = !!url && await verifyUrl(url);
-      return { ok, detail: `${audio.length} مسار | لغات: ${langs.join(',')} | الرابط ${ok ? 'شغّال' : 'مرفوض/مفيش'}` };
+      const extra = ok ? '' : ' | ' + await describeUrlProbe(audio.find(f => f.url === url) || audio[0]);
+      return { ok, detail: `${audio.length} مسار | لغات: ${langs.join(',')} | الرابط ${ok ? 'شغّال' : 'مرفوض/مفيش'}${extra}` };
     }, 40000);
     await step('بث 360p (progressive)', async () => {
       const u = await getFastStreamUrl(videoId);
@@ -6169,7 +6220,8 @@ async function runSelfTest(videoId = 'dQw4w9WgXcQ') {
       const vUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === sel.videoFormatId));
       const aUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === sel.audioFormatId));
       const ok = !!(vUrl && aUrl) && await verifyAll([vUrl, aUrl]);
-      return { ok, detail: ok ? 'روابط الفيديو والصوت متحقق منها' : 'روابط الفيديو/الصوت مرفوضة (403) أو ناقصة — ده سبب إن الجودات العالية مش بتشتغل' };
+      const extra = ok ? '' : ' | فيديو: ' + await describeUrlProbe((info.formats || []).find(f => String(f.format_id) === sel.videoFormatId)) + ' | صوت: ' + await describeUrlProbe((info.formats || []).find(f => String(f.format_id) === sel.audioFormatId));
+      return { ok, detail: ok ? 'روابط الفيديو والصوت متحقق منها' : 'روابط الفيديو/الصوت مرفوضة (403) أو ناقصة — ده سبب إن الجودات العالية مش بتشتغل' + extra };
     }, 60000);
   }
   const result = { at: Date.now(), videoId, totalMs: Date.now() - t00, steps };
