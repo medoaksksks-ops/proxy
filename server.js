@@ -412,7 +412,7 @@ function containerCpus() {
 const PROC_MAX = (() => {
   const env = parseInt(process.env.YTDLP_MAX_PROCS, 10);
   if (env > 0) return env;
-  const byMem = Math.floor(containerMemMb() / 250);
+  const byMem = Math.floor(containerMemMb() / 220);
   const byCpu = Math.ceil(containerCpus() * 4);
   return Math.max(2, Math.min(10, byMem, byCpu));
 })();
@@ -1277,12 +1277,17 @@ async function getVideoInfo(videoId) {
     let lastErr = null;
     const results = [];
     const track = (p, plan) => p.then(
-      r => { results.push(r); return r; },
+      r => { if (r && !r.skipped) results.push(r); return r; },
       e => { lastErr = e; log.warn(`info client ${plan.playerClient || 'default'} fail: ${cleanErr(e, 200).split('\n')[0]}`, { cat: 'info', videoId, detail: cleanErr(e) }); return null; }
     );
     const pA = track(runPlan(planA), planA);
     // B بتبدأ بعد ما A تخلص (أو بعد 4ث) بدل ما الاتنين يضربوا المعالج في نفس اللحظة
-    const pB = track(Promise.race([pA, sleepMs(4000)]).then(() => runPlan(planB)), planB);
+    // الخطة التانية (tv,web,mweb) بترجّع 360p بس في التقارير، فبنشغّلها بس لو الأساسية فشلت أو مفيهاش ترجمة/صوت (بدل ما تضاعف حمل yt-dlp مع كل /info)
+    const pB = track(pA.then(async () => {
+      const a = results.find(r => r.client === planA.playerClient);
+      if (a && a.subs > 0 && a.audioOnly > 0) return { skipped: true };
+      return runPlan(planB);
+    }), planB);
     await Promise.race([pA, pB]);
     if (!results.length) {
       await Promise.all([pA, pB]);                       // الأول فشل → استنى التاني
@@ -1403,9 +1408,20 @@ const poManager = (() => {
       if (!mod) { try { mod = require('bgutils-js'); } catch (e) { impErr = impErr || e; } }
       if (!mod) {
         // بعض نسخ الحزمة exports بتاعتها مش بتدعم import من الجذر → نحمّل الملف مباشرة
-        for (const p of ['bgutils-js/dist/index.js', 'bgutils-js/dist/index.cjs', 'bgutils-js/dist/index.mjs']) {
-          try { mod = await import(require('url').pathToFileURL(require.resolve(p)).href); break; } catch (e) { impErr = impErr || e; }
+        const path = require('path');
+        const tried = [];
+        for (const base of [path.join(process.cwd(), 'node_modules', 'bgutils-js'), path.join(__dirname, 'node_modules', 'bgutils-js')]) {
+          let pkg = {}; try { pkg = JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf8')); } catch { continue; }
+          for (const rel of [pkg.module, pkg.main, 'dist/index.js', 'dist/index.mjs', 'dist/index.cjs', 'build/index.js'].filter(Boolean)) {
+            const f = path.join(base, rel);
+            if (!fs.existsSync(f)) continue;
+            tried.push(rel);
+            try { mod = await import(require('url').pathToFileURL(f).href); break; } catch (e) { impErr = e; }
+          }
+          if (mod) break;
+          try { tried.push('dir:' + fs.readdirSync(base).join('/')); } catch {}
         }
+        if (!mod && tried.length) impErr = new Error(`${impErr && impErr.message} | جرّبت: ${tried.join(', ')}`);
       }
       BG = mod && (mod.BG || (mod.default && mod.default.BG));
       if (!BG) throw new Error('حزمة bgutils-js مش متحمّلة: ' + String((impErr && impErr.message) || 'BG مش موجود في الحزمة').split('\n')[0]);
