@@ -950,6 +950,7 @@ async function innertubeFastPath(args) {
   }
 }
 
+const ytFailFast = new Map();
 async function runYtDlp(args, opts = {}) {
   // yt-dlp الحديث مبقاش بيعرف البريفكس ytsearchdateN: → بنحوّله تلقائيًا
   // لرابط بحث يوتيوب مرتّب بتاريخ الرفع (sp=CAI%3D)، ولو فشل نرجع لـ ytsearchN.
@@ -1052,6 +1053,12 @@ async function runYtDlp(args, opts = {}) {
   const attemptTimeout = Math.min(timeout, opts.attemptTimeout || 35000);
   const deadline = Date.now() + (opts.budget || Math.max(timeout, 60000));
 
+  // نفس الفيديو لو فشل بـ bot-check/reload من شوية، منكرّرش 6 محاولات × 4 جولات (كان بيطلّع لحد 24 عملية yt-dlp للفيديو الواحد)
+  const vidKey = (args.map(String).join(' ').match(/watch\?v=([\w-]{11})/) || [])[1];
+  if (vidKey) {
+    const ff = ytFailFast.get(vidKey);
+    if (ff && ff.until > Date.now()) { const e = new Error(ff.msg); e.failFast = true; throw e; }
+  }
   let lastError;
   const startIdx = Math.min(Math.max(0, opts.skip | 0), Math.max(0, attempts.length - 1));
   for (let i = startIdx; i < attempts.length; i++) {
@@ -1079,6 +1086,10 @@ async function runYtDlp(args, opts = {}) {
       if (!keepTrying && i === startIdx) throw error;
       if (i < attempts.length - 1) log.warn(`yt-dlp fallback ${i + 1}: ${String(error.message || error).split('\n')[0]}`);
     }
+  }
+  if (vidKey && lastError && /sign in to confirm|not a bot|page needs to be reloaded/i.test(String(lastError.message || ''))) {
+    if (ytFailFast.size > 500) ytFailFast.clear();
+    ytFailFast.set(vidKey, { until: Date.now() + 60000, msg: String(lastError.message).slice(0, 400) });
   }
   throw lastError;
 }
@@ -1406,33 +1417,38 @@ const poManager = (() => {
       let mod = null, impErr = null;
       try { mod = await import('bgutils-js'); } catch (e) { impErr = e; }
       if (!mod) { try { mod = require('bgutils-js'); } catch (e) { impErr = impErr || e; } }
-      if (!mod) {
-        // بعض نسخ الحزمة exports بتاعتها مش بتدعم import من الجذر → نحمّل الملف مباشرة
+      const pickBG = (m) => m && (m.BG || (m.default && m.default.BG));
+      if (!pickBG(mod)) {
+        // exports بتاعة الحزمة مش بتسمح بالـ import من الجذر → نجرّب كل ملفات js جواها بالمسار المباشر لحد ما نلاقي BG
         const path = require('path');
         const tried = [];
+        mod = null;
         for (const base of [path.join(process.cwd(), 'node_modules', 'bgutils-js'), path.join(__dirname, 'node_modules', 'bgutils-js')]) {
-          let pkg = {}; try { pkg = JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf8')); } catch { continue; }
-          const found = [];
+          let pkg = null; try { pkg = JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf8')); } catch { continue; }
+          const cands = [];
+          const addStr = (v) => { if (typeof v === 'string') cands.push(v); else if (v && typeof v === 'object') Object.values(v).forEach(addStr); };
+          addStr(pkg.exports); cands.push(pkg.module, pkg.main);
+          const files = [];
           (function walk(d, depth) {
-            if (depth > 3) return;
+            if (depth > 4) return;
             let ents = []; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
             for (const e of ents) {
               const p = path.join(d, e.name);
-              if (e.isDirectory()) walk(p, depth + 1);
-              else if (/^index\.(m?js|cjs)$/.test(e.name)) found.push(path.relative(base, p));
+              if (e.isDirectory()) { if (e.name !== 'node_modules') walk(p, depth + 1); }
+              else if (/\.(m?js|cjs)$/.test(e.name) && !/\.d\.|\.min\./.test(e.name)) files.push(path.relative(base, p));
             }
-          })(path.join(base, 'dist'), 0);
-          found.sort((a, b) => (/esm|\.mjs/.test(b) ? 1 : 0) - (/esm|\.mjs/.test(a) ? 1 : 0));
-          for (const rel of [pkg.module, pkg.main, ...found, 'dist/index.js', 'dist/index.mjs', 'build/index.js'].filter(Boolean)) {
+          })(base, 0);
+          files.sort((x, y) => ((/esm|\.mjs/.test(y) ? 2 : 0) + (/index/.test(y) ? 1 : 0)) - ((/esm|\.mjs/.test(x) ? 2 : 0) + (/index/.test(x) ? 1 : 0)));
+          cands.push(...files);
+          tried.push(`exports=${JSON.stringify(pkg.exports || null).slice(0, 160)} files=${files.slice(0, 12).join(',') || 'none'}`);
+          for (const rel of [...new Set(cands.filter(Boolean))]) {
             const f = path.join(base, rel);
             if (!fs.existsSync(f)) continue;
-            tried.push(rel);
-            try { mod = await import(require('url').pathToFileURL(f).href); break; } catch (e) { impErr = e; }
+            try { const m = await import(require('url').pathToFileURL(f).href); if (pickBG(m)) { mod = m; break; } } catch (e) { impErr = e; }
           }
           if (mod) break;
-          try { tried.push('dir:' + fs.readdirSync(base).join('/')); } catch {}
         }
-        if (!mod && tried.length) impErr = new Error(`${impErr && impErr.message} | جرّبت: ${tried.join(', ')}`);
+        if (!mod) impErr = new Error(`${impErr && impErr.message} | ${tried.join(' || ')}`);
       }
       BG = mod && (mod.BG || (mod.default && mod.default.BG));
       if (!BG) throw new Error('حزمة bgutils-js مش متحمّلة: ' + String((impErr && impErr.message) || 'BG مش موجود في الحزمة').split('\n')[0]);
@@ -6041,6 +6057,7 @@ function diagnose() {
   const recent = [...incStore.groups.values()].filter(g => g.last > since && g.level !== 'slow');
   const blob = recent.map(g => `${g.msg}\n${g.detail}`).join('\n');
   const rules = [
+    [/page needs to be reloaded/i, 'bad', 'يوتيوب بيرد "The page needs to be reloaded" مع الكوكيز → الكوكيز غالبًا اتلغت/اتبدّلت (يوتيوب بيقفل الجلسة لما الحساب يتفتح في متصفح بعد التصدير). صدّر كوكيز جديدة من نافذة Incognito، واقفلها فورًا، وماتفتحش الحساب تاني.'],
     [/sign in to confirm|not a bot/i, 'bad', 'يوتيوب شاكك إن السيرفر بوت (Sign in to confirm) → جدّد الكوكيز (حساب مسجّل دخول، صيغة Netscape) وتأكد إن IP السيرفر مش محظور.'],
     [/po.?token/i, 'warn', 'ظهرت أخطاء متعلقة بـ PO Token → راجع حالة التوليد التلقائي (bgutils-js + jsdom لازم يكونوا منصّبين).'],
     [/http error 403|upstream rejected|\(403\)|status.?403/i, 'warn', 'روابط جوجل بترجع 403 → غالبًا PO Token/كوكيز/IP أو yt-dlp قديم. جرّب /api/video-debug?v=ID.'],
