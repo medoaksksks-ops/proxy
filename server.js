@@ -1238,9 +1238,11 @@ async function getVideoInfo(videoId) {
     // خطتين بيشتغلوا في نفس اللحظة بدل ما يتجرّبوا ورا بعض (ده كان أكبر سبب للبطء):
     //  A) android_vr/tv/ios من غير كوكيز → formats مضمونة + جودات عالية + HLS للبث المباشر.
     //  B) tv/web/mweb بالكوكيز + PO Token → الترجمات + المقاطع الصوتية بلغات تانية.
-    const planA = { playerClient: 'android_vr,tv,ios', useCookies: false };
+    // الأساسي = clients الافتراضية بتاعة yt-dlp نفسه (التقرير أثبت إنها بترجّع 2160p..240p بينما android_vr/tv/ios رجّعوا 360p بس)
+    const planA = { playerClient: null, useCookies: cookiesReady };
     const planB = { playerClient: 'tv,web,mweb', useCookies: true };
     const fallbackPlans = [
+      { playerClient: 'android_vr,tv,ios', useCookies: false },
       { playerClient: 'tv,ios,web', useCookies: true },
       { playerClient: 'web', useCookies: true }
     ];
@@ -1262,7 +1264,7 @@ async function getVideoInfo(videoId) {
       });
       const parsed = slimInfo(JSON.parse(stdout));
       const formats = Array.isArray(parsed.formats) ? parsed.formats : [];
-      const heights = new Set(formats.map(f => Number(f.height)).filter(h => h > 0));
+      const heights = new Set(formats.filter(f => f.vcodec && f.vcodec !== 'none').map(f => Number(f.height)).filter(h => h > 0));   // من غير storyboards (144/90/45p دي صور مصغّرة)
       const subs =
         Object.keys(parsed.subtitles || {}).length +
         Object.keys(parsed.automatic_captions || {}).length;
@@ -1337,7 +1339,7 @@ async function getVideoInfo(videoId) {
     // الخطة التانية لسه شغّالة؟ بنرد دلوقتي وهي بتكمّل في الخلفية (بتعدّل نفس الكائن المتكاشّ).
     // /captions و/transcript بيستنوها عبر ensureSubtitles، و/info مبيستناهاش (عشان الوصف يطلع بسرعة).
     const pending = [pA, pB];
-    if (degradedNow) { const planC = { playerClient: null, useCookies: cookiesReady }; pending.push(track(runPlan(planC), planC)); }
+    if (degradedNow) { const planC = { playerClient: 'android_vr,tv,ios', useCookies: false }; pending.push(track(runPlan(planC), planC)); }
     const settle = Promise.allSettled(pending).then(() => {
       for (const r of results) if (!merged.has(r)) { mergeInto(best, r); merged.add(r); }
       if (degradedNow) {
@@ -1395,8 +1397,19 @@ const poManager = (() => {
     try { ({ JSDOM } = require('jsdom')); }
     catch (e) { throw new Error('حزمة jsdom مش متحمّلة: ' + String(e.message || e).split('\n')[0]); }
     let BG;
-    try { ({ BG } = await import('bgutils-js')); }
-    catch (e) { throw new Error('حزمة bgutils-js مش متحمّلة: ' + String(e.message || e).split('\n')[0]); }
+    {
+      let mod = null, impErr = null;
+      try { mod = await import('bgutils-js'); } catch (e) { impErr = e; }
+      if (!mod) { try { mod = require('bgutils-js'); } catch (e) { impErr = impErr || e; } }
+      if (!mod) {
+        // بعض نسخ الحزمة exports بتاعتها مش بتدعم import من الجذر → نحمّل الملف مباشرة
+        for (const p of ['bgutils-js/dist/index.js', 'bgutils-js/dist/index.cjs', 'bgutils-js/dist/index.mjs']) {
+          try { mod = await import(require('url').pathToFileURL(require.resolve(p)).href); break; } catch (e) { impErr = impErr || e; }
+        }
+      }
+      BG = mod && (mod.BG || (mod.default && mod.default.BG));
+      if (!BG) throw new Error('حزمة bgutils-js مش متحمّلة: ' + String((impErr && impErr.message) || 'BG مش موجود في الحزمة').split('\n')[0]);
+    }
 
     const visitorData = await fetchVisitorData();
     const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
@@ -6079,6 +6092,7 @@ async function runSelfTest(videoId = 'dQw4w9WgXcQ') {
   await step('استخراج بيانات الفيديو + الجودات', async () => {
     forgetVideo(videoId);
     info = await getVideoInfo(videoId);
+    await waitSettled(info, 30000);
     const heights = getAvailableQualities(info);
     const maxH = heights[0] || 0;
     return { ok: maxH > 360, detail: `جودات: ${heights.join(',') || 'مفيش'} | formats=${(info.formats || []).length}${maxH <= 360 ? ' ← أعلى جودة 360 أو أقل (غير طبيعي للفيديو ده)' : ''}` };
