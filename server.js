@@ -18,7 +18,9 @@ require('dotenv').config();
 // ==========================================================================
 // v13.4.0 — AUTO PO TOKEN: السيرفر بيولّد PO Token + Visitor Data لوحده
 // (bgutils-js + jsdom) ويجدده كل 4 ساعات، من غير أي توكن يدوي.
-const SERVER_VERSION = '13.6.0-FAST-FIX';
+// v13.7.0 — DIAG-FIX: لوحة مشاكل + سجل عمليات + تقرير للنسخ، إصلاح تنزيل ffmpeg (كان بيتكرر بالتوازي),
+// كاش الجودات/المعلومات المتدهورة، الترجمة/الصوت بدون انتظار طويل، سقف عمليات yt-dlp حسب الرام/المعالج.
+const SERVER_VERSION = '13.7.0-DIAG-FIX';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -233,13 +235,206 @@ app.use((req, res, next) => {
 const TIMEOUT = 45000;
 const MAX_RETRIES = 2;
 
-// Logger
+// ==========================================================================
+// 🚨 INCIDENTS + OPS LOG (v13.7)
+// كل مشكلة بتحصل في السيرفر (أخطاء / تحذيرات / بطء) بتتسجّل هنا وتظهر في لوحة /admin،
+// ومعاها زرار "نسخ كل المشاكل" عشان تبعت التقرير كامل. بتتنضّف من التوكنات/الكوكيز قبل التخزين.
+// ==========================================================================
+const os = require('os');
+const INC_FILE = process.env.INCIDENTS_FILE || '/tmp/titan-incidents.json';
+const INC_MAX_EVENTS = 500;
+const OPS_MAX = 400;
+const incStore = { events: [], groups: new Map(), ops: [], seq: 0, startedAt: Date.now(), dirty: false, lastSelfTest: null };
+
+function redactSecrets(s) {
+  return String(s == null ? '' : s)
+    .replace(/https?:\/\/[^\s"'<>]*googlevideo\.com[^\s"'<>]*/gi, 'https://<googlevideo-url>')
+    .replace(/https?:\/\/[^\s"'<>]*timedtext[^\s"'<>]*/gi, 'https://<timedtext-url>')
+    .replace(/(po_token=)[^\s'"]+/gi, '$1<redacted>')
+    .replace(/(visitor_data=)[^\s'"]+/gi, '$1<redacted>')
+    .replace(/([?&](?:auth|key|token|pot|secret)=)[^&\s'"]+/gi, '$1<redacted>')
+    .replace(/(cookie:\s*)[^\r\n]+/gi, '$1<redacted>')
+    .replace(/(authorization:\s*)[^\r\n]+/gi, '$1<redacted>')
+    .replace(/(x-admin-key:\s*)[^\r\n]+/gi, '$1<redacted>');
+}
+
+// بيطلّع نص الخطأ المفيد (stderr بتاع yt-dlp) من غير سطر الأمر (اللي فيه PO Token وبيزحم الرسالة)
+function cleanErr(e, max = 700) {
+  if (e == null) return '';
+  let txt = '';
+  if (typeof e === 'string') txt = e;
+  else {
+    const stderr = typeof e.stderr === 'string' ? e.stderr.trim() : '';
+    let msg = String(e.message || e).replace(/^Command failed:[^\n]*\n?/, '').trim();
+    const killed = e.killed || e.signal === 'SIGTERM' ? '[TIMEOUT/killed] ' : '';
+    txt = killed + [msg, stderr].filter(Boolean).join('\n');
+    if (!txt.trim() && e.code != null) txt = `exit code ${e.code}`;
+  }
+  const lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
+  const important = lines.filter(l => /error|sign in|403|429|po.?token|not available|unavailable|private|timeout|timed out|killed/i.test(l));
+  const picked = (important.length ? important.slice(-4) : lines.slice(-6)).join('\n');
+  return redactSecrets(picked).slice(0, max);
+}
+
+function inferCat(msg) {
+  const m = String(msg).toLowerCase();
+  if (/ffmpeg|دمج/.test(m)) return 'ffmpeg';
+  if (/po token|🔑/.test(m)) return 'potoken';
+  if (/cookie|كوكيز|firebase/.test(m)) return 'cookies';
+  if (/subs|caption|ترجمة|subtitle|transcript/.test(m)) return 'captions';
+  if (/audio|صوت|dub/.test(m)) return 'audio';
+  if (/quality|جودة|merge|progressive|\b\d{3,4}p\b/.test(m)) return 'quality';
+  if (/yt-dlp|info client|extract/.test(m)) return 'ytdlp';
+  if (/innertube/.test(m)) return 'innertube';
+  if (/hls|live|بث/.test(m)) return 'live';
+  if (/memory|rss|🧠/.test(m)) return 'memory';
+  if (/upstream|stream|proxy|googlevideo/.test(m)) return 'stream';
+  return 'system';
+}
+
+function normalizeFp(s) {
+  return String(s).toLowerCase()
+    .replace(/\b(?=[\w-]*\d)[\w-]{11}\b/g, '<id>')
+    .replace(/\/tmp\/[^\s]+/g, '<tmp>')
+    .replace(/\d+(\.\d+)?/g, '#')
+    .slice(0, 160);
+}
+
+function addOp(level, msg) {
+  try {
+    incStore.ops.push({ t: Date.now(), level, msg: redactSecrets(msg).slice(0, 300) });
+    if (incStore.ops.length > OPS_MAX) incStore.ops.splice(0, incStore.ops.length - OPS_MAX);
+    incStore.dirty = true;
+  } catch {}
+}
+
+function addIncident(level, msg, ctx = {}) {
+  try {
+    const now = Date.now();
+    const cat = ctx.cat || inferCat(msg);
+    const text = redactSecrets(msg).slice(0, 500);
+    const detail = ctx.detail ? redactSecrets(ctx.detail).slice(0, 1400) : '';
+    const ev = {
+      id: ++incStore.seq, t: now, level, cat, msg: text, detail,
+      videoId: ctx.videoId || null, route: ctx.route ? redactSecrets(ctx.route).slice(0, 200) : null,
+      status: ctx.status || null, ms: ctx.ms != null ? Math.round(ctx.ms) : null, reqId: ctx.reqId || null
+    };
+    incStore.events.push(ev);
+    if (incStore.events.length > INC_MAX_EVENTS) incStore.events.splice(0, incStore.events.length - INC_MAX_EVENTS);
+    const fp = `${level}|${cat}|${normalizeFp(text)}`;
+    let g = incStore.groups.get(fp);
+    if (!g) {
+      g = { fp, level, cat, msg: text, detail: '', count: 0, first: now, last: now, videos: [], maxMs: 0 };
+      incStore.groups.set(fp, g);
+      if (incStore.groups.size > 300) {
+        const oldest = [...incStore.groups.values()].sort((a, b) => a.last - b.last)[0];
+        if (oldest) incStore.groups.delete(oldest.fp);
+      }
+    }
+    g.count++; g.last = now;
+    if (detail) g.detail = detail;
+    if (ev.videoId && !g.videos.includes(ev.videoId) && g.videos.length < 5) g.videos.push(ev.videoId);
+    if (ev.ms != null) g.maxMs = Math.max(g.maxMs || 0, ev.ms);
+    incStore.dirty = true;
+    return ev;
+  } catch { return null; }
+}
+
+function loadIncidents() {
+  try {
+    if (!fs.existsSync(INC_FILE)) return;
+    const j = JSON.parse(fs.readFileSync(INC_FILE, 'utf8'));
+    if (Array.isArray(j.events)) incStore.events = j.events.slice(-INC_MAX_EVENTS);
+    if (Array.isArray(j.groups)) for (const g of j.groups) if (g && g.fp) incStore.groups.set(g.fp, g);
+    if (Array.isArray(j.ops)) incStore.ops = j.ops.slice(-OPS_MAX);
+    incStore.seq = incStore.events.reduce((m, e) => Math.max(m, e.id || 0), 0);
+  } catch {}
+}
+function saveIncidents() {
+  if (!incStore.dirty) return;
+  incStore.dirty = false;
+  try {
+    const tmp = `${INC_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ savedAt: Date.now(), events: incStore.events, groups: [...incStore.groups.values()], ops: incStore.ops }));
+    fs.renameSync(tmp, INC_FILE);
+  } catch {}
+}
+loadIncidents();
+setInterval(saveIncidents, 15000).unref();
+process.on('exit', saveIncidents);
+
+// Logger — كل سطر بيتسجّل في "سجل العمليات"، والـ warn/error بيتسجّلوا كمان كـ "مشاكل" (مجمّعة ومعدودة)
 const log = {
-  info: (msg) => console.log(`[${new Date().toISOString()}] ℹ️  ${msg}`),
-  success: (msg) => console.log(`[${new Date().toISOString()}] ✅ ${msg}`),
-  error: (msg) => console.error(`[${new Date().toISOString()}] ❌ ${msg}`),
-  warn: (msg) => console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`)
+  info: (msg) => { console.log(`[${new Date().toISOString()}] ℹ️  ${msg}`); addOp('info', msg); },
+  success: (msg) => { console.log(`[${new Date().toISOString()}] ✅ ${msg}`); addOp('ok', msg); },
+  error: (msg, ctx) => { console.error(`[${new Date().toISOString()}] ❌ ${msg}`); addOp('error', msg); addIncident('error', msg, ctx); },
+  warn: (msg, ctx) => { console.warn(`[${new Date().toISOString()}] ⚠️  ${msg}`); addOp('warn', msg); addIncident('warn', msg, ctx); }
 };
+
+// ---- حدود العمليات المتزامنة (yt-dlp + node) حسب رام/معالج الحاوية ----
+class PrioritySemaphore {
+  constructor(max, reserveForHigh = 0) { this.max = max; this.current = 0; this.q = [[], []]; this.reserve = reserveForHigh; }
+  _can(p) { return this.current < (p === 0 ? this.max : this.max - this.reserve); }
+  acquire(p = 1) {
+    if (this.q[0].length === 0 && (p === 0 || this.q[1].length === 0) && this._can(p)) { this.current++; return Promise.resolve(); }
+    return new Promise(resolve => this.q[p].push(resolve));
+  }
+  release() { this.current = Math.max(0, this.current - 1); this._drain(); }
+  _drain() {
+    for (const p of [0, 1]) {
+      while (this.q[p].length && this._can(p)) { this.current++; this.q[p].shift()(); }
+    }
+  }
+  get queued() { return this.q[0].length + this.q[1].length; }
+}
+function readCgroupNum(f) {
+  try { const t = fs.readFileSync(f, 'utf8').trim(); if (t === 'max') return null; const n = Number(t); return Number.isFinite(n) ? n : null; } catch { return null; }
+}
+function containerMemMb() {
+  for (const f of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    const n = readCgroupNum(f);
+    if (n && n > 0 && n < 64 * 1024 ** 3) return Math.round(n / 1048576);
+  }
+  return Math.round(os.totalmem() / 1048576);
+}
+function containerCpus() {
+  try {
+    const t = fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+    if (t[0] !== 'max') { const q = Number(t[0]), p = Number(t[1]) || 100000; if (q > 0) return q / p; }
+  } catch {}
+  try {
+    const q = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8')), p = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8'));
+    if (q > 0 && p > 0) return q / p;
+  } catch {}
+  return os.cpus().length || 1;
+}
+// كل عملية yt-dlp (+ node للـ n/sig) بتاخد ~150-300MB ومعالج. قبل كده كان ممكن 14 عملية مع بعض → السيرفر يتخنق.
+const PROC_MAX = (() => {
+  const env = parseInt(process.env.YTDLP_MAX_PROCS, 10);
+  if (env > 0) return env;
+  const byMem = Math.floor(containerMemMb() / 250);
+  const byCpu = Math.ceil(containerCpus() * 4);
+  return Math.max(2, Math.min(10, byMem, byCpu));
+})();
+const procLimiter = new PrioritySemaphore(PROC_MAX, PROC_MAX >= 3 ? 1 : 0);   // "stream" بياخد أولوية، و"meta" مبياخدش آخر خانة
+const spawnStats = { stream: { d: [], fails: 0, n: 0 }, meta: { d: [], fails: 0, n: 0 } };
+function noteSpawn(lane, ms, ok) {
+  const s = spawnStats[lane] || spawnStats.meta;
+  s.n++; if (!ok) s.fails++;
+  s.d.push(Math.round(ms)); if (s.d.length > 60) s.d.shift();
+}
+function spawnSummary(lane) {
+  const s = spawnStats[lane]; const d = [...s.d].sort((a, b) => a - b);
+  return { runs: s.n, fails: s.fails, avgMs: d.length ? Math.round(d.reduce((a, b) => a + b, 0) / d.length) : 0, p95Ms: d.length ? d[Math.min(d.length - 1, Math.floor(d.length * 0.95))] : 0 };
+}
+function attemptLabel(cmd) {
+  const i = cmd.indexOf('--extractor-args');
+  const m = i >= 0 ? String(cmd[i + 1] || '').match(/player_client=([\w,]+)/) : null;
+  const ck = cmd.includes('--cookies') ? '+cookies' : '';
+  return `${m ? m[1] : 'default'}${ck}`;
+}
+const sleepMs = (ms) => new Promise(r => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
+
 
 // ==========================================================================
 // Concurrency limiter — بيمنع الـ Railway instance من إنه يتحمّل أكتر من طاقته
@@ -309,13 +504,19 @@ function ytdlpBaseArgs() {
   if (ytdlpState.remoteComponents && process.env.YTDLP_REMOTE_COMPONENTS !== '0') a.push('--remote-components', 'ejs:github');
   return a;
 }
+let pythonOkMemo = null;
+function pythonOk() {
+  if (pythonOkMemo !== null) return pythonOkMemo;
+  try { pythonOkMemo = require('child_process').execFileSync('python3', ['-c', 'import sys;print(int(sys.version_info>=(3,10)))'], { timeout: 8000 }).toString().trim() === '1'; }
+  catch { pythonOkMemo = false; }
+  return pythonOkMemo;
+}
 async function updateYtDlp(force = false) {
   if (process.env.YTDLP_AUTO_UPDATE === '0' || process.env.YTDLP_PATH) return;
   if (!force && Date.now() - ytdlpState.lastCheck < 5 * 3600 * 1000) return;
   ytdlpState.lastCheck = Date.now();
   const nightly = process.env.YTDLP_CHANNEL === 'nightly';
   const repo = nightly ? 'yt-dlp/yt-dlp-nightly-builds' : 'yt-dlp/yt-dlp';
-  const asset = process.env.YTDLP_ASSET || 'yt-dlp_linux';
   const tmp = `${YTDLP_LOCAL}.new`;
   try {
     let tag = null;
@@ -326,10 +527,18 @@ async function updateYtDlp(force = false) {
     if (tag && ytdlpState.version && tag === ytdlpState.version) { ytdlpState.lastError = null; return; }
     if (!fs.existsSync(YTDLP_DIR)) fs.mkdirSync(YTDLP_DIR, { recursive: true });
     log.info(`⬇️  تحديث yt-dlp (${ytdlpState.version || 'غير معروف'} → ${tag || 'latest'})`);
-    await httpDownloadToFile(`https://github.com/${repo}/releases/latest/download/${asset}`, tmp);
-    fs.chmodSync(tmp, 0o755);
-    const v = (await execFileAsync(tmp, ['--version'], { timeout: 30000 })).stdout.trim();
-    if (!v) throw new Error('النسخة الجديدة مش بترد على --version');
+    // zipapp (python) بيبدأ أسرع بكتير من نسخة PyInstaller (اللي بتفك نفسها في /tmp مع كل تشغيل) → نفضّله لو python>=3.10 موجود
+    const assets = process.env.YTDLP_ASSET ? [process.env.YTDLP_ASSET] : (pythonOk() ? ['yt-dlp', 'yt-dlp_linux'] : ['yt-dlp_linux', 'yt-dlp']);
+    let v = '', lastAssetErr = null;
+    for (const asset of assets) {
+      try {
+        await httpDownloadToFile(`https://github.com/${repo}/releases/latest/download/${asset}`, tmp);
+        fs.chmodSync(tmp, 0o755);
+        v = (await execFileAsync(tmp, ['--version'], { timeout: 30000 })).stdout.trim();
+        if (v) { log.info(`yt-dlp asset المستخدم: ${asset}`); break; }
+      } catch (e) { lastAssetErr = e; try { fs.unlinkSync(tmp); } catch {} }
+    }
+    if (!v) throw lastAssetErr || new Error('النسخة الجديدة مش بترد على --version');
     fs.renameSync(tmp, YTDLP_LOCAL);
     ytdlpBin = YTDLP_LOCAL;
     await refreshYtdlpInfo();
@@ -779,9 +988,23 @@ async function runYtDlp(args, opts = {}) {
   // الطابور بيتاخد لكل محاولة لوحدها (مش للطلب كله) — قبل كده طلب واحد فاشل كان
   // بيحجز مكان لحد 8 محاولات ورا بعض ويخنق باقي المستخدمين.
   const execOnce = async (cmd, execOpts) => {
+    const tq = Date.now();
     await limiter.acquire();
-    try { return await execFileAsync(ytdlpBin, cmd, execOpts); }
-    finally { limiter.release(); }
+    let gotProc = false;
+    try {
+      // سقف عام لكل عمليات yt-dlp (حسب الرام/المعالج) والـ stream ليه أولوية
+      await procLimiter.acquire(lane === 'stream' ? 0 : 1); gotProc = true;
+      const waited = Date.now() - tq;
+      if (waited > 8000) addIncident('slow', `طابور yt-dlp مزدحم: العملية استنت ${Math.round(waited / 1000)}ث قبل ما تشتغل (${lane})`, { cat: 'queue', ms: waited });
+      const t1 = Date.now();
+      try { const r = await execFileAsync(ytdlpBin, cmd, execOpts); noteSpawn(lane, Date.now() - t1, true); return r; }
+      catch (err) {
+        noteSpawn(lane, Date.now() - t1, false);
+        // رسالة execFile الأصلية سطرها الأول هو سطر الأمر كله (مفيهوش السبب!) → نخلي الرسالة = سبب الفشل الحقيقي من stderr
+        try { err.fullMessage = err.message; err.message = cleanErr(err, 900) || err.message; } catch {}
+        throw err;
+      }
+    } finally { if (gotProc) procLimiter.release(); limiter.release(); }
   };
 
   const base = ytdlpBaseArgs();
@@ -839,6 +1062,10 @@ async function runYtDlp(args, opts = {}) {
     } catch (error) {
       lastError = error;
       const msg = String(error.message || error).toLowerCase();
+      {
+        const vArg = attempts[i].find(a => /watch\?v=[\w-]{11}/.test(String(a)));
+        addIncident('warn', `yt-dlp فشل (${attemptLabel(attempts[i])}) محاولة ${i + 1}/${attempts.length}`, { cat: 'ytdlp', videoId: vArg ? String(vArg).match(/v=([\w-]{11})/)[1] : null, detail: cleanErr(error) });
+      }
       if (/po.?token|sign in to confirm|not a bot/.test(msg)) poManager.invalidateSoon();
       const keepTrying = isRetryableYoutubeError(error)
         || msg.includes('private')
@@ -969,24 +1196,25 @@ async function getPaginatedPool(cache, cacheKeyBase, fetchPoolFn, page, limit, m
 // قبل كده: لو الخطة اللي فيها الترجمة اتأخرت أو فشلت مرة، السيرفر كان يقول "مفيش ترجمة" للأبد.
 async function ensureSubtitles(videoId, info) {
   const count = () => Object.keys(info.subtitles || {}).length + Object.keys(info.automatic_captions || {}).length;
-  if (info.__settle) { try { await info.__settle; } catch {} }
+  await waitSettled(info, 15000);   // قبل كده كان بيستنى الخطة التانية بلا حد (لحد 40ث+) فالترجمة كانت بتتعلّق
   if (count() || info.__subsRetried) return info;
   return dedupe(`ensure-subs:${videoId}`, async () => {
     if (count() || info.__subsRetried) return info;
     Object.defineProperty(info, '__subsRetried', { value: true, enumerable: false, writable: true, configurable: true });
-    for (const plan of [{ playerClient: 'web,mweb', useCookies: false }, { playerClient: 'tv,ios,web', useCookies: true }]) {
+    // أول خطة = clients الافتراضية بتاعة yt-dlp نفسه (بتتحدّث مع yt-dlp) ثم بدائل
+    for (const plan of [{ playerClient: null, useCookies: true }, { playerClient: 'tv,web,mweb', useCookies: true }, { playerClient: 'web,mweb', useCookies: false }]) {
       try {
-        const stdout = await runYtDlp(['--dump-json', '--no-playlist', '--skip-download', `https://www.youtube.com/watch?v=${videoId}`], {
-          timeout: 40000, raw: true, useCookies: plan.useCookies && cookiesReady, playerClient: plan.playerClient, maxBuffer: 1024 * 1024 * 20
+        const stdout = await runYtDlp(['--dump-json', '--no-playlist', '--skip-download', '--ignore-no-formats-error', `https://www.youtube.com/watch?v=${videoId}`], {
+          timeout: 30000, raw: true, useCookies: plan.useCookies && cookiesReady, playerClient: plan.playerClient, maxBuffer: 1024 * 1024 * 20
         });
         const p = JSON.parse(stdout);
         if (Object.keys(p.subtitles || {}).length || Object.keys(p.automatic_captions || {}).length) {
           info.subtitles = p.subtitles || {};
           info.automatic_captions = p.automatic_captions || {};
-          log.info(`subs recovered for ${videoId} via ${plan.playerClient}`);
+          log.info(`subs recovered for ${videoId} via ${plan.playerClient || 'default'}`);
           break;
         }
-      } catch (e) { log.warn(`ensureSubtitles ${plan.playerClient}: ${String(e.message || e).split('\n')[0]}`); }
+      } catch (e) { log.warn(`ensureSubtitles ${plan.playerClient || 'default'}: ${cleanErr(e, 200).split('\n')[0]}`, { cat: 'captions', videoId, detail: cleanErr(e) }); }
     }
     return info;
   });
@@ -1040,7 +1268,7 @@ async function getVideoInfo(videoId) {
         Object.keys(parsed.automatic_captions || {}).length;
       const audioOnly = formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')).length;
       const score = formats.length * 2 + heights.size * 10 + subs * 5 + audioOnly * 3 + (parsed.is_live ? 1000 : 0);
-      log.info(`info client=${plan.playerClient} formats=${formats.length} heights=${[...heights].sort((a,b)=>b-a).slice(0,8).join(',')} subs=${subs} score=${score}`);
+      log.info(`info client=${plan.playerClient || "default"} formats=${formats.length} heights=${[...heights].sort((a,b)=>b-a).slice(0,8).join(',')} subs=${subs} score=${score}`);
       return { parsed, score, heights, subs, audioOnly, client: plan.playerClient };
     };
 
@@ -1048,10 +1276,11 @@ async function getVideoInfo(videoId) {
     const results = [];
     const track = (p, plan) => p.then(
       r => { results.push(r); return r; },
-      e => { lastErr = e; log.warn(`info client ${plan.playerClient} fail: ${String(e.message || e).split('\n')[0]}`); return null; }
+      e => { lastErr = e; log.warn(`info client ${plan.playerClient || 'default'} fail: ${cleanErr(e, 200).split('\n')[0]}`, { cat: 'info', videoId, detail: cleanErr(e) }); return null; }
     );
     const pA = track(runPlan(planA), planA);
-    const pB = track(runPlan(planB), planB);
+    // B بتبدأ بعد ما A تخلص (أو بعد 4ث) بدل ما الاتنين يضربوا المعالج في نفس اللحظة
+    const pB = track(Promise.race([pA, sleepMs(4000)]).then(() => runPlan(planB)), planB);
     await Promise.race([pA, pB]);
     if (!results.length) {
       await Promise.all([pA, pB]);                       // الأول فشل → استنى التاني
@@ -1065,7 +1294,7 @@ async function getVideoInfo(videoId) {
       for (const plan of fallbackPlans) {
         if (Date.now() > fbDeadline) break;
         try { results.push(await runPlan(plan, 40000)); break; }
-        catch (e) { lastErr = e; log.warn(`info client ${plan.playerClient} fail: ${String(e.message || e).split('\n')[0]}`); }
+        catch (e) { lastErr = e; log.warn(`info client ${plan.playerClient || 'default'} fail: ${cleanErr(e, 200).split('\n')[0]}`, { cat: 'info', videoId, detail: cleanErr(e) }); }
       }
     }
     if (!results.length) throw lastErr || new Error('Failed to extract video info');
@@ -1099,19 +1328,30 @@ async function getVideoInfo(videoId) {
     const merged = new Set([primary]);
     for (const r of results) if (!merged.has(r)) { mergeInto(best, r); merged.add(r); }
 
+    const liveNow = !!(best.is_live || best.live_status === 'is_live');
+    const maxHeightOf = (o) => { const hs = (o.formats || []).filter(f => f && f.vcodec && f.vcodec !== 'none').map(f => fmtH(f)).filter(h => h > 0); return hs.length ? Math.max(...hs) : 0; };
+    const planSummary = () => results.map(r => `${r.client || 'default'}: formats=${(r.parsed.formats || []).length} heights=${[...r.heights].sort((a, b) => b - a).slice(0, 6).join('/') || '-'} subs=${r.subs} audioOnly=${r.audioOnly}`).join('\n') + (lastErr ? `\nlast error: ${cleanErr(lastErr, 300)}` : '');
+    // أعلى جودة <=360 غالبًا = استخراج ناقص (client اتحجب/محتاج PO Token) مش فيديو واطي الجودة → مش هنكاشه ساعتين، ونجرّب clients الافتراضية بتاعة yt-dlp
+    const degradedNow = !liveNow && best.live_status !== 'is_upcoming' && maxHeightOf(best) <= 360;
+
     // الخطة التانية لسه شغّالة؟ بنرد دلوقتي وهي بتكمّل في الخلفية (بتعدّل نفس الكائن المتكاشّ).
     // /captions و/transcript بيستنوها عبر ensureSubtitles، و/info مبيستناهاش (عشان الوصف يطلع بسرعة).
-    const settle = Promise.allSettled([pA, pB]).then(() => {
+    const pending = [pA, pB];
+    if (degradedNow) { const planC = { playerClient: null, useCookies: cookiesReady }; pending.push(track(runPlan(planC), planC)); }
+    const settle = Promise.allSettled(pending).then(() => {
       for (const r of results) if (!merged.has(r)) { mergeInto(best, r); merged.add(r); }
+      if (degradedNow) {
+        if (maxHeightOf(best) > 360) infoCache.set(key, best, CACHE_TTL.info);
+        else addIncident('warn', `info degraded ${videoId}: كل الـ clients رجّعوا أعلى جودة ${maxHeightOf(best)}p (ممكن الفيديو نفسه جودته واطية)`, { cat: 'info', videoId, detail: planSummary() });
+      }
     });
     Object.defineProperty(best, '__settle', { value: settle, enumerable: false, configurable: true });
     Object.defineProperty(best, '__pending', { value: true, enumerable: false, writable: true, configurable: true });
     settle.then(() => { best.__pending = false; });
 
-    const liveNow = !!(best.is_live || best.live_status === 'is_live');
     noteLiveHint(videoId, liveNow);
-    // البث المباشر: كاش قصير عشان روابط الـ HLS تتجدد
-    infoCache.set(key, best, (liveNow || best.live_status === 'is_upcoming') ? 5 * 60 * 1000 : CACHE_TTL.info);
+    // البث المباشر: كاش قصير عشان روابط الـ HLS تتجدد | استخراج ناقص: 3 دقايق بس
+    infoCache.set(key, best, (liveNow || best.live_status === 'is_upcoming') ? 5 * 60 * 1000 : (degradedNow ? 3 * 60 * 1000 : CACHE_TTL.info));
     return best;
   });
 }
@@ -1987,13 +2227,47 @@ async function getVideoComments(videoId, limit = 50) {
 // ⚡ Request telemetry — لا يضيف انتظارًا ولا يلمس البيانات الحساسة.
 // ==========================================================================
 let requestSeq = 0;
+const STREAMY = /^\/(video|download|hls)(?!\/qualities)/;
+function catFromPath(p) {
+  if (/^\/(captions|transcript)/.test(p)) return 'captions';
+  if (/^\/audio-tracks/.test(p)) return 'audio';
+  if (/^\/(video\/qualities|formats)/.test(p)) return 'quality';
+  if (/^\/(video|download|hls)/.test(p)) return 'stream';
+  if (/^\/(info|chapters)/.test(p)) return 'info';
+  if (/^\/(search|home|trending|related|recommendations|channel|playlist|comments|api\/me|api\/account-feed|api\/live)/.test(p)) return 'feed';
+  return 'system';
+}
+function reportRouteError(req, res, cat, e, extra = {}) {
+  try {
+    if (res && res.locals) res.locals.__reported = true;
+    addIncident('error', `${req.method} ${req.path} فشل${extra.lang ? ' (' + extra.lang + ')' : ''}`, {
+      cat, videoId: typeof req.query.v === 'string' ? req.query.v.slice(0, 11) : null, route: req.originalUrl, detail: cleanErr(e),
+      reqId: res && res.getHeader ? res.getHeader('X-Request-ID') : null
+    });
+  } catch {}
+}
 app.use((req, res, next) => {
   const started = process.hrtime.bigint();
   const id = (++requestSeq).toString(36);
   res.setHeader('X-Request-ID', id);
+  const elapsed = () => Number(process.hrtime.bigint() - started) / 1e6;
+  let ttfb = null;
+  const origWriteHead = res.writeHead;
+  res.writeHead = function (...a) { if (ttfb === null) ttfb = elapsed(); return origWriteHead.apply(this, a); };
+  const ctx = (extra) => ({ cat: catFromPath(req.path), videoId: typeof req.query.v === 'string' ? req.query.v.slice(0, 11) : null, route: req.originalUrl, reqId: id, ...extra });
   res.on('finish', () => {
-    const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    if (ms > 1500) log.warn(`🐢 ${req.method} ${req.originalUrl} ${ms.toFixed(0)}ms [${id}]`);
+    const total = elapsed();
+    const streamy = STREAMY.test(req.path);
+    const waited = streamy ? (ttfb != null ? ttfb : total) : total;   // للستريم بنقيس أول بايت مش مدة التشغيل كلها
+    const code = res.statusCode;
+    const reported = res.locals && res.locals.__reported;
+    if (code >= 500 && !reported) addIncident('error', `${req.method} ${req.path} → ${code}`, ctx({ status: code, ms: total }));
+    else if (streamy && [401, 403, 410, 503].includes(code) && !reported) addIncident('warn', `${req.method} ${req.path} → ${code}`, ctx({ status: code, ms: total }));
+    if (waited > (streamy ? 6000 : 4000)) addIncident('slow', `${streamy ? 'أول بايت اتأخر' : 'رد بطيء'}: ${req.method} ${req.path}`, ctx({ status: code, ms: waited }));
+  });
+  res.on('close', () => {
+    const t = elapsed();
+    if (!res.writableFinished && !res.headersSent && t > 2000) addIncident('warn', `العميل قفل قبل ما السيرفر يرد (استنى ${Math.round(t / 1000)}ث): ${req.method} ${req.path}`, ctx({ ms: t }));
   });
   next();
 });
@@ -2217,6 +2491,7 @@ app.get('/captions', async (req, res) => {
     infoCache.set(key, out, languages.length ? CACHE_TTL.info : 60 * 1000);
     res.json(out);
   } catch (e) {
+    reportRouteError(req, res, 'captions', e);
     res.status(502).json({ error: 'تعذّر جلب الكابشنز', details: NODE_ENV === 'development' ? e.message : undefined });
   }
 });
@@ -2281,17 +2556,24 @@ async function fetchSubsViaYtDlp(videoId, lang) {
   const dir = `/tmp/subs-${videoId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   fs.mkdirSync(dir, { recursive: true });
   try {
-    await runYtDlp([
-      '--skip-download', '--no-playlist',
-      '--write-subs', '--write-auto-subs',
-      '--sub-langs', lang,
-      '--sub-format', 'vtt/srv3/json3/best',
-      '-o', `${dir}/%(id)s.%(ext)s`,
-      `https://www.youtube.com/watch?v=${videoId}`
-    ], { raw: true, useCookies: true, playerClient: 'tv,web,mweb', timeout: 50000 });
+    let subErr = null;
+    for (const pc of [null, 'tv,web,mweb']) {
+      try {
+        await runYtDlp([
+          '--skip-download', '--no-playlist', '--ignore-no-formats-error',
+          '--write-subs', '--write-auto-subs',
+          '--sub-langs', lang,
+          '--sub-format', 'vtt/srv3/json3/best',
+          '-o', `${dir}/%(id)s.%(ext)s`,
+          `https://www.youtube.com/watch?v=${videoId}`
+        ], { raw: true, useCookies: true, playerClient: pc, timeout: 45000 });
+        subErr = null;
+        break;
+      } catch (e) { subErr = e; }
+    }
     const files = fs.readdirSync(dir).filter(f => /\.(vtt|srt|srv3|json3|ttml|srv1|srv2)$/i.test(f));
     const pick = files.find(f => f.toLowerCase().endsWith('.vtt')) || files[0];
-    if (!pick) throw new Error('yt-dlp لم يُنتج ملف ترجمة');
+    if (!pick) throw subErr || new Error('yt-dlp لم يُنتج ملف ترجمة');
     return { body: fs.readFileSync(`${dir}/${pick}`, 'utf8'), ext: pick.split('.').pop().toLowerCase() };
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
@@ -2414,7 +2696,7 @@ app.get('/captions/file', async (req, res) => {
     return res.end(body);
   } catch (e) {
     if (e && e.code === 'NO_SUBS') return res.status(404).json({ error: 'لا توجد ترجمة لهذه اللغة' });
-    log.warn(`captions/file failed ${videoId}/${lang}: ${String(e.message || e).split('\n')[0]}`);
+    reportRouteError(req, res, 'captions', e, { lang });
     res.status(502).json({ error: 'تعذّر تحميل ملف الترجمة', details: NODE_ENV === 'development' ? e.message : undefined });
   }
 });
@@ -2431,7 +2713,7 @@ app.get('/audio-tracks', async (req, res) => {
   if (cached) return res.json(cached);
   try {
     const info = await getVideoInfo(videoId);
-    await waitSettled(info, 4000);   // الدبلجات بتيجي من الخطة التانية
+    await waitSettled(info, 12000);   // الدبلجات بتيجي من الخطة التانية (قبل كده 4ث كانت بتطلّع قايمة ناقصة)
     const formats = Array.isArray(info.formats) ? info.formats : [];
     const audioOnly = formats.filter(f =>
       f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && !isManifestFormat(f)
@@ -2489,6 +2771,7 @@ app.get('/audio-tracks', async (req, res) => {
     infoCache.set(key, out, info.__pending ? 20 * 1000 : CACHE_TTL.info);
     res.json(out);
   } catch (e) {
+    reportRouteError(req, res, 'audio', e);
     res.status(502).json({ error: 'تعذّر جلب المقاطع الصوتية', details: NODE_ENV === 'development' ? e.message : undefined });
   }
 });
@@ -3350,6 +3633,31 @@ function pickBestAudioUrl(info) {
   return audio[0] ? audio[0].url : null;
 }
 
+// يختار رابط صوت شغّال: المسار المطلوب → نفس اللغة → المسار الأصلي → أي مسار → yt-dlp من جديد
+async function resolveAudioSource(videoId, audioFormat) {
+  const info = await getVideoInfo(videoId).catch(() => null);
+  if (info && audioFormat && !(info.formats || []).some(f => String(f.format_id) === audioFormat)) await waitSettled(info, 12000);
+  const byRate = (a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
+  const audioFmts = info ? (info.formats || []).filter(f => f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && !isManifestFormat(f) && usableDirectUrl(f)) : [];
+  const cands = [];
+  const seen = new Set();
+  const push = (f, fallback) => { if (!f || !f.url || seen.has(f.url)) return; seen.add(f.url); cands.push({ url: f.url, formatId: String(f.format_id || ''), fallback }); };
+  if (audioFormat) {
+    const want = audioFmts.find(f => String(f.format_id) === audioFormat);
+    if (want) {
+      push(want, null);
+      audioFmts.filter(f => (f.language || 'und') === (want.language || 'und')).sort(byRate).forEach(f => push(f, 'same-language'));
+    }
+  }
+  const bestUrl = info ? pickBestAudioUrl(info) : null;
+  if (bestUrl) push(audioFmts.find(f => f.url === bestUrl) || { url: bestUrl, format_id: '' }, audioFormat ? 'original-track' : null);
+  audioFmts.slice().sort(byRate).forEach(f => push(f, audioFormat ? 'original-track' : null));
+  for (const c of cands.slice(0, 4)) if (await verifyUrl(c.url)) return c;
+  const selector = audioFormat ? `${audioFormat}/bestaudio[acodec!=none]/bestaudio/best` : 'bestaudio[acodec!=none]/bestaudio/best';
+  const urls = await getVerifiedUrls(videoId, selector, { minCount: 1 });
+  return { url: urls[0], formatId: null, fallback: 'yt-dlp' };
+}
+
 function chooseProgressiveFormat(info, requestedHeight) {
   const h = Number(requestedHeight);
   const prog = getVideoFormats(info).filter(f => f.acodec && f.acodec !== 'none');
@@ -3408,66 +3716,128 @@ function testFfmpegBinary(bin) {
   return ok;
 }
 
-let ffmpegRetryAt = 0;
-async function ensureFfmpeg() {
-  if (ffmpegReadyFlag === true && testFfmpegBinary(ffmpegBin)) return true;
-  if (ffmpegReadyFlag === false && Date.now() < ffmpegRetryAt) return false;
-  if (commandExists('ffmpeg') && testFfmpegBinary('ffmpeg')) {
-    ffmpegBin = 'ffmpeg'; ffmpegReadyFlag = true; return true;
-  }
-  if (process.env.FFMPEG_PATH && testFfmpegBinary(process.env.FFMPEG_PATH)) {
-    ffmpegBin = process.env.FFMPEG_PATH; ffmpegReadyFlag = true; return true;
-  }
+// ==========================================================================
+// 🎞️ ffmpeg bootstrap (v13.7)
+// المشاكل اللي كانت موجودة: (1) كل request كان بيبدأ تنزيل ffmpeg (70MB) من جديد بالتوازي ويكتبوا على نفس الملف
+// → ملف بايظ + بطء، (2) /video/qualities كان بيستنى التنزيل (لحد 3 دقايق!)، (3) نتيجة "مفيش ffmpeg" كانت بتتكاش ساعتين
+// فتفضل الجودات 360 بس. دلوقتي: تنزيل واحد بس (deduped) لملف مؤقت ثم rename، مصادر متعددة (gz أصغر)، backoff، وحالة ظاهرة في اللوحة.
+// ==========================================================================
+const ffmpegState = { status: 'unknown', bin: null, source: null, lastError: null, attempts: 0, retryAt: 0, lastOkAt: 0 };
+let ffmpegInflight = null;
 
+function ffmpegMarkReady(bin, source) {
+  ffmpegBin = bin; ffmpegReadyFlag = true; commandCache.set('ffmpeg', true);
+  Object.assign(ffmpegState, { status: 'ready', bin, source, lastError: null, lastOkAt: Date.now() });
+  return true;
+}
+
+function downloadStream(url, dest, { gunzip = false, redirects = 0, timeout = 120000 } = {}) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 8) return reject(new Error('too many redirects'));
+    const mod = url.startsWith('http://') ? require('http') : https;
+    const req = mod.get(url, { timeout, headers: { 'User-Agent': 'titan-bootstrap/1.0' } }, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 300 && code < 400 && res.headers.location) {
+        res.resume();
+        return resolve(downloadStream(new URL(res.headers.location, url).toString(), dest, { gunzip, redirects: redirects + 1, timeout }));
+      }
+      if (code >= 400) { res.resume(); return reject(new Error(`download HTTP ${code}`)); }
+      const out = fs.createWriteStream(dest);
+      const src = gunzip ? res.pipe(zlib.createGunzip()) : res;
+      let bytes = 0;
+      src.on('data', c => { bytes += c.length; });
+      src.on('error', e => { out.destroy(); reject(e); });
+      res.on('error', e => { out.destroy(); reject(e); });
+      out.on('error', reject);
+      out.on('finish', () => out.close(() => (bytes > 1000000 ? resolve(bytes) : reject(new Error(`file too small (${bytes}B)`)))));
+      src.pipe(out);
+    });
+    req.on('timeout', () => req.destroy(new Error('download timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function ensureFfmpegInner() {
+  if (testFfmpegBinary('ffmpeg')) return ffmpegMarkReady('ffmpeg', 'system');
+  if (process.env.FFMPEG_PATH && testFfmpegBinary(process.env.FFMPEG_PATH)) return ffmpegMarkReady(process.env.FFMPEG_PATH, 'env');
   try {
     const staticPath = require('ffmpeg-static');
-    if (staticPath && testFfmpegBinary(staticPath)) {
-      ffmpegBin = staticPath; ffmpegReadyFlag = true; return true;
-    }
+    if (staticPath && testFfmpegBinary(staticPath)) return ffmpegMarkReady(staticPath, 'ffmpeg-static');
   } catch {}
 
   const dir = '/tmp/.bin';
   const dest = `${dir}/ffmpeg`;
-  try {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    if (fs.existsSync(dest)) {
-      try { fs.chmodSync(dest, 0o755); } catch {}
-      if (testFfmpegBinary(dest)) {
-        ffmpegBin = dest; ffmpegReadyFlag = true; return true;
-      }
-      try { fs.unlinkSync(dest); } catch {}
-    }
-
-    const urls = [
-      'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1/ffmpeg-linux-x64',
-      'https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/ffmpeg-linux-x64',
-      'https://github.com/eugeneware/ffmpeg-static/releases/download/b5.2.0/ffmpeg-linux-x64'
-    ];
-    let lastErr = null;
-    for (const url of urls) {
-      try {
-        log.info(`⬇️  downloading ffmpeg static: ${url}`);
-        await httpDownloadToFile(url, dest);
-        fs.chmodSync(dest, 0o755);
-        if (testFfmpegBinary(dest)) {
-          ffmpegBin = dest;
-          ffmpegReadyFlag = true;
-          commandCache.set('ffmpeg', true);
-          log.success(`✅ ffmpeg ready at ${dest}`);
-          return true;
-        }
-      } catch (e) {
-        lastErr = e;
-        try { fs.unlinkSync(dest); } catch {}
-      }
-    }
-    throw lastErr || new Error('ffmpeg download failed');
-  } catch (e) {
-    log.warn(`ensureFfmpeg: ${e.message}`);
-    ffmpegReadyFlag = false;
-    ffmpegRetryAt = Date.now() + 10 * 60 * 1000;
-    return false;
+  try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); } catch {}
+  if (fs.existsSync(dest)) {
+    try { fs.chmodSync(dest, 0o755); } catch {}
+    if (testFfmpegBinary(dest)) return ffmpegMarkReady(dest, 'cached');
+    try { fs.unlinkSync(dest); } catch {}
   }
+
+  ffmpegState.status = 'downloading';
+  ffmpegState.attempts++;
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const gh = 'https://github.com/eugeneware/ffmpeg-static/releases/download';
+  const sources = [
+    { name: 'eugeneware b6.1.1 (gz)', url: `${gh}/b6.1.1/ffmpeg-linux-${arch}.gz`, gunzip: true },
+    { name: 'eugeneware b6.0 (gz)', url: `${gh}/b6.0/ffmpeg-linux-${arch}.gz`, gunzip: true },
+    { name: 'eugeneware b6.0 (raw)', url: `${gh}/b6.0/ffmpeg-linux-${arch}` },
+    { name: 'eugeneware b5.2.0 (raw)', url: `${gh}/b5.2.0/ffmpeg-linux-${arch}` },
+    { name: 'yt-dlp FFmpeg-Builds (tar.xz)', tar: true, url: `https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux${arch === 'arm64' ? 'arm64' : '64'}-gpl.tar.xz` }
+  ];
+  const errors = [];
+  const stamp = `${process.pid}.${Date.now()}`;
+  for (const s of sources) {
+    const tmp = `${dest}.${stamp}.part`;
+    try {
+      log.info(`⬇️  ffmpeg: تنزيل من ${s.name}`);
+      if (s.tar) {
+        const tarFile = `${dir}/ffmpeg-${stamp}.tar.xz`;
+        const outDir = `${dir}/ffx-${stamp}`;
+        try {
+          await downloadStream(s.url, tarFile);
+          fs.mkdirSync(outDir, { recursive: true });
+          await execFileAsync('tar', ['-xJf', tarFile, '-C', outDir, '--wildcards', '*/bin/ffmpeg', '--strip-components=2'], { timeout: 120000 });
+          fs.copyFileSync(`${outDir}/ffmpeg`, tmp);
+        } finally {
+          try { fs.unlinkSync(tarFile); } catch {}
+          try { fs.rmSync(outDir, { recursive: true, force: true }); } catch {}
+        }
+      } else {
+        await downloadStream(s.url, tmp, { gunzip: !!s.gunzip });
+      }
+      fs.chmodSync(tmp, 0o755);
+      if (!testFfmpegBinary(tmp)) throw new Error('الملف اتنزّل بس مش بيشتغل (-version فشل)');
+      fs.renameSync(tmp, dest);
+      testFfmpegBinary(dest);
+      log.success(`✅ ffmpeg جاهز (${s.name})`);
+      return ffmpegMarkReady(dest, s.name);
+    } catch (e) {
+      errors.push(`${s.name}: ${String(e.message || e).split('\n')[0]}`);
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+  }
+  const mins = Math.min(15, 2 * Math.pow(2, Math.max(0, ffmpegState.attempts - 1)));
+  Object.assign(ffmpegState, { status: 'missing', lastError: errors.join(' | ').slice(0, 700), retryAt: Date.now() + mins * 60 * 1000 });
+  log.warn(`ffmpeg مش متاح — كل المصادر فشلت (إعادة المحاولة بعد ${mins}د)`, { cat: 'ffmpeg', detail: ffmpegState.lastError });
+  return false;
+}
+
+// تنزيل/فحص واحد بس في نفس الوقت مهما كان عدد الـ requests
+function ensureFfmpeg() {
+  if (ffmpegState.status === 'ready' && testFfmpegBinary(ffmpegBin)) return Promise.resolve(true);
+  if (ffmpegInflight) return ffmpegInflight;
+  if (ffmpegState.status === 'missing' && Date.now() < ffmpegState.retryAt) return Promise.resolve(false);
+  ffmpegInflight = ensureFfmpegInner()
+    .catch(e => { ffmpegState.status = 'missing'; ffmpegState.lastError = String(e.message || e); ffmpegState.retryAt = Date.now() + 120000; return false; })
+    .finally(() => { ffmpegInflight = null; });
+  return ffmpegInflight;
+}
+
+// للـ requests: لو ffmpeg جاهز يرجّع فورًا، لو بيتنزّل يستنى بحد أقصى waitMs (مش 3 دقايق زي قبل)
+async function hasFfmpegNow(waitMs = 8000) {
+  if (ffmpegState.status === 'ready' && testFfmpegBinary(ffmpegBin)) return true;
+  return Promise.race([ensureFfmpeg(), sleepMs(waitMs).then(() => false)]);
 }
 
 function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audioCopy = false) {
@@ -3843,32 +4213,20 @@ app.get('/video', async (req, res) => {
 
     if (resolved?.type === 'audio') {
       const audioFormat = String(req.query.audioFormat || req.query.af || '').trim();
-      const selector = (audioFormat && /^[\w.-]+$/.test(audioFormat))
-        ? audioFormat
-        : 'bestaudio[acodec!=none]/bestaudio/best';
-      let urls = [];
-      // الرابط بييجي من الميتاداتا الجاهزة (حتى لو اتحدد audioFormat) — بدل yt-dlp جديد
-      // اللي كان بيفشل لما format_id يختلف بين الـ clients.
-      const audioInfo = await getVideoInfo(videoId).catch(() => null);
-      if (audioInfo && audioFormat && !(audioInfo.formats || []).some(f => String(f.format_id) === audioFormat)) await waitSettled(audioInfo, 10000);
-      if (audioInfo) {
-        const direct = audioFormat
-          ? usableDirectUrl((audioInfo.formats || []).find(f => String(f.format_id) === audioFormat))
-          : pickBestAudioUrl(audioInfo);
-        if (direct) urls = [direct];
-      }
-      if (!urls.length) urls = await getFormatUrls(videoId, selector);
-      if (!(await verifyUrl(urls[0]))) { try { urls = await getVerifiedUrls(videoId, selector, { minCount: 1 }); } catch {} }
-      if (probe) return res.json({ probe: true, id: videoId, type: 'audio', formatId: audioFormat || null, resolved: true, urlLength: String(urls[0] || '').length });
-      if (wantDirect) return redirectToCdn(res, urls[0], { mode: 'direct-cdn', quality: 'audio' });
+      // لو المسار المطلوب (دبلجة) رابطه مرفوض/مش موجود بنرجع لنفس اللغة ثم المسار الأصلي بدل ما الطلب كله يفشل
+      const src = await resolveAudioSource(videoId, /^[\w.-]+$/.test(audioFormat) ? audioFormat : '');
+      if (probe) return res.json({ probe: true, id: videoId, type: 'audio', formatId: audioFormat || null, servedFormatId: src.formatId, fallback: src.fallback, resolved: true, urlLength: String(src.url || '').length });
+      if (wantDirect) return redirectToCdn(res, src.url, { mode: 'direct-cdn', quality: 'audio' });
       res.setHeader('X-Stream-Mode', 'proxy-audio');
       if (audioFormat) res.setHeader('X-Audio-Format', audioFormat);
-      return streamFromUpstream(req, res, urls[0], 0, videoDuration);
+      if (src.formatId) res.setHeader('X-Audio-Served-Format', src.formatId);
+      if (src.fallback) res.setHeader('X-Audio-Fallback', src.fallback);
+      return streamFromUpstream(req, res, src.url, 0, videoDuration, { onForbidden: async () => { forgetVideo(videoId); const s2 = await resolveAudioSource(videoId, ''); return s2.url; } });
     }
 
     if (resolved?.type === 'video') {
       const h = resolved.height;
-      const hasFfmpeg = commandExists('ffmpeg') || (await ensureFfmpeg());
+      const hasFfmpeg = await hasFfmpegNow(8000);
 
       // 1) progressive بنفس الارتفاع فقط (لو موجود)
       try {
@@ -3976,7 +4334,8 @@ app.get('/video', async (req, res) => {
 
   } catch (error) {
     recordPerf(quality ? 'video-quality' : 'video-default', Date.now() - requestStartedAt, false);
-    log.error(`Error streaming ${videoId}: ${error.message}`);
+    res.locals.__reported = true;
+    log.error(`Error streaming ${videoId}: ${cleanErr(error, 200).split('\n')[0]}`, { cat: 'stream', videoId, detail: cleanErr(error), route: req.originalUrl });
     if (res.headersSent) return;
 
     const msg = String(error.message || '').toLowerCase();
@@ -4259,13 +4618,14 @@ app.get('/video/qualities', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  const cacheKey = `qualities_v13_${videoId}`;
+  const cacheKey = `qualities_v14_${videoId}`;
   const cached = infoCache.get(cacheKey);
-  if (cached) return res.json(cached);
+  // نتيجة اتحسبت وffmpeg مش جاهز مبقاش ينفع تفضل مكاشّة بعد ما ffmpeg يشتغل (ده كان بيثبّت 360p بس)
+  if (cached && !(cached.ffmpegReady === false && ffmpegState.status === 'ready')) return res.json(cached);
 
   try {
     const info = await getVideoInfo(videoId);
-    await waitSettled(info, 4000);   // عشان الجودات العالية (1080/4K) تظهر في القايمة
+    await waitSettled(info, 7000);   // عشان الجودات العالية (1080/4K) تظهر في القايمة
 
     // بث مباشر: الجودات الحقيقية من variants الـ HLS
     if (isLiveInfo(info)) {
@@ -4282,7 +4642,7 @@ app.get('/video/qualities', async (req, res) => {
       return res.json(liveResult);
     }
 
-    const hasFfmpeg = commandExists('ffmpeg') || (await ensureFfmpeg());
+    const hasFfmpeg = await hasFfmpegNow(8000);
 
     // بنعرض بس الارتفاعات اللي موجودة فعلًا في الفيديو ده (مفيش جودات وهمية)
     const buckets = new Map();
@@ -4336,10 +4696,12 @@ app.get('/video/qualities', async (req, res) => {
         : 'الجودات progressive تشتغل فورًا. باقي الجودات تحتاج ffmpeg على السيرفر.'
     };
 
-    infoCache.set(cacheKey, result, info.__pending ? 20 * 1000 : CACHE_TTL.info);
+    const topQ = heightsDesc[0] || 0;
+    infoCache.set(cacheKey, result, info.__pending ? 20 * 1000 : (!hasFfmpeg ? 30 * 1000 : (topQ <= 360 ? 3 * 60 * 1000 : CACHE_TTL.info)));
     res.json(result);
   } catch (error) {
-    log.error(`Error fetching qualities: ${error.message}`);
+    res.locals.__reported = true;
+    log.error(`Error fetching qualities: ${cleanErr(error, 200).split('\n')[0]}`, { cat: 'quality', videoId, detail: cleanErr(error), route: req.originalUrl });
     res.status(500).json({
       error: 'تعذّر جلب الجودات المتاحة',
       details: NODE_ENV === 'development' ? error.message : undefined
@@ -4361,7 +4723,8 @@ app.get('/health', (req, res) => {
     ytdlpVersion: ytdlpState.version,   // مكاشّة: execFileSync كان بيقفّل الـ event loop (وبيبطّأ الستريمنج) مع كل /health
     nodeVersion: process.version,
     jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
-    ffmpegReady: Boolean(ffmpegReadyFlag) || commandExists('ffmpeg') || (ffmpegBin && ffmpegBin !== 'ffmpeg' && fs.existsSync(ffmpegBin)),
+    ffmpegReady: ffmpegState.status === 'ready' || (ffmpegState.status === 'unknown' && commandExists('ffmpeg')),
+    ffmpegState: { status: ffmpegState.status, source: ffmpegState.source, lastError: ffmpegState.lastError, attempts: ffmpegState.attempts },
     ffmpegBin: ffmpegBin || null,
     poTokenConfigured: poManager.ready(),
     poToken: poManager.status(),
@@ -4538,6 +4901,50 @@ a{color:#60a5fa;text-decoration:none}
 <div id="msg"></div>
 </div>
 
+<div class="card" id="incCard">
+<style>
+.inc-bar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.inc-bar button{flex:1;min-width:120px;padding:11px;border:0;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;background:#20242d;color:#e8e8e8}
+.inc-bar button.primary{background:#e11d48;color:#fff}
+.inc-bar button.on{outline:2px solid #60a5fa}
+.hint{padding:9px 12px;border-radius:10px;margin:6px 0;font-size:13px;line-height:1.6;background:#20242d}
+.hint.bad{border-right:4px solid #f87171}.hint.warn{border-right:4px solid #fbbf24}.hint.ok{border-right:4px solid #4ade80}
+.g{background:#0f1115;border:1px solid #2a2f3a;border-radius:10px;padding:10px 12px;margin:8px 0;font-size:13px}
+.g .top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
+.b-error{background:#7f1d1d;color:#fecaca}.b-warn{background:#78350f;color:#fde68a}.b-slow{background:#1e3a8a;color:#bfdbfe}.b-cat{background:#2a2f3a;color:#cbd5e1}
+.g pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-word;direction:ltr;text-align:left;font-size:11.5px;color:#9ca3af;background:#0b0d12;padding:8px;border-radius:8px;max-height:160px;overflow:auto}
+.opsline{font-family:monospace;font-size:11.5px;direction:ltr;text-align:left;padding:2px 0;border-bottom:1px solid #1b1f29;word-break:break-word}
+.st-row{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #1b1f29;font-size:13px}
+#incList{max-height:560px;overflow:auto}
+</style>
+<h2>🚨 مشاكل السيرفر وسجل العمليات</h2>
+<div class="grid">
+  <div class="stat"><b id="i-err">…</b><span>أخطاء (آخر ساعة)</span></div>
+  <div class="stat"><b id="i-warn">…</b><span>تحذيرات (آخر ساعة)</span></div>
+  <div class="stat"><b id="i-slow">…</b><span>بطء (آخر ساعة)</span></div>
+  <div class="stat"><b id="i-q">…</b><span>طابور yt-dlp</span></div>
+</div>
+<div id="hints"></div>
+<div class="inc-bar">
+  <button class="primary" id="copyAll">📋 نسخ كل المشاكل</button>
+  <button id="selftest">🩺 فحص شامل الآن</button>
+  <button id="incRefresh">🔄 تحديث</button>
+  <button id="incClear">🗑️ مسح السجل</button>
+</div>
+<div class="inc-bar">
+  <button data-f="all" class="fbtn on">كله</button>
+  <button data-f="error" class="fbtn">أخطاء</button>
+  <button data-f="warn" class="fbtn">تحذيرات</button>
+  <button data-f="slow" class="fbtn">بطء</button>
+  <button data-f="ops" class="fbtn">📜 سجل العمليات</button>
+</div>
+<div id="incMsg" style="min-height:20px;font-size:13px;margin:6px 0"></div>
+<div id="stBox"></div>
+<div id="incList">جاري التحميل...</div>
+<textarea id="copyFallback" style="display:none;height:160px;margin-top:10px" readonly></textarea>
+</div>
+
 <div class="card">
 <h2>🧰 صيانة</h2>
 <div class="row">
@@ -4594,6 +5001,77 @@ $('clearCache').onclick=async()=>{
     $('msg').textContent=d.message||d.error||JSON.stringify(d);
   }catch(e){$('msg').className='err';$('msg').textContent=e.message}
 };
+var incFilter = 'all';
+function esc2(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function ago2(t){var s=Math.max(0,Math.round((Date.now()-t)/1000));if(s<90)return s+'ث';var m=Math.round(s/60);if(m<90)return m+'د';var h=Math.round(m/60);return h<48?h+'س':Math.round(h/24)+'ي'}
+function hhmm(t){return new Date(t).toISOString().slice(11,19)}
+function incMsg(t,bad){var m=$('incMsg');m.textContent=t;m.className=bad?'err':'ok'}
+function renderGroups(groups){
+  if(!groups.length)return '<div class="hint ok">مفيش مشاكل مسجّلة ✅</div>';
+  return groups.map(function(g){
+    var vids=(g.videos&&g.videos.length)?'<div style="opacity:.7;margin-top:4px">فيديوهات: '+g.videos.map(esc2).join(' , ')+'</div>':'';
+    return '<div class="g"><div class="top"><span class="badge b-'+g.level+'">'+g.level.toUpperCase()+'</span><span class="badge b-cat">'+esc2(g.cat)+'</span><b>×'+g.count+'</b><span style="opacity:.6">آخر مرة منذ '+ago2(g.last)+'</span>'+(g.maxMs?'<span style="opacity:.6">أقصى زمن '+g.maxMs+'ms</span>':'')+'</div><div>'+esc2(g.msg)+'</div>'+(g.detail?'<pre>'+esc2(g.detail)+'</pre>':'')+vids+'</div>';
+  }).join('');
+}
+function renderOps(ops){
+  if(!ops.length)return '<div class="hint">السجل فاضي</div>';
+  return ops.map(function(o){var ic=o.level==='ok'?'✅':o.level==='error'?'❌':o.level==='warn'?'⚠️':'ℹ️';return '<div class="opsline">'+hhmm(o.t)+' '+ic+' '+esc2(o.msg)+'</div>'}).join('');
+}
+function renderSelfTest(st){
+  if(!st)return '';
+  return '<div class="g"><b>🩺 آخر فحص شامل ('+hhmm(st.at)+' UTC — '+Math.round(st.totalMs/1000)+'ث)</b>'+st.steps.map(function(s){return '<div class="st-row"><span>'+(s.ok?'✅':'❌')+' '+esc2(s.name)+'</span><span style="opacity:.7;direction:ltr;text-align:left;max-width:60%">'+esc2(s.detail||'')+' ('+s.ms+'ms)</span></div>'}).join('')+'</div>';
+}
+async function loadIncidents(){
+  try{
+    var level=(incFilter==='ops')?'all':incFilter;
+    var r=await fetch('/api/incidents?level='+level,{headers:authHeaders});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var d=await r.json();
+    $('i-err').textContent=d.summary.lastHour.errors;
+    $('i-warn').textContent=d.summary.lastHour.warnings;
+    $('i-slow').textContent=d.summary.lastHour.slow;
+    $('i-q').textContent=d.env.concurrency.procQueued+' / '+d.env.concurrency.procRunning+' شغّال';
+    $('hints').innerHTML=d.hints.map(function(h){return '<div class="hint '+(h.lvl==='ok'?'ok':h.lvl)+'">'+(h.lvl==='bad'?'🔴':h.lvl==='warn'?'🟠':'🟢')+' '+esc2(h.text)+'</div>'}).join('');
+    $('stBox').innerHTML=renderSelfTest(d.lastSelfTest);
+    $('incList').innerHTML=(incFilter==='ops')?renderOps(d.ops):renderGroups(d.groups);
+  }catch(e){$('incList').textContent='❌ تعذر تحميل السجل: '+e.message}
+}
+async function copyText(txt){
+  try{await navigator.clipboard.writeText(txt);return true}catch(e){}
+  try{var ta=$('copyFallback');ta.style.display='block';ta.value=txt;ta.focus();ta.select();var ok=document.execCommand('copy');if(ok){ta.style.display='none'}return ok}catch(e){return false}
+}
+$('copyAll').onclick=async function(){
+  incMsg('جاري تجهيز التقرير...');
+  try{
+    var r=await fetch('/api/incidents/report',{headers:authHeaders});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var txt=await r.text();
+    var ok=await copyText(txt);
+    incMsg(ok?'تم نسخ التقرير كامل ('+txt.length+' حرف) ✅ — الصقه في الشات':'المتصفح منع النسخ التلقائي — حدّدت التقرير في الخانة تحت، انسخه يدوي (Ctrl+C)',!ok);
+  }catch(e){incMsg('فشل تجهيز التقرير: '+e.message,true)}
+};
+$('selftest').onclick=async function(){
+  var b=$('selftest');b.disabled=true;incMsg('الفحص الشامل شغّال... ممكن ياخد لحد دقيقتين ⏳');
+  try{
+    var r=await fetch('/api/selftest',{method:'POST',headers:authHeaders});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    var bad=d.steps.filter(function(s){return !s.ok}).length;
+    incMsg(bad?('الفحص خلص: '+bad+' خطوة فشلت ❌ (التفاصيل تحت)'):'الفحص خلص: كله سليم ✅',!!bad);
+  }catch(e){incMsg('الفحص فشل: '+e.message,true)}
+  b.disabled=false;loadIncidents();
+};
+$('incRefresh').onclick=loadIncidents;
+$('incClear').onclick=async function(){
+  if(!confirm('مسح كل المشاكل وسجل العمليات؟'))return;
+  try{var r=await fetch('/api/incidents/clear',{method:'POST',headers:authHeaders});var d=await r.json();incMsg(d.message||d.error,!r.ok)}catch(e){incMsg(e.message,true)}
+  loadIncidents();
+};
+Array.prototype.forEach.call(document.querySelectorAll('.fbtn'),function(b){
+  b.onclick=function(){incFilter=b.getAttribute('data-f');Array.prototype.forEach.call(document.querySelectorAll('.fbtn'),function(x){x.classList.remove('on')});b.classList.add('on');loadIncidents()}
+});
+loadIncidents();
+setInterval(loadIncidents,10000);
 loadHealth();
 setInterval(loadHealth,30000);
 </script></body></html>`);
@@ -5413,18 +5891,272 @@ app.get('/test', (req, res) => {
   return res.send(TEST_PAGE_HTML);
 });
 
-// 404
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint غير موجود', path: req.path });
-});
+// ==========================================================================
+// 🧾 تقرير المشاكل + تشخيص تلقائي + فحص ذاتي (v13.7)
+// GET  /api/incidents          → JSON للوحة
+// GET  /api/incidents/report   → نص كامل جاهز للنسخ وإرساله
+// POST /api/incidents/clear    → مسح السجل
+// GET|POST /api/selftest       → فحص شامل (yt-dlp, ffmpeg, استخراج, ترجمة, صوت, جودات) بيتسجّل نتيجته
+// ==========================================================================
+function fmtDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}ث`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}د`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}س` : `${Math.round(h / 24)}ي`;
+}
+const tsShort = (t) => new Date(t).toISOString().replace('T', ' ').slice(5, 19);
 
-// Error handler
-app.use((err, req, res, next) => {
-  log.error(`Unhandled error: ${err.message}`);
-  res.status(500).json({
-    error: 'خطأ في السيرفر',
-    details: NODE_ENV === 'development' ? err.message : undefined
+function envSnapshot() {
+  const mem = process.memoryUsage();
+  return {
+    version: SERVER_VERSION,
+    uptimeSec: Math.round(process.uptime()),
+    node: process.version,
+    ytdlp: { version: ytdlpState.version, bin: ytdlpState.bin, remoteComponents: ytdlpState.remoteComponents, lastError: ytdlpState.lastError, updatedAt: ytdlpState.updatedAt ? new Date(ytdlpState.updatedAt).toISOString() : null },
+    ffmpeg: { status: ffmpegState.status, source: ffmpegState.source, bin: ffmpegState.bin, lastError: ffmpegState.lastError, attempts: ffmpegState.attempts },
+    jsRuntime: detectNodeRuntime() || (commandExists('deno') ? 'deno' : (commandExists('bun') ? 'bun' : null)),
+    cookies: { ready: cookiesReady, bytes: lastCookiesContent.length },
+    poToken: poManager.status(),
+    memory: { rssMb: Math.round(mem.rss / 1048576), heapMb: Math.round(mem.heapUsed / 1048576), containerLimitMb: containerMemMb() },
+    cpu: Number(containerCpus().toFixed(2)),
+    concurrency: {
+      procMax: PROC_MAX, procRunning: procLimiter.current, procQueued: procLimiter.queued,
+      meta: { max: META_CONCURRENCY, running: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length },
+      stream: { max: STREAM_CONCURRENCY, running: streamLimiter.current, queued: streamLimiter.queue.length }
+    },
+    spawn: { stream: spawnSummary('stream'), meta: spawnSummary('meta') },
+    caches: { info: infoCache.stats(), stream: streamCache.stats(), fastStream: fastStreamCache.stats(), search: searchCache.stats(), subtitles: subtitleCache.stats() }
+  };
+}
+
+// تشخيص مبدئي من الحالة + المشاكل الأخيرة — بيقولك "غالبًا المشكلة فين"
+function diagnose() {
+  const env = envSnapshot();
+  const hints = [];
+  const add = (lvl, text) => hints.push({ lvl, text });
+  if (env.ffmpeg.status !== 'ready') add('bad', `ffmpeg مش شغال (الحالة: ${env.ffmpeg.status}) → من غيره مفيش غير الجودات الجاهزة (360p). آخر خطأ: ${env.ffmpeg.lastError || 'لسه بيحاول'}. الحل الدائم: ضيف ffmpeg-static في package.json أو ثبّت ffmpeg في الـ build.`);
+  if (!env.ytdlp.version) add('bad', 'yt-dlp مش بيشتغل خالص (مفيش version) → كل الفيديوهات/الترجمة/الصوت هتفشل.');
+  else if (env.ytdlp.lastError) add('warn', `تحديث yt-dlp الأوتوماتيك فشل: ${env.ytdlp.lastError} (النسخة الحالية ${env.ytdlp.version}) — نسخة قديمة = مشاكل 403/جودات ناقصة.`);
+  if (!env.cookies.ready) add('warn', 'الكوكيز مش موجودة → الترجمات والدبلجات (المقاطع الصوتية) والمقترح الشخصي غالبًا هتفشل. ارفعها من الخانة اللي فوق.');
+  if (!env.jsRuntime) add('warn', 'مفيش node/deno متاح لـ yt-dlp → حل تحدي n/sig هيفشل وروابط web هترجع 403.');
+  if (env.poToken.mode === 'none') add('warn', `PO Token مش متولّد${env.poToken.lastError ? ': ' + env.poToken.lastError : ''} → ممكن روابط web/الترجمة ترفضها يوتيوب.`);
+  if (env.concurrency.procQueued > 3) add('warn', `طابور yt-dlp مزدحم (${env.concurrency.procQueued} مستنيين من ${env.concurrency.procMax} مسموح) → ده سبب بطء مباشر. زوّد رام/CPU للسيرفر أو YTDLP_MAX_PROCS.`);
+  if (env.spawn.stream.p95Ms > 20000) add('warn', `عمليات yt-dlp بطيئة (p95 = ${Math.round(env.spawn.stream.p95Ms / 1000)}ث) → غالبًا يوتيوب بيتأخر/بيحظر، أو المعالج ضعيف.`);
+  if (env.memory.containerLimitMb && env.memory.rssMb > env.memory.containerLimitMb * 0.8) add('warn', `استهلاك الرام عالي (${env.memory.rssMb}MB من ${env.memory.containerLimitMb}MB).`);
+
+  const since = Date.now() - 6 * 3600 * 1000;
+  const recent = [...incStore.groups.values()].filter(g => g.last > since && g.level !== 'slow');
+  const blob = recent.map(g => `${g.msg}\n${g.detail}`).join('\n');
+  const rules = [
+    [/sign in to confirm|not a bot/i, 'bad', 'يوتيوب شاكك إن السيرفر بوت (Sign in to confirm) → جدّد الكوكيز (حساب مسجّل دخول، صيغة Netscape) وتأكد إن IP السيرفر مش محظور.'],
+    [/po.?token/i, 'warn', 'ظهرت أخطاء متعلقة بـ PO Token → راجع حالة التوليد التلقائي (bgutils-js + jsdom لازم يكونوا منصّبين).'],
+    [/http error 403|upstream rejected|\(403\)|status.?403/i, 'warn', 'روابط جوجل بترجع 403 → غالبًا PO Token/كوكيز/IP أو yt-dlp قديم. جرّب /api/video-debug?v=ID.'],
+    [/429|too many requests/i, 'warn', 'يوتيوب بيعمل Rate limit (429) → قلّل الطلبات المتوازية أو استنى شوية.'],
+    [/n challenge|nsig|signature solving|js.?runtime|ejs|jsc/i, 'warn', 'فشل حل تحدي n/sig → لازم node شغال و yt-dlp محدّث (--remote-components ejs:github محتاج وصول لـ GitHub).'],
+    [/requested format is not available/i, 'warn', 'الفورمات المطلوبة مش متاحة → يوتيوب بيخفي روابط الـ client ده (SABR/PO Token). التجربة بتتكرر على clients تانية تلقائيًا.'],
+    [/timeout|timed out|\[timeout|sigterm|killed/i, 'warn', 'عمليات بتنتهي بـ timeout → بطء من يوتيوب أو ضغط على السيرفر.'],
+    [/enotfound|eai_again|econnreset|etimedout|econnrefused/i, 'warn', 'أخطاء شبكة (DNS/اتصال) → مشكلة في خروج السيرفر للإنترنت.'],
+    [/download HTTP 4|github/i, 'warn', 'تنزيل من GitHub فشل → ffmpeg/تحديث yt-dlp محتاجين وصول لـ GitHub.']
+  ];
+  for (const [re, lvl, text] of rules) if (re.test(blob)) add(lvl, text);
+  const degraded = recent.find(g => /info degraded/.test(g.msg));
+  if (degraded) add('warn', 'فيه فيديوهات استخراجها رجّع أعلى جودة 360p أو أقل → التفاصيل في مشكلة "info degraded" تحت (الـ clients اللي اتجرّبت ونتيجة كل واحد).');
+  if (!hints.length) add('ok', 'مفيش مشاكل واضحة في الحالة الحالية. لو لسه فيه شكوى، شغّل "الفحص الشامل" وابعت التقرير.');
+  return hints;
+}
+
+function sortedGroups(levelFilter) {
+  const rank = { error: 0, warn: 1, slow: 2 };
+  return [...incStore.groups.values()]
+    .filter(g => !levelFilter || levelFilter === 'all' || g.level === levelFilter)
+    .sort((a, b) => (rank[a.level] - rank[b.level]) || (b.last - a.last));
+}
+
+function incidentSummary() {
+  const hourAgo = Date.now() - 3600 * 1000;
+  const count = (lvl, since = 0) => incStore.events.filter(e => e.level === lvl && e.t > since).length;
+  return {
+    lastHour: { errors: count('error', hourAgo), warnings: count('warn', hourAgo), slow: count('slow', hourAgo) },
+    stored: { errors: count('error'), warnings: count('warn'), slow: count('slow'), groups: incStore.groups.size, ops: incStore.ops.length },
+    since: new Date(incStore.events[0] ? incStore.events[0].t : incStore.startedAt).toISOString()
+  };
+}
+
+function buildReport() {
+  const L = [];
+  const P = (s = '') => L.push(s);
+  const env = envSnapshot();
+  const icon = { error: '❌', warn: '⚠️', slow: '🐢' };
+  P('════════ تقرير مشاكل السيرفر (TITAN) ════════');
+  P(`الوقت (UTC): ${new Date().toISOString()}`);
+  P(`النسخة: ${env.version} | Uptime: ${fmtDur(env.uptimeSec * 1000)} | Node ${env.node}`);
+  P('');
+  P('── الحالة ──');
+  P(`yt-dlp: ${env.ytdlp.version || 'مش شغال'} | bin=${env.ytdlp.bin} | remote-components=${env.ytdlp.remoteComponents} | آخر تحديث=${env.ytdlp.updatedAt || '-'}${env.ytdlp.lastError ? ' | خطأ التحديث: ' + env.ytdlp.lastError : ''}`);
+  P(`ffmpeg: ${env.ffmpeg.status}${env.ffmpeg.source ? ' (' + env.ffmpeg.source + ')' : ''}${env.ffmpeg.lastError ? ' | خطأ: ' + env.ffmpeg.lastError : ''}`);
+  P(`JS runtime: ${env.jsRuntime || 'مفيش'} | كوكيز: ${env.cookies.ready ? 'موجودة (' + env.cookies.bytes + 'B)' : 'مفيش'} | PO Token: ${env.poToken.mode}${env.poToken.lastError ? ' (' + env.poToken.lastError + ')' : ''}`);
+  P(`رام: ${env.memory.rssMb}MB / حد الحاوية ${env.memory.containerLimitMb}MB | CPU: ${env.cpu}`);
+  P(`طابور yt-dlp: شغّال ${env.concurrency.procRunning}/${env.concurrency.procMax} | مستنّي ${env.concurrency.procQueued}`);
+  P(`زمن yt-dlp: stream avg=${env.spawn.stream.avgMs}ms p95=${env.spawn.stream.p95Ms}ms (فشل ${env.spawn.stream.fails}/${env.spawn.stream.runs}) | meta avg=${env.spawn.meta.avgMs}ms p95=${env.spawn.meta.p95Ms}ms (فشل ${env.spawn.meta.fails}/${env.spawn.meta.runs})`);
+  P(`كاش info: ${env.caches.info.entries} (hit ${env.caches.info.hits}/miss ${env.caches.info.misses}) | stream: ${env.caches.stream.entries}`);
+  const sum = incidentSummary();
+  P(`آخر ساعة: ${sum.lastHour.errors} أخطاء، ${sum.lastHour.warnings} تحذيرات، ${sum.lastHour.slow} بطء`);
+  P('');
+  P('── التشخيص المبدئي ──');
+  for (const h of diagnose()) P(`${h.lvl === 'bad' ? '🔴' : h.lvl === 'warn' ? '🟠' : '🟢'} ${h.text}`);
+  P('');
+  const groups = sortedGroups('all').slice(0, 40);
+  P(`── المشاكل المتكررة (${groups.length}) ──`);
+  if (!groups.length) P('(مفيش)');
+  groups.forEach((g, i) => {
+    P(`[${i + 1}] ${icon[g.level] || ''} ${g.level.toUpperCase()} · ${g.cat} · ×${g.count} · آخر مرة منذ ${fmtDur(Date.now() - g.last)} · أول مرة ${tsShort(g.first)}${g.maxMs ? ' · أقصى زمن ' + g.maxMs + 'ms' : ''}`);
+    P(`    ${g.msg}`);
+    if (g.detail) P(g.detail.split('\n').map(x => '    ↳ ' + x).join('\n'));
+    if (g.videos && g.videos.length) P(`    فيديوهات: ${g.videos.join(', ')}`);
   });
+  P('');
+  const evs = incStore.events.slice(-80);
+  P(`── آخر ${evs.length} حدث (الأحدث تحت) ──`);
+  for (const e of evs) {
+    const extra = [e.videoId && `v=${e.videoId}`, e.route && e.route, e.status && `HTTP ${e.status}`, e.ms != null && `${e.ms}ms`, e.reqId && `req=${e.reqId}`].filter(Boolean).join(' ');
+    P(`${tsShort(e.t)} ${icon[e.level] || ''}[${e.cat}] ${e.msg}${extra ? '  {' + extra + '}' : ''}`);
+    if (e.detail) P('      ↳ ' + e.detail.split('\n').slice(0, 3).join(' | ').slice(0, 300));
+  }
+  P('');
+  const ops = incStore.ops.slice(-60);
+  P(`── سجل العمليات (آخر ${ops.length}) ──`);
+  for (const o of ops) P(`${tsShort(o.t)} ${o.level === 'ok' ? '✅' : o.level === 'error' ? '❌' : o.level === 'warn' ? '⚠️' : 'ℹ️'} ${o.msg}`);
+  const st = incStore.lastSelfTest;
+  if (st) {
+    P('');
+    P(`── آخر فحص شامل (${tsShort(st.at)} UTC، فيديو ${st.videoId}، ${st.totalMs}ms) ──`);
+    for (const s of st.steps) P(`${s.ok ? '✅' : '❌'} ${s.name} (${s.ms}ms) ${s.detail || ''}`);
+  }
+  P('');
+  P('════════ نهاية التقرير ════════');
+  return L.join('\n');
+}
+
+let selfTestRunning = false;
+async function runSelfTest(videoId = 'dQw4w9WgXcQ') {
+  const steps = [];
+  const t00 = Date.now();
+  const step = async (name, fn, timeoutMs = 30000) => {
+    const t = Date.now();
+    let timer;
+    try {
+      const r = await Promise.race([fn(), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`انتهى وقت الخطوة (${Math.round(timeoutMs / 1000)}ث)`)), timeoutMs); })]);
+      const ok = r && r.ok !== undefined ? !!r.ok : true;
+      steps.push({ name, ok, ms: Date.now() - t, detail: (r && r.detail) || '' });
+      if (!ok) addIncident('error', `فحص ذاتي فشل: ${name}`, { cat: 'selftest', detail: r && r.detail, ms: Date.now() - t, videoId });
+    } catch (e) {
+      steps.push({ name, ok: false, ms: Date.now() - t, detail: cleanErr(e, 300) });
+      addIncident('error', `فحص ذاتي فشل: ${name}`, { cat: 'selftest', detail: cleanErr(e), ms: Date.now() - t, videoId });
+    } finally { clearTimeout(timer); }
+  };
+
+  await step('yt-dlp شغّال', async () => ({ ok: !!ytdlpState.version, detail: `${ytdlpState.version || 'مفيش'} (${ytdlpState.bin})` }), 5000);
+  await step('ffmpeg جاهز ويدعم https', async () => {
+    const ok = await hasFfmpegNow(25000);
+    if (!ok) return { ok: false, detail: `الحالة ${ffmpegState.status}: ${ffmpegState.lastError || '-'}` };
+    const { stdout } = await execFileAsync(ffmpegBin, ['-hide_banner', '-protocols'], { timeout: 10000, maxBuffer: 1024 * 1024 });
+    const hasHttps = /\bhttps\b/.test(stdout);
+    return { ok: hasHttps, detail: `${ffmpegState.source || 'system'} — ${hasHttps ? 'https مدعوم' : 'مفيش دعم https (مش هينفع للدمج)'}` };
+  }, 40000);
+  await step('الاتصال بيوتيوب', async () => {
+    const r = await httpGetText('https://www.youtube.com/robots.txt', { timeout: 8000 });
+    return { ok: r.status === 200, detail: `HTTP ${r.status}` };
+  }, 10000);
+  await step('الاتصال بـ GitHub (للتحديث/ffmpeg)', async () => {
+    const r = await httpGetText('https://api.github.com/rate_limit', { timeout: 8000 });
+    return { ok: r.status === 200, detail: `HTTP ${r.status}` };
+  }, 10000);
+  await step('الكوكيز', async () => ({ ok: cookiesReady, detail: cookiesReady ? `${lastCookiesContent.length} بايت` : 'مفيش كوكيز' }), 3000);
+
+  let info = null;
+  await step('استخراج بيانات الفيديو + الجودات', async () => {
+    forgetVideo(videoId);
+    info = await getVideoInfo(videoId);
+    const heights = getAvailableQualities(info);
+    const maxH = heights[0] || 0;
+    return { ok: maxH > 360, detail: `جودات: ${heights.join(',') || 'مفيش'} | formats=${(info.formats || []).length}${maxH <= 360 ? ' ← أعلى جودة 360 أو أقل (غير طبيعي للفيديو ده)' : ''}` };
+  }, 120000);
+  if (info) {
+    await step('الترجمة', async () => {
+      await waitSettled(info, 25000);
+      const withSubs = await ensureSubtitles(videoId, info);
+      const langs = [...Object.keys(withSubs.subtitles || {}), ...Object.keys(withSubs.automatic_captions || {})];
+      if (!langs.length) return { ok: false, detail: 'مفيش لغات ترجمة اتلقت' };
+      const lang = langs.includes('en') ? 'en' : langs[0];
+      const body = await getSubtitleBody(videoId, withSubs, lang, 'vtt');
+      return { ok: !!(body && body.body && body.body.length > 20), detail: `${langs.length} لغة | تحميل ${lang} عن طريق ${body && body.via}` };
+    }, 90000);
+    await step('المقاطع الصوتية', async () => {
+      await waitSettled(info, 15000);
+      const audio = (info.formats || []).filter(f => f && f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && !isManifestFormat(f));
+      const langs = [...new Set(audio.map(f => f.language || 'und'))];
+      const url = pickBestAudioUrl(info);
+      const ok = !!url && await verifyUrl(url);
+      return { ok, detail: `${audio.length} مسار | لغات: ${langs.join(',')} | الرابط ${ok ? 'شغّال' : 'مرفوض/مفيش'}` };
+    }, 40000);
+    await step('بث 360p (progressive)', async () => {
+      const u = await getFastStreamUrl(videoId);
+      return { ok: !!u, detail: u ? 'رابط متحقق منه' : 'مفيش رابط' };
+    }, 60000);
+    await step('بث 1080p (دمج ffmpeg)', async () => {
+      const heights = getAvailableQualities(info);
+      if (!heights.includes(1080)) return { ok: true, detail: 'الفيديو ده مفيهوش 1080 — اتخطّى' };
+      const sel = chooseQualityFormats(info, 1080);
+      if (sel.mode === 'direct') {
+        const u = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === sel.videoFormatId));
+        return { ok: !!u && await verifyUrl(u), detail: 'progressive مباشر' };
+      }
+      const vUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === sel.videoFormatId));
+      const aUrl = usableDirectUrl((info.formats || []).find(f => String(f.format_id) === sel.audioFormatId));
+      const ok = !!(vUrl && aUrl) && await verifyAll([vUrl, aUrl]);
+      return { ok, detail: ok ? 'روابط الفيديو والصوت متحقق منها' : 'روابط الفيديو/الصوت مرفوضة (403) أو ناقصة — ده سبب إن الجودات العالية مش بتشتغل' };
+    }, 60000);
+  }
+  const result = { at: Date.now(), videoId, totalMs: Date.now() - t00, steps };
+  incStore.lastSelfTest = result;
+  return result;
+}
+
+app.get('/api/incidents', (req, res) => {
+  if (!isAdminAuthorized(req)) return res.status(401).json({ error: 'غير مصرح' });
+  const level = String(req.query.level || 'all');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    summary: incidentSummary(),
+    env: envSnapshot(),
+    hints: diagnose(),
+    groups: sortedGroups(level).slice(0, 60),
+    events: incStore.events.slice(-120).reverse(),
+    ops: incStore.ops.slice(-150).reverse(),
+    lastSelfTest: incStore.lastSelfTest
+  });
+});
+app.get('/api/incidents/report', (req, res) => {
+  if (!isAdminAuthorized(req)) return res.status(401).type('text/plain; charset=utf-8').send('غير مصرح');
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('text/plain; charset=utf-8').send(buildReport());
+});
+app.post('/api/incidents/clear', (req, res) => {
+  if (!isAdminAuthorized(req)) return res.status(401).json({ error: 'غير مصرح' });
+  incStore.events = []; incStore.groups.clear(); incStore.ops = []; incStore.dirty = true; incStore.lastSelfTest = null;
+  saveIncidents();
+  res.json({ success: true, message: 'تم مسح سجل المشاكل والعمليات' });
+});
+app.all('/api/selftest', async (req, res) => {
+  if (!isAdminAuthorized(req)) return res.status(401).json({ error: 'غير مصرح' });
+  if (selfTestRunning) return res.status(409).json({ error: 'فحص شغّال دلوقتي — استنى لحد ما يخلص' });
+  const vid = isValidVideoId(String(req.query.v || '')) ? String(req.query.v) : 'dQw4w9WgXcQ';
+  selfTestRunning = true;
+  try { res.json(await runSelfTest(vid)); }
+  catch (e) { res.status(500).json({ error: 'الفحص نفسه فشل', details: cleanErr(e) }); }
+  finally { selfTestRunning = false; }
 });
 
 // ==========================================================================
@@ -5495,6 +6227,20 @@ function summarizeTestBody(body) {
   return out;
 }
 
+// 404 + Error handler — لازم يكونوا آخر حاجة (قبل كده /api/test-all كانت متسجّلة بعدهم فمكانتش بتشتغل أبدًا)
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint غير موجود', path: req.path });
+});
+app.use((err, req, res, next) => {
+  res.locals.__reported = true;
+  log.error(`Unhandled error: ${String(err && err.message || err)}`, { cat: catFromPath(req.path), route: req.originalUrl, detail: err && err.stack ? String(err.stack).split('\n').slice(0, 6).join('\n') : '' });
+  if (res.headersSent) return;
+  res.status(500).json({
+    error: 'خطأ في السيرفر',
+    details: NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
 // Start server
 // ==========================================================================
 // 🧠 Memory watchdog (v13.6) — لو الرام قربت من الحد (Railway بيقتل العملية) بنفضّي الكاشات التقيلة بدل ما السيرفر يقع.
@@ -5542,6 +6288,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   server.headersTimeout = 66000;
   server.requestTimeout = 0;
   server.maxConnections = 2000;
+  // لو ffmpeg لسه مش جاهز: حاول تاني في الخلفية كل 5 دقايق (من غير ما حد يطلب جودة)
+  setInterval(() => { if (ffmpegState.status !== 'ready') ensureFfmpeg().catch(() => {}); }, 5 * 60 * 1000).unref();
+  log.info(`🧾 لوحة المشاكل وسجل العمليات: /admin  (عمليات yt-dlp المتزامنة: ${PROC_MAX})`);
   const ytdlpStatus = commandExists(ytdlpBin) ? '✅' : '❌';
   console.log(`
 ╔═══════════════════════════════════════════╗
@@ -5577,5 +6326,9 @@ process.on('SIGTERM', () => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  log.error(`Unhandled Rejection: ${reason}`);
+  log.error(`Unhandled Rejection: ${cleanErr(reason, 200).split('\n')[0]}`, { cat: 'system', detail: reason && reason.stack ? String(reason.stack).split('\n').slice(0, 6).join('\n') : cleanErr(reason) });
+});
+process.on('uncaughtException', (err) => {
+  log.error(`Uncaught Exception: ${String(err && err.message || err)}`, { cat: 'system', detail: err && err.stack ? String(err.stack).split('\n').slice(0, 8).join('\n') : '' });
+  saveIncidents();
 });
