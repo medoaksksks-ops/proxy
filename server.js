@@ -18,13 +18,9 @@ require('dotenv').config();
 // ==========================================================================
 // v13.4.0 — AUTO PO TOKEN: السيرفر بيولّد PO Token + Visitor Data لوحده
 // (bgutils-js + jsdom) ويجدده كل 4 ساعات، من غير أي توكن يدوي.
-// v14.0.0 — TURBO: (1) شريط الفيديو بالمدة الكاملة من أول ثانية + تقديم/ترجيع للجودات المدموجة (?start=) بدل الإعادة من الأول،
-// (2) التعليقات + الردود عبر InnerTube مباشر (/comments, /comments/replies) مع رجوع لـ yt-dlp، (3) معلومات القناة عبر InnerTube،
-// (4) اقتراحات البحث اتصلحت (كانت بترجع JSONP فبتفشل) + إعادة استخدام البادئات، (5) كاش SWR + حفظ على الديسك،
-// (6) gzip غير متزامن بدل gzipSync اللي كان بيوقّف الـ event loop.
 // v13.7.0 — DIAG-FIX: لوحة مشاكل + سجل عمليات + تقرير للنسخ، إصلاح تنزيل ffmpeg (كان بيتكرر بالتوازي),
 // كاش الجودات/المعلومات المتدهورة، الترجمة/الصوت بدون انتظار طويل، سقف عمليات yt-dlp حسب الرام/المعالج.
-const SERVER_VERSION = '14.0.0-TURBO';
+const SERVER_VERSION = '13.8.0-SEEKABLE-MUX';
 
 // Agent واحد بيعيد استخدام نفس اتصالات TCP/TLS بدل ما يفتح اتصال جديد لكل
 // طلب لجوجل — ده اللي بيدي إحساس "سريع" فعلي في البث والـ API calls
@@ -59,7 +55,7 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, ETag, Last-Modified, X-Video-Quality, X-Stream-Mode, X-Video-Duration, X-Video-Start, X-Video-Remaining, X-Seek-Mode, X-Requested-Quality'
+    'Content-Length, Content-Range, Accept-Ranges, Content-Type, Cache-Control, ETag, Last-Modified, X-Video-Quality, X-Stream-Mode, X-Seekable, X-Merge-Mode, X-Video-Duration'
   );
   res.setHeader('Access-Control-Max-Age', '86400');
 
@@ -127,20 +123,18 @@ app.use((req, res, next) => {
   if (!accept.includes('gzip')) return next();
   const originalJson = res.json.bind(res);
   res.json = (body) => {
-    let raw;
-    try { raw = Buffer.from(JSON.stringify(body)); } catch { return originalJson(body); }
-    if (raw.length < 800) return originalJson(body);
-    // gzip غير متزامن (v14): الـ gzipSync القديم كان بيوقّف السيرفر كله أثناء الضغط
-    zlib.gzip(raw, { level: 4 }, (err, gz) => {
-      if (res.headersSent || res.destroyed) return;
-      if (err) return originalJson(body);
+    try {
+      const raw = Buffer.from(JSON.stringify(body));
+      if (raw.length < 800) return originalJson(body);
+      const gz = zlib.gzipSync(raw, { level: 5 });
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Content-Encoding', 'gzip');
       res.setHeader('Vary', 'Accept-Encoding');
       res.setHeader('Content-Length', gz.length);
-      res.end(gz);
-    });
-    return res;
+      return res.end(gz);
+    } catch {
+      return originalJson(body);
+    }
   };
   next();
 });
@@ -177,22 +171,6 @@ class MemoryTTLCache {
   }
   delete(key) { return this.map.delete(key); }
   clear() { this.map.clear(); }
-  // v14: حفظ/استرجاع من الديسك (بيحافظ على الكاش بعد restart). القيم لازم تكون JSON عادي.
-  dump(max = 400) {
-    const out = []; const arr = [...this.map.entries()];
-    for (const [k, e] of arr.slice(-max)) out.push([k, e.value, e.createdAt, e.expiresAt]);
-    return out;
-  }
-  restore(list) {
-    let n = 0;
-    for (const row of Array.isArray(list) ? list : []) {
-      if (!Array.isArray(row) || row.length < 4 || row[1] === undefined) continue;
-      this.map.set(String(row[0]), { value: row[1], createdAt: Number(row[2]) || Date.now(), expiresAt: Number(row[3]) || 0 });
-      n++;
-    }
-    while (this.map.size > this.maxEntries) this.map.delete(this.map.keys().next().value);
-    return n;
-  }
   stats() {
     let fresh = 0, stale = 0; const now = Date.now();
     for (const e of this.map.values()) e.expiresAt > now ? fresh++ : stale++;
@@ -205,7 +183,7 @@ const searchCache = new MemoryTTLCache(500);
 const feedCache = new MemoryTTLCache(300);
 const streamCache = new MemoryTTLCache(1000);
 const fastStreamCache = new MemoryTTLCache(600);
-const channelCache = new MemoryTTLCache(600);
+const channelCache = new MemoryTTLCache(250);
 const channelMetaCache = new MemoryTTLCache(300);
 // URL → { fmt: http_headers من yt-dlp, ok/cookies: نتيجة التحقق } (v13.6)
 const urlMeta = new MemoryTTLCache(3000);
@@ -218,7 +196,7 @@ function fillChannelOwner(list, channel) {
     channelId: v.channelId || (channel && channel.id) || ''
   }));
 }
-const suggestionCache = new MemoryTTLCache(2500);
+const suggestionCache = new MemoryTTLCache(150);
 // كاش لنصوص الترجمة الجاهزة (ملفات صغيرة) + أي فيديو شفناه بث مباشر
 const subtitleCache = new MemoryTTLCache(300);
 const liveIdHints = new Set();
@@ -236,7 +214,7 @@ const CACHE_TTL = {
   channel: 45 * 60 * 1000,
   stream: 45 * 60 * 1000,
   fastStream: 40 * 60 * 1000,
-  suggestions: 6 * 60 * 60 * 1000
+  suggestions: 30 * 60 * 1000
 };
 
 // Never make the browser/CDN serve an old API response; only our RAM cache is used.
@@ -2176,50 +2154,7 @@ async function getChannelSorted(channelId, sort, count) {
   return { channel, videos: fillChannelOwner(videos, channel), approximate };
 }
 
-// ⚡ قناة بطلب InnerTube مباشر (معلومات القناة + الفيديوهات) بدل عملية yt-dlp كاملة — v14
-async function innertubeChannelVideos(channelId, limit) {
-  let data = await innertubeCall('browse', { browseId: channelId, params: 'EgZ2aWRlb3PyBgQKAjoA' }, 6000);
-  const meta = itFindAll(data, 'channelMetadataRenderer')[0] || {};
-  const title = meta.title || '';
-  if (!title) throw new Error('innertube channel: no metadata');
-  let followers = null;
-  try {
-    const m = JSON.stringify(data.header || {}).match(/"((?:\d[\d.,]*)\s*[KMBkmb]?)\s*subscribers?"/);
-    if (m) followers = itViews(m[1]);
-  } catch {}
-  const thumbs = (meta.avatar && meta.avatar.thumbnails) || [];
-  const channel = {
-    id: meta.externalId || channelId,
-    title,
-    followers,
-    avatar: thumbs.length ? thumbs[thumbs.length - 1].url : null,
-    description: meta.description || ''
-  };
-  const items = itItems(data);
-  const seen = new Set(items.map(i => i.id));
-  let next = itContinuation(data);
-  for (let page = 1; items.length < limit && next && page < 6; page++) {
-    data = await innertubeCall('browse', { continuation: next }, 6000);
-    for (const it of itItems(data)) if (!seen.has(it.id)) { seen.add(it.id); items.push(it); }
-    next = itContinuation(data);
-  }
-  if (!items.length) throw new Error('innertube channel: no videos');
-  return { channel, videos: items.slice(0, limit).map(i => mapFlatEntry(i)).filter(Boolean) };
-}
-
 async function getChannelVideos(channelId, limit = 20) {
-  if (IT_ENABLED && /^UC[\w-]{22}$/.test(String(channelId)) && itBreaker.until <= Date.now()) {
-    try {
-      const r = await innertubeChannelVideos(channelId, limit);
-      itBreaker.fails = 0;
-      channelMetaCache.set(String(channelId), r.channel, 60 * 60 * 1000);
-      return { channel: r.channel, videos: fillChannelOwner(r.videos, r.channel) };
-    } catch (e) {
-      itBreaker.fails++;
-      if (itBreaker.fails >= 3) { itBreaker.until = Date.now() + 60 * 1000; itBreaker.fails = 0; }
-      log.warn(`channel innertube fail → yt-dlp: ${String(e.message || e).split('\n')[0]}`);
-    }
-  }
   const url = `https://www.youtube.com/channel/${channelId}/videos`;
   log.info(`📺 Fetching channel: ${channelId} (limit ${limit})`);
   const stdout = await runYtDlp(['--flat-playlist', '--dump-single-json', '--playlist-end', String(limit), url]);
@@ -2320,270 +2255,28 @@ async function searchLive(query = 'بث مباشر', limit = 30) {
 }
 
 /**
- * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن (مسار yt-dlp — بيستعمل كاحتياطي لو InnerTube فشل)
- * v14: بيرجّع حقل parent (قبل كده كان ناقص فالردود مكانتش تتعرف) + خيار جلب الردود.
+ * جلب تعليقات حقيقية من يوتيوب لفيديو معيّن
  */
-async function getVideoComments(videoId, limit = 50, opts = {}) {
-  const withReplies = !!opts.replies;
-  log.info(`💬 Fetching comments (yt-dlp): ${videoId} (limit ${limit}${withReplies ? ', +replies' : ''})`);
-  // max_comments = الكل, الرئيسية, الردود, الردود لكل تعليق — الأصفار = بدون ردود (أسرع بكتير)
-  const spec = withReplies ? `${limit * 4},${limit},${limit * 3},8` : `${limit},${limit},0,0`;
+async function getVideoComments(videoId, limit = 50) {
+  log.info(`💬 Fetching comments: ${videoId} (limit ${limit})`);
   const args = [
     '--skip-download', '--dump-json', '--write-comments',
-    '--extractor-args', `youtube:comment_sort=top;max_comments=${spec}`,
+    // max-comments,max-parents,max-replies,max-replies-per-thread: بدون ردود = أسرع بكتير
+    '--extractor-args', `youtube:comment_sort=top;max_comments=${limit},${limit},0,0`,
     `https://www.youtube.com/watch?v=${videoId}`
   ];
-  const stdout = await runYtDlp(args, { timeout: withReplies ? 70000 : 45000, attemptTimeout: withReplies ? 50000 : 30000 });
+  const stdout = await runYtDlp(args, { timeout: 45000, attemptTimeout: 30000 });
   const lines = stdout.trim().split('\n').filter(Boolean);
   const data = JSON.parse(lines[lines.length - 1]);
-  const all = (data.comments || []).map(c => {
-    const isReply = !!(c.parent && c.parent !== 'root');
-    return {
-      id: c.id,
-      author: c.author || 'مستخدم يوتيوب',
-      authorThumbnail: c.author_thumbnail || '',
-      authorChannelId: c.author_id || '',
-      text: c.text || '',
-      likeCount: c.like_count || 0,
-      isReply,
-      parent: isReply ? c.parent : null,
-      isPinned: !!c.is_pinned,
-      isCreator: !!c.author_is_uploader,
-      publishedText: c.time_text || '',
-      timestamp: c.timestamp ? new Date(c.timestamp * 1000).toISOString() : null
-    };
-  });
-  const tops = all.filter(c => !c.isReply).slice(0, limit);
-  const repliesBy = new Map();
-  for (const c of all) if (c.isReply) { if (!repliesBy.has(c.parent)) repliesBy.set(c.parent, []); repliesBy.get(c.parent).push(c); }
-  return {
-    comments: tops.map(c => ({ ...c, replyCount: withReplies ? (repliesBy.get(c.id) || []).length : null })),
-    repliesBy: withReplies ? repliesBy : null
-  };
-}
-
-// ==========================================================================
-// 💬 Comments v3 (v14.0) — InnerTube مباشر مع الردود (≈ 0.3–0.8 ث بدل 8–30 ث yt-dlp)
-//   GET /comments?v=ID&limit=50&sort=top|new&cursor=...&replies=N   (replies=N: أول N ردود لكل تعليق جاهزة جوّه الرد)
-//   GET /comments/replies?v=ID&c=COMMENT_ID&limit=50                 (كل ردود تعليق معيّن)
-// أي فشل/نتيجة غير مفهومة → رجوع تلقائي لـ yt-dlp.
-// ==========================================================================
-const commentsCache = new MemoryTTLCache(600);
-const commentReplyTokens = new MemoryTTLCache(6000);
-
-function itAgoToIso(text) {
-  const m = String(text || '').toLowerCase().match(/(\d+|an?)\s*(second|minute|hour|day|week|month|year)s?\s+ago/);
-  if (!m) return null;
-  const n = /^an?$/.test(m[1]) ? 1 : parseInt(m[1], 10);
-  const unit = { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800, month: 2592000, year: 31536000 }[m[2]];
-  return new Date(Date.now() - n * unit * 1000).toISOString();
-}
-function itCommentFromEntity(e) {
-  const p = e.properties || {}, a = e.author || {}, t = e.toolbar || {};
-  const id = p.commentId; if (!id) return null;
-  const pub = String(p.publishedTime || '');
-  const parentId = id.includes('.') ? id.split('.')[0] : null;
-  return {
-    id,
-    author: String(a.displayName || '').replace(/^@/, '@') || 'مستخدم يوتيوب',
-    authorThumbnail: a.avatarThumbnailUrl || '',
-    authorChannelId: a.channelId || '',
-    text: itText(p.content) || '',
-    likeCount: itViews(t.likeCountNotliked || t.likeCountLiked || '0'),
-    replyCount: itViews(t.replyCount || '0'),
-    isReply: !!parentId,
-    parent: parentId,
-    isPinned: false,
-    isCreator: !!a.isCreator,
-    publishedText: pub.replace(/\s*\(edited\)\s*/i, '').trim(),
-    edited: /edited/i.test(pub),
-    timestamp: itAgoToIso(pub)
-  };
-}
-function itCommentFromLegacy(r) {
-  if (!r || !r.commentId) return null;
-  const id = r.commentId;
-  const parentId = id.includes('.') ? id.split('.')[0] : null;
-  const pub = itText(r.publishedTimeText);
-  return {
-    id,
-    author: itText(r.authorText) || 'مستخدم يوتيوب',
-    authorThumbnail: (r.authorThumbnail && r.authorThumbnail.thumbnails && r.authorThumbnail.thumbnails.slice(-1)[0] || {}).url || '',
-    authorChannelId: (r.authorEndpoint && r.authorEndpoint.browseEndpoint && r.authorEndpoint.browseEndpoint.browseId) || '',
-    text: itText(r.contentText),
-    likeCount: itViews(itText(r.voteCount) || String(r.likeCount || 0)),
-    replyCount: Number(r.replyCount) || 0,
-    isReply: !!parentId, parent: parentId,
-    isPinned: !!r.pinnedCommentBadge,
-    isCreator: !!r.authorIsChannelOwner,
-    publishedText: pub.replace(/\s*\(edited\)\s*/i, '').trim(),
-    edited: /edited/i.test(pub),
-    timestamp: itAgoToIso(pub)
-  };
-}
-function itEntityMap(data) {
-  const map = new Map();
-  for (const e of itFindAll(data, 'commentEntityPayload')) {
-    const c = itCommentFromEntity(e); if (c) map.set(c.id, c);
-  }
-  return map;
-}
-// next page token (آخر continuationItemRenderer على مستوى القايمة — مش اللي جوّه الردود)
-function itPageToken(data) {
-  let tok = null;
-  for (const items of itFindAll(data, 'continuationItems')) {
-    if (!Array.isArray(items) || !items.length) continue;
-    const last = items[items.length - 1];
-    const t = last && last.continuationItemRenderer && last.continuationItemRenderer.continuationEndpoint &&
-      last.continuationItemRenderer.continuationEndpoint.continuationCommand &&
-      last.continuationItemRenderer.continuationEndpoint.continuationCommand.token;
-    if (t) tok = t;
-  }
-  return tok;
-}
-function itCommentSectionToken(watch) {
-  const sec = itFindAll(watch, 'itemSectionRenderer').find(s => s && s.sectionIdentifier === 'comment-item-section');
-  let t = sec && itContinuation(sec);
-  if (t) return t;
-  const panel = itFindAll(watch, 'engagementPanelSectionListRenderer').find(p => p && /comments/i.test(String(p.panelIdentifier || p.targetId || '')));
-  return panel ? itContinuation(panel) : null;
-}
-// threads → [{...comment, _replyToken}]
-function itParseThreads(data) {
-  const ents = itEntityMap(data);
-  const out = []; const seen = new Set();
-  for (const th of itFindAll(data, 'commentThreadRenderer')) {
-    let c = null;
-    const vm = th.commentViewModel && (th.commentViewModel.commentViewModel || th.commentViewModel);
-    if (vm && vm.commentId && ents.has(vm.commentId)) c = { ...ents.get(vm.commentId) };
-    else if (th.comment && th.comment.commentRenderer) c = itCommentFromLegacy(th.comment.commentRenderer);
-    if (!c || seen.has(c.id)) continue;
-    seen.add(c.id);
-    if (vm && vm.pinnedText) c.isPinned = true;
-    if (th.commentViewModel && th.commentViewModel.pinnedText) c.isPinned = true;
-    const rr = th.replies && th.replies.commentRepliesRenderer;
-    const tok = rr ? itContinuation(rr) : null;
-    c.hasReplies = !!tok || c.replyCount > 0;
-    out.push({ c, tok });
-  }
-  return out;
-}
-// ردود (continuationItems فيها commentViewModel/commentRenderer مباشرة)
-function itParseReplies(data) {
-  const ents = itEntityMap(data);
-  const out = []; const seen = new Set();
-  for (const vm of itFindAll(data, 'commentViewModel')) {
-    if (vm && typeof vm.commentId === 'string' && ents.has(vm.commentId) && !seen.has(vm.commentId)) { seen.add(vm.commentId); out.push({ ...ents.get(vm.commentId) }); }
-  }
-  for (const r of itFindAll(data, 'commentRenderer')) {
-    const c = itCommentFromLegacy(r); if (c && !seen.has(c.id)) { seen.add(c.id); out.push(c); }
-  }
-  return out;
-}
-async function innertubeComments(videoId, limit, { sort = 'top', cursor = null } = {}) {
-  let data, total = null, sortTokens = null;
-  if (cursor) {
-    data = await innertubeCall('next', { continuation: cursor }, 6000);
-  } else {
-    const watch = await innertubeCall('next', { videoId }, 6000);
-    const sectionToken = itCommentSectionToken(watch);
-    if (!sectionToken) throw new Error('no comment section token');
-    data = await innertubeCall('next', { continuation: sectionToken }, 6000);
-    const menu = itFindAll(data, 'sortFilterSubMenuRenderer')[0];
-    if (menu && Array.isArray(menu.subMenuItems)) {
-      sortTokens = menu.subMenuItems.map(i => i && i.serviceEndpoint && i.serviceEndpoint.continuationCommand && i.serviceEndpoint.continuationCommand.token);
-    }
-    const countText = itText((itFindAll(data, 'commentsHeaderRenderer')[0] || {}).countText);
-    if (countText) total = itViews(countText);
-    if (sort === 'new' && sortTokens && sortTokens[1]) {
-      // لو ترتيب "الأحدث" رجع فاضي/هيكل مختلف نكمّل بالترتيب الافتراضي بدل ما نفشل
-      try { const sorted = await innertubeCall('next', { continuation: sortTokens[1] }, 6000); if (itParseThreads(sorted).length) data = sorted; } catch {}
-    }
-  }
-  const comments = []; const seen = new Set();
-  let next = null;
-  for (let page = 0; page < 8; page++) {
-    for (const { c, tok } of itParseThreads(data)) {
-      if (seen.has(c.id)) continue;
-      seen.add(c.id);
-      if (tok) commentReplyTokens.set(`${videoId}:${c.id}`, tok, 45 * 60 * 1000);
-      comments.push(c);
-    }
-    next = itPageToken(data);
-    if (comments.length >= limit || !next) break;
-    data = await innertubeCall('next', { continuation: next }, 6000);
-  }
-  // سلامة: صفحة بتقول فيها تعليقات (total>0) ومفيش ولا واحد اتفهم → هيكل اتغيّر → خلّي المتصل يرجع لـ yt-dlp
-  if (!comments.length && total > 0) throw new Error('comments parse empty');
-  return { comments: comments.slice(0, limit), total, nextCursor: comments.length >= limit ? next : null };
-}
-async function innertubeReplies(token, limit) {
-  const out = []; const seen = new Set();
-  let data = await innertubeCall('next', { continuation: token }, 6000);
-  for (let page = 0; page < 6; page++) {
-    for (const c of itParseReplies(data)) if (!seen.has(c.id)) { seen.add(c.id); out.push(c); }
-    const next = itPageToken(data);
-    if (out.length >= limit || !next) break;
-    data = await innertubeCall('next', { continuation: next }, 6000);
-  }
-  return out.slice(0, limit);
-}
-
-// كل مسارات جلب التعليقات (native ← yt-dlp) في مكان واحد. بيرجّع { comments, total, nextCursor, source }
-async function loadComments(videoId, limit, { sort = 'top', cursor = null } = {}) {
-  if (IT_ENABLED && itBreaker.until <= Date.now()) {
-    try {
-      const r = await innertubeComments(videoId, limit, { sort, cursor });
-      itBreaker.fails = 0;
-      return { ...r, source: 'innertube' };
-    } catch (e) {
-      if (!/no comment section/.test(String(e.message))) itBreaker.fails++;
-      if (itBreaker.fails >= 3) { itBreaker.until = Date.now() + 60 * 1000; itBreaker.fails = 0; }
-      log.warn(`comments innertube fail → yt-dlp: ${String(e.message || e).split('\n')[0]}`);
-    }
-  }
-  if (cursor) return { comments: [], total: null, nextCursor: null, source: 'none' };   // cursor بتاع innertube مش بيشتغل على yt-dlp
-  const y = await getVideoComments(videoId, limit);
-  return { comments: y.comments, total: null, nextCursor: null, source: 'yt-dlp' };
-}
-const warmedExtras = new MemoryTTLCache(3000);
-function warmVideoExtras(videoId) {
-  // InnerTube فقط (سريع وخفيف) — مفيش احتياطي yt-dlp هنا عشان مانشغّلش عملية تقيلة بدون طلب فعلي
-  if (!IT_ENABLED || itBreaker.until > Date.now() || warmedExtras.get(videoId)) return;
-  warmedExtras.set(videoId, 1, 10 * 60 * 1000);
-  const key = `cm3:${videoId}:top:-`;
-  const e = commentsCache.getEntry(key);
-  if (e && e.expiresAt > Date.now() && e.value.fetchedLimit >= 50) return;
-  dedupe(`comments:${key}:50`, async () => {
-    const r = await innertubeComments(videoId, 50, {});
-    const val = { ...r, source: 'innertube', fetchedLimit: 50 };
-    commentsCache.set(key, val, r.comments.length ? 30 * 60 * 1000 : 2 * 60 * 1000);
-    return val;
-  }).catch(() => {});
-}
-async function loadReplies(videoId, commentId, limit) {
-  let token = commentReplyTokens.get(`${videoId}:${commentId}`);
-  if (!token && IT_ENABLED) {
-    // السيرفر اتعمله restart أو التوكن انتهى → نحمّل أول 100 تعليق من جديد (من الكاش لو موجود) عشان نلاقيه
-    try { await dedupe(`cm-tokens:${videoId}`, () => loadComments(videoId, 100)); } catch {}
-    token = commentReplyTokens.get(`${videoId}:${commentId}`);
-  }
-  if (token && IT_ENABLED && itBreaker.until <= Date.now()) {
-    try { return { replies: await innertubeReplies(token, limit), source: 'innertube' }; }
-    catch (e) { log.warn(`replies innertube fail → yt-dlp: ${String(e.message || e).split('\n')[0]}`); }
-  }
-  // احتياطي: yt-dlp بالردود (بطيء، بس بيتكاش 30 دقيقة لكل الفيديو)
-  const key = `cm3full:${videoId}`;
-  let full = commentsCache.get(key);
-  if (!full) {
-    full = await dedupe(key, async () => {
-      const r = await getVideoComments(videoId, 40, { replies: true });
-      const obj = {}; for (const [k, v] of r.repliesBy || []) obj[k] = v;
-      commentsCache.set(key, obj, 30 * 60 * 1000);
-      return obj;
-    });
-  }
-  return { replies: (full[commentId] || []).slice(0, limit), source: 'yt-dlp' };
+  return (data.comments || []).slice(0, limit).map(c => ({
+    id: c.id,
+    author: c.author || 'مستخدم يوتيوب',
+    authorThumbnail: c.author_thumbnail || '',
+    text: c.text || '',
+    likeCount: c.like_count || 0,
+    isReply: !!(c.parent && c.parent !== 'root'),
+    timestamp: c.timestamp ? new Date(c.timestamp * 1000).toISOString() : null
+  }));
 }
 
 // ==========================================================================
@@ -2763,87 +2456,37 @@ app.get('/related', async (req, res) => {
 });
 
 /**
- * GET /comments?v=VIDEO_ID&limit=50&sort=top|new&cursor=TOKEN&replies=N
- * تعليقات حقيقية من يوتيوب + replyCount لكل تعليق. replies=N بيرجّع أول N ردود جوّه كل تعليق (حقل replies).
- * الرد: { id, count, total, nextCursor, comments:[{ id, author, text, likeCount, replyCount, hasReplies, parent, isReply, ... }] }
+ * GET /comments?v=VIDEO_ID&limit=50
+ * تعليقات حقيقية من يوتيوب (Top comments)
  */
 app.get('/comments', async (req, res) => {
   const videoId = String(req.query.v || '');
   if (!videoId || !isValidVideoId(videoId)) {
     return res.status(400).json({
       error: 'Video ID مطلوب وصحيح (11 حرف)',
-      example: '/comments?v=dQw4w9WgXcQ&limit=50&replies=2'
+      example: '/comments?v=dQw4w9WgXcQ&limit=50'
     });
   }
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
-  const sort = String(req.query.sort || 'top').toLowerCase() === 'new' ? 'new' : 'top';
-  const cursorRaw = String(req.query.cursor || '');
-  const cursor = /^[\w%=.\-]{10,6000}$/.test(cursorRaw) ? cursorRaw : null;
-  const inlineReplies = Math.min(Math.max(parseInt(req.query.replies, 10) || 0, 0), 10);
-  const key = `cm3:${videoId}:${sort}:${cursor || '-'}`;
+  const key = `comments_v2:${videoId}`;
+  const cached = infoCache.get(key);
+  // لو عندنا كاش بعدد أكبر أو مساوي نرد منه فورًا
+  if (cached && cached.fetchedLimit >= limit) {
+    const list = cached.comments.slice(0, limit);
+    return res.json({ id: videoId, count: list.length, comments: list });
+  }
   try {
-    let base = commentsCache.get(key);
-    // كاش بعدد أكبر أو مساوي → رد فوري. غير كده نجيب (مع dedupe) ونكاشّي
-    if (!base || base.fetchedLimit < limit) {
-      const prev = commentsCache.get(key, true);   // نسخة قديمة تنفع تتعرض فورًا لو الجلب فشل
-      try {
-        base = await dedupe(`comments:${key}:${limit}`, async () => {
-          const r = await loadComments(videoId, limit, { sort, cursor });
-          const val = { ...r, fetchedLimit: limit };
-          commentsCache.set(key, val, r.comments.length ? 30 * 60 * 1000 : 2 * 60 * 1000);
-          return val;
-        });
-      } catch (e) { if (prev) base = prev; else throw e; }
-    }
-    let list = base.comments.slice(0, limit).map(c => ({ ...c }));
-    if (inlineReplies > 0) {
-      const withReplies = list.filter(c => c.hasReplies || c.replyCount > 0).slice(0, 25);
-      let idx = 0;
-      const worker = async () => {
-        while (idx < withReplies.length) {
-          const c = withReplies[idx++];
-          try { c.replies = (await loadReplies(videoId, c.id, inlineReplies)).replies; } catch { c.replies = []; }
-        }
-      };
-      await Promise.all([worker(), worker(), worker(), worker()]);
-    }
-    log.success(`✅ Comments done: ${videoId} (${list.length}, ${base.source || 'cache'})`);
-    res.json({ id: videoId, count: list.length, total: base.total || null, nextCursor: base.nextCursor || null, sort, source: base.source || 'cache', comments: list });
+    const comments = await dedupe(`comments:${videoId}:${limit}`, () => getVideoComments(videoId, limit));
+    const out = { id: videoId, count: comments.length, comments };
+    infoCache.set(key, { fetchedLimit: limit, comments }, comments.length ? 30 * 60 * 1000 : 2 * 60 * 1000);
+    log.success(`✅ Comments done: ${videoId} (${comments.length})`);
+    res.json(out);
   } catch (error) {
     log.error(`Error fetching comments: ${error.message}`);
     res.status(500).json({
       error: 'تعذّر جلب التعليقات',
       details: NODE_ENV === 'development' ? error.message : undefined
     });
-  }
-});
-
-/**
- * GET /comments/replies?v=VIDEO_ID&c=COMMENT_ID&limit=50
- * كل الردود على تعليق معيّن (زرار "عرض الردود").
- */
-app.get('/comments/replies', async (req, res) => {
-  const videoId = String(req.query.v || '');
-  const commentId = String(req.query.c || req.query.id || '').split('.')[0];
-  if (!isValidVideoId(videoId) || !/^[\w-]{10,80}$/.test(commentId)) {
-    return res.status(400).json({ error: 'v (Video ID) و c (Comment ID) مطلوبين', example: '/comments/replies?v=dQw4w9WgXcQ&c=UgxXXXX' });
-  }
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-  const key = `cm3r:${videoId}:${commentId}`;
-  try {
-    let hit = commentsCache.get(key);
-    if (!hit || hit.limit < limit) {
-      hit = await dedupe(key + ':' + limit, async () => {
-        const r = await loadReplies(videoId, commentId, limit);
-        const val = { ...r, limit };
-        commentsCache.set(key, val, r.replies.length ? 30 * 60 * 1000 : 60 * 1000);
-        return val;
-      });
-    }
-    res.json({ id: videoId, parent: commentId, count: Math.min(hit.replies.length, limit), source: hit.source, replies: hit.replies.slice(0, limit) });
-  } catch (error) {
-    log.error(`Error fetching replies: ${String(error.message || error).split('\n')[0]}`);
-    res.status(500).json({ error: 'تعذّر جلب الردود', details: NODE_ENV === 'development' ? error.message : undefined });
   }
 });
 
@@ -3398,10 +3041,15 @@ app.get('/channel', async (req, res) => {
     // (التقرير: /channel?limit=1 اتطلب لعشرات القنوات مع بعض وكل واحد شغّل yt-dlp لحد 53ث)
     const ps = Math.max(poolSize, 30);
     const dataCacheKey = sort === 'latest' ? `channel_${channelId}_${ps}` : `channel_${channelId}_${sort}_${ps}`;
-    // v14: stale-while-revalidate — لو الكاش قديم بيرد فورًا بالنسخة القديمة ويجدّد في الخلفية
-    const data = await staleWhileRevalidate(channelCache, dataCacheKey,
-      () => sort === 'latest' ? getChannelVideos(channelId, ps) : getChannelSorted(channelId, sort, ps),
-      CACHE_TTL.channel);
+    let data = channelCache.get(dataCacheKey);
+    if (!data) {
+      data = await dedupe(`chan:${dataCacheKey}`, async () => {
+        const again = channelCache.get(dataCacheKey); if (again) return again;
+        const d = sort === 'latest' ? await getChannelVideos(channelId, ps) : await getChannelSorted(channelId, sort, ps);
+        channelCache.set(dataCacheKey, d, CACHE_TTL.channel);
+        return d;
+      });
+    }
 
     const start = (pageNum - 1) * pageSize;
     const videos = data.videos.slice(start, start + pageSize);
@@ -4299,74 +3947,7 @@ async function hasFfmpegNow(waitMs = 8000) {
   return Promise.race([ensureFfmpeg(), sleepMs(waitMs).then(() => false)]);
 }
 
-// ==========================================================================
-// 🎞️ fMP4 duration patch (v14.0) — حل مشكلة "شريط الفيديو بيبدأ من 0 ويزيد لحد 5 ثواني ثم يكبر"
-// ffmpeg بيطلّع MP4 مجزّأ (frag + empty_moov) على pipe من غير مدة (mvhd/tkhd/mdhd duration = 0)،
-// فالمتصفح مبيعرفش طول الفيديو ويفضل يحسبه بالتدريج. هنا بنقرأ الـ init segment (ftyp+moov)
-// ونكتب فيه المدة الحقيقية قبل ما نبعته للمتصفح → الشريط يظهر بطول الفيديو كله من أول ثانية.
-// ==========================================================================
-function fmp4InitEnd(buf) {
-  // بيرجّع مكان بداية أول moof/mdat (يعني الـ init اكتمل)، أو -1 لو لسه ناقص
-  let p = 0;
-  while (p + 8 <= buf.length) {
-    let size = buf.readUInt32BE(p);
-    const type = buf.toString('latin1', p + 4, p + 8);
-    if (type === 'moof' || type === 'mdat') return p;
-    if (size === 1) { if (p + 16 > buf.length) return -1; size = Number(buf.readBigUInt64BE(p + 8)); }
-    if (size < 8) return -1;
-    if (p + size > buf.length) return -1;
-    p += size;
-  }
-  return -1;
-}
-function patchFmp4Duration(buf, seconds) {
-  const secs = Number(seconds);
-  if (!(secs > 0) || !Buffer.isBuffer(buf)) return buf;
-  const out = Buffer.from(buf);
-  let movieTs = 0;
-  const put = (off, ver, value) => {
-    if (ver === 1) out.writeBigUInt64BE(BigInt(Math.max(0, value)), off);
-    else out.writeUInt32BE(Math.min(Math.max(0, value), 0xFFFFFFFF), off);
-  };
-  const walk = (start, end) => {
-    let p = start;
-    while (p + 8 <= end) {
-      let size = out.readUInt32BE(p);
-      const type = out.toString('latin1', p + 4, p + 8);
-      let hdr = 8;
-      if (size === 1) { if (p + 16 > end) return; size = Number(out.readBigUInt64BE(p + 8)); hdr = 16; }
-      else if (size === 0) size = end - p;
-      if (size < hdr || p + size > end) return;
-      const body = p + hdr;
-      if (type === 'mvhd' || type === 'mdhd') {
-        const ver = out[body];
-        const tsOff = ver === 1 ? body + 20 : body + 12;
-        if (tsOff + (ver === 1 ? 12 : 8) <= p + size) {
-          const ts = out.readUInt32BE(tsOff);
-          if (ts) { if (type === 'mvhd') movieTs = ts; put(tsOff + 4, ver, Math.round(secs * ts)); }
-        }
-      } else if (type === 'tkhd' && movieTs) {
-        const ver = out[body];
-        const dOff = ver === 1 ? body + 28 : body + 20;
-        if (dOff + (ver === 1 ? 8 : 4) <= p + size) put(dOff, ver, Math.round(secs * movieTs));
-      } else if (type === 'moov' || type === 'trak' || type === 'mdia') {
-        walk(body, p + size);
-      }
-      p += size;
-    }
-  };
-  try { walk(0, out.length); } catch { return buf; }
-  return out;
-}
-
-function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audioCopy = false) {
-  // ?start=SECONDS (أو ?t=) → السيرفر يبدأ الدمج من الثانية دي (ده اللي بيخلي التقديم/الترجيع شغّال
-  // مع الجودات المدموجة اللي مفيهاش Range). المتصفح بيستعمل X-Video-Start مع currentTime.
-  const totalDur = Number(duration) > 0 ? Number(duration) : 0;
-  let startSec = parseFloat(req.query.start !== undefined ? req.query.start : req.query.t);
-  if (!Number.isFinite(startSec) || startSec < 0) startSec = 0;
-  if (totalDur > 0) startSec = Math.min(startSec, Math.max(0, totalDur - 1));
-  startSec = Math.min(startSec, 86400);
+function streamMergedLive(req, res, videoUrl, audioUrl, duration = 0, audioCopy = false, startSec = 0) {
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // نفس الـ User-Agent/headers اللي yt-dlp طلّع بيها الرابط (ده اللي بيمنع 403)
   const ffIn = (u) => {
@@ -4375,7 +3956,6 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
       .filter(([k]) => !['user-agent', 'range', 'accept-encoding', 'connection', 'host'].includes(k))
       .map(([k, v]) => `${k}: ${v}\r\n`).join('');
     return [
-      ...(startSec > 0 ? ['-ss', startSec.toFixed(3)] : []),
       '-user_agent', h['user-agent'] || UA,
       ...(extra ? ['-headers', extra] : []),
       '-reconnect', '1',
@@ -4384,8 +3964,10 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
       '-reconnect_delay_max', '5',
       '-rw_timeout', '30000000',
       // تحليل أقصر للمدخلات = أول بايت يوصل أسرع
-      '-probesize', '1000000',
-      '-analyzeduration', '1000000',
+      '-probesize', '600000',
+      '-analyzeduration', '600000',
+      '-fflags', '+nobuffer+genpts',
+      ...(startSec > 0 ? ['-ss', String(startSec)] : []),
       '-i', u
     ];
   };
@@ -4402,7 +3984,10 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
     '-c:v', 'copy',
     // AAC بيتنسخ زي ما هو؛ غير كده (Opus مثلًا) بنحوّله لـ AAC عشان MP4
     ...(audioCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2']),
+    ...(audioCopy ? [] : ['-af', 'aresample=async=1:first_pts=0']),
     '-avoid_negative_ts', 'make_zero',
+    '-max_interleave_delta', '2000000',
+    '-flush_packets', '1',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     '-f', 'mp4', 'pipe:1'
   ];
@@ -4411,13 +3996,10 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Accel-Buffering', 'no');
-  res.setHeader('Accept-Ranges', 'none');
-  res.setHeader('X-Seek-Mode', 'start-param');
-  res.setHeader('X-Video-Start', String(startSec));
-  if (totalDur > 0) {
-    res.setHeader('X-Video-Duration', String(totalDur));
-    res.setHeader('X-Video-Remaining', String(Math.max(1, totalDur - startSec)));
-  }
+  res.setHeader('Accept-Ranges', 'none');          // البث ده مش قابل للـ byte-range → الفرونت يستخدم ?start=ثواني
+  res.setHeader('X-Seekable', 'start');
+  res.setHeader('X-Merge-Mode', 'live');
+  if (Number(duration) > 0) res.setHeader('X-Video-Duration', String(duration));
 
   const ff = spawn(ffmpegBin || 'ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderrBuf = '';
@@ -4427,29 +4009,9 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
     stderrBuf += d.toString();
     if (stderrBuf.length > 4000) stderrBuf = stderrBuf.slice(-4000);
   });
-  // بنجمّع أول بايتات (ftyp+moov) → نكتب فيها المدة الحقيقية → نكمّل البث مع backpressure.
-  // لو ffmpeg فشل قبل أي بايت نرد بخطأ واضح بدل 200 فاضي (مفيش pipe مباشر).
-  const remainingDur = totalDur > 0 ? Math.max(1, totalDur - startSec) : 0;
-  let headChunks = [], headLen = 0, headDone = false;
-  const writeOut = (chunk) => {
-    if (res.destroyed || res.writableEnded) return;
-    if (!res.write(chunk)) { ff.stdout.pause(); res.once('drain', () => { try { ff.stdout.resume(); } catch {} }); }
-  };
-  const flushHead = () => {
-    if (headDone) return;
-    headDone = true;
-    const joined = Buffer.concat(headChunks); headChunks = [];
-    const end = remainingDur > 0 ? fmp4InitEnd(joined) : -1;
-    if (end > 0) writeOut(Buffer.concat([patchFmp4Duration(joined.subarray(0, end), remainingDur), joined.subarray(end)]));
-    else if (joined.length) writeOut(joined);
-  };
-  ff.stdout.on('data', (chunk) => {
-    gotData = true;
-    if (headDone) return writeOut(chunk);
-    headChunks.push(chunk); headLen += chunk.length;
-    if (remainingDur <= 0 || headLen >= 768 * 1024 || fmp4InitEnd(Buffer.concat(headChunks)) > 0) flushHead();
-  });
-  ff.stdout.on('end', flushHead);
+  ff.stdout.once('data', () => { gotData = true; });
+  // end:false → لو ffmpeg فشل قبل أي بايت نرد بخطأ واضح بدل 200 فاضي
+  ff.stdout.pipe(res, { end: false });
 
   const cleanup = () => {
     if (!ff.killed) {
@@ -4472,6 +4034,211 @@ function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audio
     if (!res.writableEnded) res.end();
   });
   req.on('close', cleanup);
+}
+
+// ==========================================================================
+// 🎞️ MUX CACHE v13.8 — دمج فيديو+صوت لملف MP4 حقيقي قابل للتقديم/التأخير
+// المشكلة القديمة: الدمج كان pipe حي (fragmented MP4) من ffmpeg → مفيش Range، مفيش مدة،
+// فالمتصفح لما تقدّم/تأخّر كان بيطلب من الأول (الفيديو بيبدأ من 0 وشريط التقدم بيكبر).
+// الحل: تنزيل الفيديو والصوت بالتوازي (chunks متوازية من جوجل) ثم دمج copy بدون ترميز
+// بـ +faststart → ملف كامل بمدة صح وRange صح + سينك صوت/صورة ثابت. الملفات بتتكاش وبتتمسح لوحدها.
+// فيديوهات أكبر من MUX_CACHE_MAX_MB (افتراضي 120) بتفضل بث حي، ويدعم ?start=ثواني للتقديم.
+// ==========================================================================
+const nodeCrypto = require('crypto');
+const nodePath = require('path');
+const MUX_DIR = process.env.MUX_CACHE_DIR || '/tmp/mux-cache';
+const MUX_MAX_FILE_BYTES = (parseInt(process.env.MUX_CACHE_MAX_MB, 10) || 120) * 1048576;
+const MUX_CACHE_TOTAL_BYTES = (parseInt(process.env.MUX_CACHE_TOTAL_MB, 10) || 1000) * 1048576;
+const MUX_TTL_MS = (parseInt(process.env.MUX_CACHE_TTL_MIN, 10) || 90) * 60000;
+const MUX_CHUNK = 3 * 1048576;
+const MUX_PARALLEL = Math.max(2, parseInt(process.env.MUX_PARALLEL, 10) || 6);
+const MUX_BUILD_TIMEOUT_MS = (parseInt(process.env.MUX_BUILD_TIMEOUT_SEC, 10) || 60) * 1000;
+const muxFiles = new Map();   // key -> { path, size, type, lastUsed, inUse }
+const muxJobs = new Map();    // key -> Promise
+const muxLimiter = new Semaphore(Math.max(1, parseInt(process.env.MUX_CONCURRENCY, 10) || 3));
+try { fs.mkdirSync(MUX_DIR, { recursive: true }); for (const f of fs.readdirSync(MUX_DIR)) { try { fs.unlinkSync(nodePath.join(MUX_DIR, f)); } catch {} } } catch {}
+
+function muxUrlIdentity(u) {
+  try { const q = new URL(u).searchParams; const id = q.get('id'), itag = q.get('itag'); if (id && itag) return `${id}.${itag}`; } catch {}
+  return nodeCrypto.createHash('sha1').update(String(u)).digest('hex').slice(0, 16);
+}
+function muxClen(u) { try { return Number(new URL(u).searchParams.get('clen')) || 0; } catch { return 0; } }
+function muxKey(videoUrl, audioUrl, audioCopy) { return `${muxUrlIdentity(videoUrl)}+${muxUrlIdentity(audioUrl)}${audioCopy ? 'c' : 't'}`; }
+
+function muxFetchRange(url, metaUrl, start, end, hop = 0) {
+  return new Promise((resolve, reject) => {
+    let target; try { target = new URL(url); } catch (e) { return reject(e); }
+    const headers = buildUpstreamHeaders(metaUrl);
+    if (!/googlevideo\.com$/i.test(target.hostname)) delete headers.cookie;
+    headers.range = `bytes=${start}-${end}`;
+    const want = end - start + 1;
+    const req = https.get(target, { headers, timeout: 20000, agent: keepAliveAgent }, (r) => {
+      const code = Number(r.statusCode || 0);
+      if ([301, 302, 303, 307, 308].includes(code) && r.headers.location && hop < 4) {
+        r.resume();
+        return resolve(muxFetchRange(new URL(r.headers.location, target).toString(), metaUrl, start, end, hop + 1));
+      }
+      if (code !== 206 && !(code === 200 && start === 0)) { r.resume(); const e = new Error(`upstream ${code}`); e.status = code; return reject(e); }
+      const chunks = []; let got = 0, done = false;
+      const finish = () => {
+        if (done) return; done = true;
+        let buf = Buffer.concat(chunks, got);
+        if (buf.length > want) buf = buf.subarray(0, want);
+        const cr = /bytes\s+\d+-\d+\/(\d+|\*)/i.exec(r.headers['content-range'] || '');
+        const total = cr && cr[1] !== '*' ? Number(cr[1]) : (code === 200 ? Number(r.headers['content-length']) || 0 : 0);
+        resolve({ buf, total, url });
+      };
+      r.on('data', d => { chunks.push(d); got += d.length; if (code === 200 && got >= want) { finish(); r.destroy(); } });
+      r.on('end', finish);
+      r.on('error', e => { if (!done) { done = true; reject(e); } });
+      r.on('aborted', () => { if (!done) { done = true; reject(new Error('aborted')); } });
+    });
+    req.on('timeout', () => req.destroy(new Error('chunk timeout')));
+    req.on('error', reject);
+  });
+}
+async function muxRetry(fn, tries = 3) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) { last = e; if ([400, 401, 403, 404, 410].includes(e.status)) throw e; await sleepMs(150 * (i + 1)); }
+  }
+  throw last;
+}
+async function muxDownload(url, dest, expectTotal, state) {
+  const fh = await fs.promises.open(dest, 'w');
+  try {
+    const first = await muxRetry(() => muxFetchRange(url, url, 0, MUX_CHUNK - 1));
+    const total = first.total || expectTotal;
+    if (!total) throw new Error('حجم الملف مجهول');
+    if (total > MUX_MAX_FILE_BYTES) { const e = new Error('too big'); e.tooBig = true; throw e; }
+    await fh.write(first.buf, 0, first.buf.length, 0);
+    let cursor = first.buf.length;
+    const finalUrl = first.url;
+    const worker = async () => {
+      while (!state.aborted) {
+        const s0 = cursor; if (s0 >= total) return;
+        cursor = s0 + MUX_CHUNK;
+        const e0 = Math.min(s0 + MUX_CHUNK, total) - 1;
+        const r = await muxRetry(() => muxFetchRange(finalUrl, url, s0, e0));
+        if (r.buf.length !== e0 - s0 + 1) throw new Error('chunk ناقص');
+        await fh.write(r.buf, 0, r.buf.length, s0);
+      }
+    };
+    const n = Math.min(MUX_PARALLEL, Math.max(1, Math.ceil((total - cursor) / MUX_CHUNK)));
+    if (cursor < total) await Promise.all(Array.from({ length: n }, worker));
+    return total;
+  } catch (e) { state.aborted = true; throw e; }
+  finally { await fh.close().catch(() => {}); }
+}
+function muxRunFfmpeg(vPath, aPath, out, audioCopy) {
+  const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', vPath, '-i', aPath,
+    '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy',
+    ...(audioCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']),
+    '-movflags', '+faststart', '-f', 'mp4', out];
+  return new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegBin || 'ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = ''; ff.stderr.on('data', d => { err = (err + d).slice(-1500); });
+    const t = setTimeout(() => { try { ff.kill('SIGKILL'); } catch {} }, 90000);
+    ff.on('error', e => { clearTimeout(t); reject(e); });
+    ff.on('close', code => { clearTimeout(t); code === 0 ? resolve() : reject(new Error(`ffmpeg mux ${code}: ${err.slice(-400)}`)); });
+  });
+}
+async function muxBuild(key, videoUrl, audioUrl, audioCopy) {
+  const base = nodePath.join(MUX_DIR, nodeCrypto.createHash('sha1').update(key).digest('hex').slice(0, 20));
+  const vp = `${base}.v.part`, ap = `${base}.a.part`, tmp = `${base}.tmp.mp4`, out = `${base}.mp4`;
+  const state = { aborted: false };
+  const timer = setTimeout(() => { state.aborted = true; }, MUX_BUILD_TIMEOUT_MS);
+  try {
+    await Promise.all([muxDownload(videoUrl, vp, muxClen(videoUrl), state), muxDownload(audioUrl, ap, muxClen(audioUrl), state)]);
+    if (state.aborted) throw new Error('انتهت مهلة تجهيز الملف');
+    await muxRunFfmpeg(vp, ap, tmp, audioCopy);
+    fs.renameSync(tmp, out);
+    const entry = { path: out, size: fs.statSync(out).size, type: 'video/mp4', lastUsed: Date.now(), inUse: 0 };
+    muxFiles.set(key, entry);
+    return entry;
+  } finally {
+    clearTimeout(timer); state.aborted = true;
+    for (const f of [vp, ap, tmp]) { try { fs.unlinkSync(f); } catch {} }
+  }
+}
+function ensureMergedFile(key, videoUrl, audioUrl, audioCopy) {
+  const hit = muxFiles.get(key);
+  if (hit && fs.existsSync(hit.path)) { hit.lastUsed = Date.now(); return Promise.resolve(hit); }
+  if (hit) muxFiles.delete(key);
+  const running = muxJobs.get(key); if (running) return running;
+  const job = (async () => {
+    await muxLimiter.acquire();
+    try { return await muxBuild(key, videoUrl, audioUrl, audioCopy); }
+    finally { muxLimiter.release(); }
+  })().finally(() => { muxJobs.delete(key); muxEvict(); });
+  muxJobs.set(key, job);
+  return job;
+}
+function muxEvict() {
+  const now = Date.now();
+  let total = 0; const list = [];
+  for (const [k, e] of muxFiles) {
+    if (!e.inUse && (now - e.lastUsed > MUX_TTL_MS || !fs.existsSync(e.path))) { try { fs.unlinkSync(e.path); } catch {} muxFiles.delete(k); continue; }
+    total += e.size; list.push([k, e]);
+  }
+  list.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+  for (const [k, e] of list) {
+    if (total <= MUX_CACHE_TOTAL_BYTES) break;
+    if (e.inUse) continue;
+    try { fs.unlinkSync(e.path); } catch {}
+    muxFiles.delete(k); total -= e.size;
+  }
+}
+setInterval(muxEvict, 5 * 60 * 1000).unref();
+
+function serveMuxFile(req, res, entry) {
+  const size = entry.size;
+  let start = 0, end = size - 1, status = 200;
+  const m = req.headers.range ? /^bytes=(\d*)-(\d*)$/i.exec(String(req.headers.range).trim()) : null;
+  if (m && (m[1] !== '' || m[2] !== '')) {
+    if (m[1] === '') start = Math.max(0, size - Number(m[2]));
+    else { start = Number(m[1]); if (m[2] !== '') end = Math.min(Number(m[2]), size - 1); }
+    if (start >= size || start > end) { res.status(416).setHeader('Content-Range', `bytes */${size}`); return res.end(); }
+    status = 206;
+  }
+  res.status(status);
+  res.setHeader('Content-Type', entry.type);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Length', String(end - start + 1));
+  if (status === 206) res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Seekable', 'bytes');
+  res.setHeader('X-Merge-Mode', 'file');
+  if (req.method === 'HEAD') return res.end();
+  entry.inUse++; entry.lastUsed = Date.now();
+  const rs = fs.createReadStream(entry.path, { start, end, highWaterMark: 256 * 1024 });
+  const release = () => { if (!rs.__rel) { rs.__rel = true; entry.inUse = Math.max(0, entry.inUse - 1); entry.lastUsed = Date.now(); } };
+  rs.on('error', () => { release(); destroyResponseStream(res); });
+  res.once('close', () => { release(); rs.destroy(); });
+  rs.pipe(res);
+}
+
+// نقطة الدخول (نفس التوقيع القديم). opts: { videoId } — لو اتحدد بنبعت المدة في X-Video-Duration
+async function streamMergedViaFfmpeg(req, res, videoUrl, audioUrl, duration = 0, audioCopy = false, opts = {}) {
+  let dur = Number(duration) || 0;
+  if (!dur && opts.videoId) { const inf = infoCache.get(`raw_info_v4_${opts.videoId}`); dur = Number(inf && inf.duration) || 0; }
+  const startSec = Math.max(0, Math.min(Number(req.query.start ?? req.query.t) || 0, dur > 0 ? dur - 1 : 1e7));
+  const forceLive = ['1', 'true'].includes(String(req.query.live || ''));
+  const vLen = muxClen(videoUrl), aLen = muxClen(audioUrl);
+  const knownTooBig = vLen && aLen && (vLen + aLen) > MUX_MAX_FILE_BYTES;
+  if (audioUrl && !forceLive && !knownTooBig) {
+    try {
+      const entry = await ensureMergedFile(muxKey(videoUrl, audioUrl, audioCopy), videoUrl, audioUrl, audioCopy);
+      if (res.destroyed || res.headersSent) return;
+      if (dur) res.setHeader('X-Video-Duration', String(dur));
+      return serveMuxFile(req, res, entry);
+    } catch (e) {
+      if (!e.tooBig) log.warn(`mux cache فشل → بث حي: ${String(e.message || e).split('\n')[0]}`);
+      if (res.destroyed || res.headersSent) return;
+    }
+  }
+  return streamMergedLive(req, res, videoUrl, audioUrl, dur, audioCopy, startSec);
 }
 
 // ==========================================================================
@@ -4726,9 +4493,7 @@ app.get('/video', async (req, res) => {
 
   try {
     // Explicit quality requires full format metadata. The default path does not.
-    // v14: المدة من الكاش لو موجودة (بتتحدّث تحت لما نجيب info للجودات المدموجة) → X-Video-Duration + شريط صح
-    let videoDuration = 0;
-    { const rawCached = infoCache.peek(`raw_info_v4_${videoId}`); if (rawCached && Number(rawCached.duration) > 0) videoDuration = Number(rawCached.duration); }
+    const videoDuration = 0;
     // Probe mode: resolve the stream without sending the video bytes.
     const probe = ['1', 'true', 'yes'].includes(String(req.query.probe || '').toLowerCase());
     // الافتراضي الآن: السيرفر يعمل proxy للفيديو (مش redirect لجوجل).
@@ -4810,7 +4575,6 @@ app.get('/video', async (req, res) => {
       if (hasFfmpeg) {
         try {
           const info = await getVideoInfo(videoId);
-          if (Number(info.duration) > 0) videoDuration = Number(info.duration);
           if (info.__pending && !getAvailableQualities(info).includes(h)) await waitSettled(info, 10000);
           const selected = chooseQualityFormats(info, h);
           if (selected.mode === 'direct' && Math.abs(Number(selected.actualHeight) - h) <= tol) {
@@ -4834,7 +4598,7 @@ app.get('/video', async (req, res) => {
             res.setHeader('X-Requested-Quality', `${h}p`);
             res.setHeader('X-Stream-Mode', 'ffmpeg');
             recordPerf('video-quality', Date.now() - requestStartedAt, true);
-            return streamMergedViaFfmpeg(req, res, vUrl, aUrl, videoDuration, /^mp4a/.test(String(selected.audioCodec || '')));
+            return streamMergedViaFfmpeg(req, res, vUrl, aUrl, videoDuration, /^mp4a/.test(String(selected.audioCodec || '')), { videoId });
           }
           // adaptive: video-only + audio at target height
           const heightSelector =
@@ -4848,7 +4612,7 @@ app.get('/video', async (req, res) => {
             res.setHeader('X-Requested-Quality', `${h}p`);
             res.setHeader('X-Stream-Mode', 'ffmpeg');
             recordPerf('video-quality', Date.now() - requestStartedAt, true);
-            return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration);
+            return streamMergedViaFfmpeg(req, res, urls[0], urls[1], videoDuration, false, { videoId });
           }
           if (selected.mode === 'merge') {
             const u2 = await getVerifiedUrls(videoId, `${selected.videoFormatId}+${selected.audioFormatId}`, { strict: true, minCount: 2 }).catch(() => []);
@@ -4857,7 +4621,7 @@ app.get('/video', async (req, res) => {
               res.setHeader('X-Video-Quality', `${selected.actualHeight}p`);
               res.setHeader('X-Requested-Quality', `${h}p`);
               res.setHeader('X-Stream-Mode', 'ffmpeg');
-              return streamMergedViaFfmpeg(req, res, u2[0], u2[1], videoDuration);
+              return streamMergedViaFfmpeg(req, res, u2[0], u2[1], videoDuration, false, { videoId });
             }
           }
         } catch (e) {
@@ -5013,7 +4777,6 @@ app.get('/info', async (req, res) => {
     return res.status(400).json({ error: 'Video ID غير صحيح' });
   }
 
-  warmVideoExtras(videoId);   // v14: التعليقات تتجهّز في الخلفية أثناء جلب المعلومات
   let cached = infoCache.get(`info_full_${videoId}`);
   // لقطة قديمة كانت لسه مستنية الترجمة، والترجمة جهزت دلوقتي → أعد البناء
   if (cached && cached.subtitlesPending) {
@@ -5226,9 +4989,6 @@ app.get('/video/qualities', async (req, res) => {
         playable,
         available: playable,
         actualProgressive: b.progressive ? h : null,
-        // range = تقديم/ترجيع عادي (Range) · start-param = الجودة بتتدمج بـ ffmpeg: لو سحبت الشريط غيّر src بـ &start=الثواني
-        seek: b.progressive ? 'range' : 'start-param',
-        duration: Number(info.duration) || 0,
         url: `/video?v=${encodeURIComponent(videoId)}&quality=${h}`
       };
     });
@@ -5245,7 +5005,6 @@ app.get('/video/qualities', async (req, res) => {
     const result = {
       id: videoId,
       title: info.title,
-      duration: Number(info.duration) || 0,
       count: qualities.length,
       supported: SUPPORTED_QUALITIES,
       progressiveHeights,
@@ -5739,81 +5498,43 @@ app.get('/', (req, res) => {
 // ==========================================================================
 // ⚡ Instant search suggestions — cached for a few seconds.
 // ==========================================================================
-// v14: كان بيستعمل client=youtube اللي بيرجّع JSONP (window.google.ac.h(...)) فالـ JSON.parse كان بيفشل
-// دايمًا → بيرجع لـ yt-dlp search (ثواني) ويكاشّي النتيجة الفاضية 30 دقيقة. دلوقتي: JSON مباشر + SWR + إعادة استخدام البادئات.
-function parseSuggestBody(body) {
-  let t = String(body || '').trim();
-  const m = t.match(/^[\w.$]+\(([\s\S]*)\)\s*;?$/);   // لو رجع JSONP نفكّه
-  if (m) t = m[1];
-  const parsed = JSON.parse(t);
-  const list = Array.isArray(parsed) ? parsed[1] : [];
-  const seen = new Set();
-  return (list || []).map(x => Array.isArray(x) ? x[0] : x).map(x => String(x || '').trim())
-    .filter(x => x && !seen.has(x) && seen.add(x)).slice(0, 10);
-}
-function fetchGoogleSuggest(q, lang) {
-  const url = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=${encodeURIComponent(lang)}&ie=utf-8&oe=utf-8&q=${encodeURIComponent(q)}`;
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { agent: keepAliveAgent, timeout: 2500, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'identity' } }, (r) => {
-      if ((r.statusCode || 0) >= 400) { r.resume(); return reject(new Error(`suggest HTTP ${r.statusCode}`)); }
-      const chunks = [];
-      r.on('data', c => chunks.push(c));
-      r.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      r.on('error', reject);
+app.get('/search/suggestions', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ query: '', suggestions: [] });
+  const key = `suggest:${q.toLowerCase()}`;
+  const cached = suggestionCache.get(key); if (cached) return res.json(cached);
+  try {
+    // Google suggest أسرع بمراحل من yt-dlp search
+    const url = `https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q=${encodeURIComponent(q)}`;
+    const body = await new Promise((resolve, reject) => {
+      https.get(url, { agent: keepAliveAgent, timeout: 4000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (r) => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => resolve(d));
+      }).on('error', reject).on('timeout', function () { this.destroy(); reject(new Error('suggest timeout')); });
     });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('suggest timeout')));
-  });
-}
-function suggestKey(lang, q) { return `suggest:${lang}:${q.toLowerCase()}`; }
-function suggestFromPrefix(lang, q) {
-  // المستخدم بيكتب حرف حرف: لو عندنا اقتراحات لبادئة أقصر نفلترها فورًا (0ms) وندّي نتيجة جزئية
-  const ql = q.toLowerCase();
-  for (let i = q.length - 1; i >= Math.max(1, q.length - 5); i--) {
-    const e = suggestionCache.peek(suggestKey(lang, q.slice(0, i)));
-    if (e && Array.isArray(e.suggestions)) {
-      const f = e.suggestions.filter(x => x.toLowerCase().startsWith(ql));
-      if (f.length >= 3) return f.slice(0, 10);
-    }
-  }
-  return null;
-}
-function refreshSuggest(key, q, lang) {
-  return dedupe(`sg:${key}`, async () => {
     let suggestions = [];
-    try { suggestions = parseSuggestBody(await fetchGoogleSuggest(q, lang)); } catch (e) { log.warn(`suggest google: ${String(e.message || e).split('\n')[0]}`); }
+    try {
+      const parsed = JSON.parse(body);
+      const list = Array.isArray(parsed) ? parsed[1] : [];
+      suggestions = (list || []).map(x => Array.isArray(x) ? x[0] : x).filter(Boolean).slice(0, 10);
+    } catch {
+      suggestions = [];
+    }
+    // لو جوجل فاضي — fallback خفيف
     if (!suggestions.length) {
-      // احتياطي خفيف (بسقف وقت) — عناوين نتايج البحث
       try {
-        const results = await Promise.race([searchVideos(q, 6), sleepMs(3500).then(() => [])]);
+        const results = await searchVideos(q, 5);
         const seen = new Set();
-        suggestions = (results || []).map(v => v.title).filter(t => t && !seen.has(t) && seen.add(t)).slice(0, 8);
+        suggestions = results.map(v => v.title).filter(t => t && !seen.has(t) && seen.add(t)).slice(0, 8);
       } catch {}
     }
     const out = { query: q, suggestions };
-    // النتيجة الفاضية متتكاشّاش كتير (كانت بتتثبّت 30 دقيقة)
-    suggestionCache.set(key, out, suggestions.length ? CACHE_TTL.suggestions : 30 * 1000);
-    return out;
-  });
-}
-app.get('/search/suggestions', async (req, res) => {
-  const q = String(req.query.q || '').trim().replace(/\s+/g, ' ').slice(0, 100);
-  if (!q) return res.json({ query: '', suggestions: [] });
-  const hl = String(req.query.hl || '');
-  const lang = /^[a-z]{2}(-[A-Za-z]{2})?$/.test(hl) ? hl : (/[\u0600-\u06FF]/.test(q) ? 'ar' : 'en');
-  const key = suggestKey(lang, q);
-  const entry = suggestionCache.getEntry(key);
-  if (entry && entry.value) {
-    if (entry.expiresAt <= Date.now()) refreshSuggest(key, q, lang).catch(() => {});
-    return res.json(entry.value);
+    suggestionCache.set(key, out, CACHE_TTL.suggestions);
+    res.json(out);
+  } catch {
+    res.json({ query: q, suggestions: [] });
   }
-  const pre = suggestFromPrefix(lang, q);
-  if (pre) {
-    refreshSuggest(key, q, lang).catch(() => {});
-    return res.json({ query: q, suggestions: pre, partial: true });
-  }
-  try { res.json(await refreshSuggest(key, q, lang)); }
-  catch { res.json({ query: q, suggestions: [] }); }
 });
 
 // ==========================================================================
@@ -5842,7 +5563,7 @@ app.get('/api/performance', (req, res) => {
     cache: {
       info: infoCache.stats(), search: searchCache.stats(), feed: feedCache.stats(),
       stream: streamCache.stats(), channel: channelCache.stats(),
-      suggestions: suggestionCache.stats(), accountFeed: feedCache.stats(), comments: commentsCache.stats(), channelMeta: channelMetaCache.stats()
+      suggestions: suggestionCache.stats(), accountFeed: feedCache.stats()
     },
     queues: {
       meta: { max: META_CONCURRENCY, current: ytdlpLimiter.current, queued: ytdlpLimiter.queue.length },
@@ -5881,8 +5602,7 @@ app.get('/api/maintenance', (req, res) => {
       stream: streamCache.stats(),
       fastStream: fastStreamCache.stats(),
       channel: channelCache.stats(),
-      suggestions: suggestionCache.stats(),
-      comments: commentsCache.stats()
+      suggestions: suggestionCache.stats()
     }
   });
 });
@@ -5899,8 +5619,6 @@ app.post('/api/cache/clear', (req, res) => {
   fastStreamCache.clear();
   channelCache.clear();
   suggestionCache.clear();
-  commentsCache.clear();
-  commentReplyTokens.clear();
 
   return res.json({
     success: true,
@@ -6876,7 +6594,7 @@ setInterval(() => {
   const rss = process.memoryUsage().rss / 1048576;
   if (rss > MEM_LIMIT_MB) {
     log.warn(`🧠 RSS ${Math.round(rss)}MB > ${MEM_LIMIT_MB}MB → تفريغ كاشات الميتاداتا`);
-    infoCache.clear(); searchCache.clear(); channelCache.clear(); subtitleCache.clear(); channelMetaCache.clear(); urlMeta.clear(); commentsCache.clear(); commentReplyTokens.clear();
+    infoCache.clear(); searchCache.clear(); channelCache.clear(); subtitleCache.clear(); channelMetaCache.clear(); urlMeta.clear();
     if (global.gc) try { global.gc(); } catch {}
   }
 }, 30000).unref();
@@ -6898,43 +6616,6 @@ async function warmCaches() {
 }
 setTimeout(() => { warmCaches(); }, 6000).unref();
 setInterval(() => { warmCaches(); }, 10 * 60 * 1000).unref();
-
-// ==========================================================================
-// 💾 Cache persistence (v14) — بيحفظ الكاشات الخفيفة (بحث/قنوات/اقتراحات/تعليقات) على الديسك كل 5 دقايق وعند الإيقاف،
-// ويرجّعها عند التشغيل → بعد أي restart السيرفر يبدأ "دافي" بدل ما يبدأ فاضي. الـ SWR بيجدّد القديم في الخلفية.
-// معلومات الفيديو/الروابط مش بتتحفظ (روابط جوجل بتنتهي). تعطيله: CACHE_PERSIST=0 — الملف: CACHE_PERSIST_FILE
-// ==========================================================================
-const CACHE_PERSIST = process.env.CACHE_PERSIST !== '0';
-const CACHE_PERSIST_FILE = process.env.CACHE_PERSIST_FILE || '/tmp/titan-cache.json';
-const persistedCaches = { search: searchCache, channel: channelCache, channelMeta: channelMetaCache, suggest: suggestionCache, comments: commentsCache };
-let lastPersistSig = '';
-function saveCaches() {
-  if (!CACHE_PERSIST) return;
-  try {
-    const out = { v: 1, savedAt: Date.now() };
-    for (const [name, c] of Object.entries(persistedCaches)) out[name] = c.dump(name === 'suggest' ? 1200 : 300);
-    const json = JSON.stringify(out);
-    if (json.length > 25 * 1024 * 1024) return;                     // كبير زيادة → نتجاهل
-    const sig = `${json.length}:${json.slice(-200)}`;
-    if (sig === lastPersistSig) return;                             // مفيش تغيير
-    lastPersistSig = sig;
-    const tmp = CACHE_PERSIST_FILE + '.tmp';
-    fs.writeFileSync(tmp, json); fs.renameSync(tmp, CACHE_PERSIST_FILE);
-  } catch (e) { log.warn(`cache save failed: ${String(e.message || e).split('\n')[0]}`); }
-}
-function loadCaches() {
-  if (!CACHE_PERSIST) return;
-  try {
-    if (!fs.existsSync(CACHE_PERSIST_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(CACHE_PERSIST_FILE, 'utf8'));
-    if (!data || data.v !== 1 || Date.now() - (data.savedAt || 0) > 24 * 3600 * 1000) return;   // أقدم من يوم → تجاهل
-    let n = 0;
-    for (const [name, c] of Object.entries(persistedCaches)) n += c.restore(data[name]);
-    log.info(`💾 cache restored: ${n} عنصر`);
-  } catch (e) { log.warn(`cache restore failed: ${String(e.message || e).split('\n')[0]}`); }
-}
-loadCaches();
-setInterval(saveCaches, 5 * 60 * 1000).unref();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   ensureFfmpeg().then(ok => { if (ok) log.success('✅ ffmpeg available for multi-quality'); else log.warn('⚠️ ffmpeg missing — only progressive heights'); }).catch(e => log.warn(String(e.message||e)));
@@ -6966,7 +6647,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   log.warn('Shutting down...');
-  saveCaches();
   server.close(() => {
     log.success('Server stopped');
     process.exit(0);
@@ -6975,7 +6655,6 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   log.warn('Terminating...');
-  saveCaches();
   server.close(() => {
     process.exit(0);
   });
